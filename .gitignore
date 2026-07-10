@@ -1,0 +1,7 @@
+node_modules/
+out/
+dist/
+*.tsbuildinfo
+.DS_Store
+# contains real camera/host passwords — do not commit
+CREDENTIALS.md
