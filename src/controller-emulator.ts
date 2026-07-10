@@ -159,6 +159,7 @@ export class ControllerEmulator extends EventEmitter {
                 if (!session.authenticated) {
                     session.authenticated = true;
                     this.log('camera authenticated', session.mac);
+                    this.enableDetections(session);
                     this.emit('online', session.mac);
                 }
                 break;
@@ -173,6 +174,24 @@ export class ControllerEmulator extends EventEmitter {
                     session.send(fn, m.payload || {}, false, m.messageId);
                 break;
         }
+    }
+
+    /**
+     * Ask the camera to run on-board analytics and push detection events. On
+     * UniFi the controller enables smart-detect; the camera then sends
+     * EventSmartDetect / EventSmartMotion / EventAnalytics (handled in main.ts).
+     * NOTE: verify with real motion in front of a camera; the exact payload the
+     * G5 firmware wants may need tuning if events don't fire.
+     */
+    private enableDetections(s: CameraSession) {
+        const deviceID = s.mac;
+        const objectTypes = ['person', 'vehicle', 'animal', 'package'];
+        try {
+            s.send('ChangeSmartDetectSettings', { deviceID, objectTypes, enable: true }, true);
+            s.send('ChangeSmartMotionSettings', { deviceID, enable: true }, true);
+            s.send('ChangeAnalyticsSettings', { deviceID, enable: true, motionAlgorithm: 'enhanced' }, true);
+            dbg('emulator enableDetections', s.mac, objectTypes);
+        } catch (e) { dbg('enableDetections failed', s.mac, (e as Error)?.message); }
     }
 
     /** Command a camera to push the given channel's video to destHost:destPort. */
