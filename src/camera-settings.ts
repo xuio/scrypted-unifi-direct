@@ -43,6 +43,11 @@ export const PARITY_FIELDS: FieldDef[] = [
     { key: 'video.fps', title: 'Frame rate (fps)', group: 'Video', type: 'integer', paths: ['av.video.<track>.fps', 'av.video.<track>.maxFps'], range: [1, 30] },
     { key: 'video.isCbr', title: 'Constant bitrate (CBR)', group: 'Video', type: 'boolean', paths: ['av.video.<track>.isCbr'] },
     { key: 'video.bitrate', title: 'Max bitrate (bps)', group: 'Video', type: 'integer', paths: ['av.video.<track>.bitRateVbrMax', 'av.video.<track>.bitRateCbrAvg'], range: [32000, 12000000] },
+    {
+        key: 'video.keyframeInterval', title: 'Keyframe interval (s)', group: 'Video', type: 'integer',
+        paths: ['av.video.<track>.nMultiplier'], range: [1, 10],
+        description: 'Seconds between keyframes. Lower = faster stream start / lower latency in Scrypted and HomeKit, at the cost of somewhat larger recordings. 1s recommended for instant playback.',
+    },
 
     // ---- Audio ----
     { key: 'audio.enabled', title: 'Microphone enabled', group: 'Audio', type: 'boolean', paths: ['av.audio.enabled'] },

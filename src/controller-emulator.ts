@@ -185,10 +185,7 @@ export class ControllerEmulator extends EventEmitter {
                 [channel]: {
                     avSerializer: {
                         type: 'extendedFlv',
-                        // withOpus:false -> camera pushes its native AAC in the FLV.
-                        // (withOpus made it emit Opus mislabeled as AAC, which the
-                        // RTP mpeg4-generic muxer could not packetize.)
-                        parameters: { streamName, withOpus: false },
+                        parameters: { streamName, withOpus: true, opusSampleRate: 16000 },
                         destinations: [`tcp://${destHost}:${destPort}?retryInterval=1&connectTimeout=5`],
                     },
                     type: videoCodec,

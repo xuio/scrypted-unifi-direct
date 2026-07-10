@@ -108,7 +108,7 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             container: 'rtsp',
             tool: 'scrypted',
             video: { codec: this.codec, width: c.w, height: c.h },
-            // audio omitted: video-only for now (camera AAC won't packetize into RTP)
+            audio: { codec: 'aac' },
         }];
     }
 
@@ -146,6 +146,7 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
                 container: 'rtsp',
                 tool: 'scrypted',
                 video: { codec: this.codec, width: chan.w, height: chan.h },
+                audio: { codec: 'aac' },
             },
         };
         return mediaManager.createFFmpegMediaObject(ffmpegInput, { sourceId: this.id });

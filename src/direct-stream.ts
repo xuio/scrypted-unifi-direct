@@ -42,7 +42,7 @@ function makeDetrailer() {
 export class DirectStream {
     private cameraServer: net.Server | undefined;
     private cameraSocket: net.Socket | undefined;
-    private flv = new PassThrough();
+    private flv = new PassThrough({ highWaterMark: 8 * 1024 * 1024 });
     private serve: RtspServeHandle | undefined;
     private streaming = false;
     private stopped = false;
@@ -81,7 +81,7 @@ export class DirectStream {
             this.serve = await startRtspServe({
                 ffmpegPath: this.ffmpegPath,
                 flv: this.flv,
-                hasAudio: false,   // TODO: camera AAC won't packetize into RTP; video-only for now
+                hasAudio: true,
                 logger: this.logger,
             });
         } catch (e) {
@@ -107,7 +107,9 @@ export class DirectStream {
             }
             if (this.cameraSocket !== sock) return;
             const clean = this.detrailer(d);
-            if (clean.length && this.flv.writable) this.flv.write(clean);
+            // write unconditionally (dropping a chunk when writable momentarily
+            // reports false would corrupt the FLV mid-tag for the readers).
+            if (clean.length && !this.flv.destroyed) this.flv.write(clean);
         });
         sock.on('error', e => dbg('DS', this.mac, 'camera stream error', (e as Error)?.message));
         sock.on('close', () => { if (this.cameraSocket === sock) this.cameraSocket = undefined; });

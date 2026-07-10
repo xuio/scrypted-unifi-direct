@@ -41,25 +41,38 @@ interface SdpInfo {
     audioTrack?: string;
 }
 
-/** Add per-media control attributes and map media types to their trackIDs. */
-function annotateSdp(raw: string): SdpInfo {
-    const lines = raw.split('\n').map(l => l.replace(/\r$/, ''));
-    const out: string[] = [];
-    let idx = -1;
-    const info: SdpInfo = { sdp: '' };
+/** Extract the m=<type> media block (m-line + its attributes) from an SDP. */
+function mediaBlock(sdp: string, type: string): string[] {
+    const lines = sdp.split(/\r?\n/).map(l => l.replace(/\r$/, ''));
+    const block: string[] = [];
+    let inBlock = false;
     for (const l of lines) {
-        if (l.startsWith('a=control:')) continue; // drop any existing control lines
-        out.push(l);
-        if (l.startsWith('m=')) {
-            idx++;
-            const control = `trackID=${idx}`;
-            out.push(`a=control:${control}`);
-            if (l.startsWith('m=video') && !info.videoTrack) info.videoTrack = control;
-            else if (l.startsWith('m=audio') && !info.audioTrack) info.audioTrack = control;
-        }
+        if (l.startsWith('m=')) inBlock = l.startsWith('m=' + type);
+        if (inBlock && l.trim() && !l.startsWith('a=control:')) block.push(l);
     }
-    info.sdp = out.join('\r\n');
-    if (!info.sdp.endsWith('\r\n')) info.sdp += '\r\n';
+    return block;
+}
+
+/**
+ * Build a combined SDP from a video-only SDP plus an optional audio-only SDP
+ * (from two separate ffmpegs). Session header comes from the video SDP; each
+ * media section gets an `a=control:trackID=N` control line for RTSP SETUP.
+ */
+function combineSdp(videoSdp: string, audioSdp?: string): SdpInfo {
+    const header: string[] = [];
+    for (const l of videoSdp.split(/\r?\n/).map(x => x.replace(/\r$/, ''))) {
+        if (l.startsWith('m=')) break;
+        if (l.trim()) header.push(l);
+    }
+    const info: SdpInfo = { sdp: '' };
+    const out = [...header, ...mediaBlock(videoSdp, 'video'), 'a=control:trackID=0'];
+    info.videoTrack = 'trackID=0';
+    const aud = audioSdp ? mediaBlock(audioSdp, 'audio') : [];
+    if (aud.length) {
+        out.push(...aud, 'a=control:trackID=1');
+        info.audioTrack = 'trackID=1';
+    }
+    info.sdp = out.join('\r\n') + '\r\n';
     return info;
 }
 
@@ -224,27 +237,31 @@ export async function startRtspServe(opts: {
     const video = await bindUdp();
     const audio = hasAudio ? await bindUdp() : undefined;
 
-    const args = [
-        '-hide_banner', '-loglevel', 'error',
-        '-fflags', '+genpts+nobuffer',
-        '-f', 'flv', '-i', 'pipe:0',
-        // video RTP; h264_mp4toannexb so keyframes carry in-band SPS/PPS.
-        '-map', '0:v', '-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb',
-        '-payload_type', '96', '-dn', '-sn', '-an',
-        '-f', 'rtp', `rtp://127.0.0.1:${video.port}?pkt_size=1200`,
-    ];
-    if (audio) {
-        args.push(
-            '-map', '0:a?', '-c:a', 'copy',
-            '-payload_type', '97', '-dn', '-sn', '-vn',
-            '-f', 'rtp', `rtp://127.0.0.1:${audio.port}?pkt_size=1200`,
-        );
-    }
-    // stdin=flv, stdout=SDP (ffmpeg's print_sdp writes there), stderr=logs.
-    const cp: ChildProcess = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
-    cp.stdin!.on('error', () => { });        // swallow EPIPE on teardown
-    cp.stderr!.on('data', (d: Buffer) => dbg('rtsp-serve ffmpeg:', d.toString().trim().slice(0, 200)));
-    flv.pipe(cp.stdin!);                     // feed input so ffmpeg can emit the SDP
+    // Two independent copy-only ffmpegs — one video, one audio — both fed the
+    // same FLV. Video is mandatory; audio is best-effort so it can never block or
+    // regress video (and an audio-only process establishes where a combined
+    // video+audio one stalls on find_stream_info). Both read from the FLV start.
+    const spawnRtp = (extra: string[], port: number): ChildProcess => {
+        const args = [
+            '-hide_banner', '-loglevel', 'error',
+            '-analyzeduration', '3000000', '-probesize', '3000000', '-fflags', '+genpts',
+            '-f', 'flv', '-i', 'pipe:0', ...extra,
+            '-f', 'rtp', `rtp://127.0.0.1:${port}?pkt_size=1200`,
+        ];
+        const cp = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
+        cp.stdin!.on('error', () => { });
+        cp.stderr!.on('data', (d: Buffer) => dbg('rtsp-serve ffmpeg:', d.toString().trim().slice(0, 160)));
+        return cp;
+    };
+
+    const cpVideo = spawnRtp(['-map', '0:v', '-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb', '-payload_type', '96', '-dn', '-sn', '-an'], video.port);
+    const cpAudio = audio ? spawnRtp(['-map', '0:a?', '-c:a', 'copy', '-payload_type', '97', '-dn', '-sn', '-vn'], audio.port) : undefined;
+
+    // tee the FLV to both ffmpegs (both need the sequence headers at the start).
+    flv.on('data', (d: Buffer) => {
+        if (cpVideo.stdin?.writable) cpVideo.stdin.write(d);
+        if (cpAudio?.stdin?.writable) cpAudio.stdin.write(d);
+    });
 
     let dead = false;
     const sessions = new Set<RtspSession>();
@@ -254,31 +271,40 @@ export async function startRtspServe(opts: {
         try { server?.close(); } catch { }
         for (const s of sessions) s.close();
         sessions.clear();
-        try { cp.kill('SIGKILL'); } catch { }
+        try { cpVideo.kill('SIGKILL'); } catch { }
+        try { cpAudio?.kill('SIGKILL'); } catch { }
         try { video.socket.close(); } catch { }
         try { audio?.socket.close(); } catch { }
         try { flv.destroy(); } catch { }
     };
 
-    // ffmpeg prints the combined SDP (all -f rtp outputs) to stdout at header time.
-    const expect = audio ? 2 : 1;
-    let sdpBuf = '';
-    const rawSdp: string = await new Promise<string>((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('sdp timeout: ' + sdpBuf.slice(-300))), opts.sdpTimeoutMs ?? 15000);
-        cp.stdout!.on('data', (d: Buffer) => {
-            sdpBuf += d.toString();
-            const sdp = extractSdp(sdpBuf, expect);
-            if (sdp) { clearTimeout(timer); resolve(sdp); }
-        });
+    const readSdp = (cp: ChildProcess, timeoutMs: number) => new Promise<string>((resolve, reject) => {
+        let buf = '';
+        const timer = setTimeout(() => reject(new Error('sdp timeout')), timeoutMs);
+        cp.stdout!.on('data', (d: Buffer) => { buf += d.toString(); const s = extractSdp(buf, 1); if (s) { clearTimeout(timer); resolve(s); } });
         cp.once('exit', () => { clearTimeout(timer); reject(new Error('ffmpeg exited before sdp')); });
-    }).catch(e => { destroy(); throw e; });
-    cp.once('exit', code => { dbg('rtsp-serve ffmpeg exited', code); destroy(); });
-    const info = annotateSdp(rawSdp);
+    });
+
+    // video SDP is required.
+    let videoSdp: string;
+    try { videoSdp = await readSdp(cpVideo, opts.sdpTimeoutMs ?? 15000); }
+    catch (e) { destroy(); throw e; }
+    // audio SDP is best-effort — give it a grace window, then proceed without it.
+    // (This delay is one-time per camera: prebuffer keeps the session warm, so
+    // user-facing "open stream" latency is unaffected.)
+    let audioSdp: string | undefined;
+    if (cpAudio) {
+        try { audioSdp = await readSdp(cpAudio, 10000); }
+        catch (e) { dbg('rtsp-serve audio unavailable, video-only:', (e as Error)?.message); try { cpAudio.kill('SIGKILL'); } catch { } }
+    }
+
+    cpVideo.once('exit', code => { dbg('rtsp-serve video ffmpeg exited', code); destroy(); });
+    const info = combineSdp(videoSdp, audioSdp);
     dbg('rtsp-serve sdp ready; video', info.videoTrack, 'audio', info.audioTrack);
 
     // fan received RTP out to every connected client by track
     video.socket.on('message', buf => { for (const s of sessions) s.sendRtp(info.videoTrack, buf); });
-    if (audio)
+    if (audio && info.audioTrack)
         audio.socket.on('message', buf => { for (const s of sessions) s.sendRtp(info.audioTrack, buf); });
 
     const pathToken = '/' + randomBytes(8).toString('hex');
