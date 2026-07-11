@@ -154,7 +154,9 @@ export class DirectStream {
         try {
             await new Promise<void>((resolve, reject) => {
                 let timer: any = setTimeout(() => reject(new Error('timed out waiting for a stable camera connection')), 25000);
-                const done = () => { clearTimeout(timer); timer = undefined; };
+                // clear both callbacks once settled so a later stop() can't invoke
+                // a stale rejection against the already-resolved promise.
+                const done = () => { clearTimeout(timer); timer = undefined; this.onServeReady = undefined; this.onServeFail = undefined; };
                 this.onServeReady = () => { done(); resolve(); };
                 this.onServeFail = (e) => { done(); reject(e); };
             });

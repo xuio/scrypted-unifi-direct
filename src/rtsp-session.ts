@@ -89,7 +89,9 @@ export class RtspSession {
 
     private handleRequest(text: string) {
         const lines = text.split('\r\n');
-        const [method, url] = lines[0].split(' ');
+        // default url to '' so a malformed request line (no URL) can't throw from
+        // inside the socket 'data' handler — that would be an uncaught exception.
+        const [method, url = ''] = lines[0].split(' ');
         const headers: Record<string, string> = {};
         for (let i = 1; i < lines.length; i++) {
             const c = lines[i].indexOf(':');
@@ -163,7 +165,10 @@ export class RtspSession {
         }
         const header = Buffer.allocUnsafe(4);
         header[0] = RTSP_MAGIC; header[1] = ch; header.writeUInt16BE(packet.length, 2);
-        this.socket.write(Buffer.concat([header, packet]));
+        // two ordered writes instead of Buffer.concat: avoids copying every RTP
+        // packet on the hot path (both land in the same synchronous block).
+        this.socket.write(header);
+        this.socket.write(packet);
         this.sent++;
     }
 
@@ -175,7 +180,8 @@ export class RtspSession {
         if (ch === undefined) return;
         const header = Buffer.allocUnsafe(4);
         header[0] = RTSP_MAGIC; header[1] = ch + 1; header.writeUInt16BE(packet.length, 2);
-        this.socket.write(Buffer.concat([header, packet]));
+        this.socket.write(header);
+        this.socket.write(packet);
     }
 
     private closed = false;

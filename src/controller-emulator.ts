@@ -215,7 +215,7 @@ export class ControllerEmulator extends EventEmitter {
     /**
      * Ask the camera to run on-board analytics and push detection events. On
      * UniFi the controller enables smart-detect; the camera then sends
-     * EventSmartDetect / EventSmartMotion / EventAnalytics (handled in main.ts).
+     * EventSmartDetect / EventSmartMotion / EventAnalytics (handled in detections.ts).
      * NOTE: verify with real motion in front of a camera; the exact payload the
      * G5 firmware wants may need tuning if events don't fire.
      */

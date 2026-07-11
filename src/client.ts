@@ -62,6 +62,9 @@ export class CameraApiClient {
             }, res => {
                 const chunks: Buffer[] = [];
                 res.on('data', (c: Buffer) => chunks.push(c));
+                // a mid-body connection drop emits 'error' (not 'end'); without this
+                // the promise would hang forever.
+                res.on('error', reject);
                 res.on('end', () => resolve({
                     statusCode: res.statusCode || 0,
                     headers: res.headers,

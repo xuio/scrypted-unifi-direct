@@ -136,63 +136,63 @@ export function buildZonePayloads(zones: ZoneDef[], ctx: ZoneBuildContext): Came
     //    truth. Skip only for cameras with no smart-detect capability at all.
     const smartFamily = of('smartDetect').length + of('exclude').length + of('line').length + of('loiter').length;
     if (smartFamily || ctx.supportedObjectTypes.length) {
-    const smart: any = {
-        deviceID: ctx.mac,
-        // proven enable fields (match our baseline enableDetections) …
-        objectTypes: ctx.globalObjectTypes,
-        enable: ctx.globalObjectTypes.length > 0,
-        // … plus the reverse-engineered global toggle Protect actually sends.
-        enableSmartDetect: ctx.globalObjectTypes,
-        enableTamperDetection: !!ctx.tamperDetection,
-        // The zones map REPLACES the camera's zones. Protect cameras always carry a
-        // default full-frame smart-detect zone, so sending an empty map leaves zero
-        // detect region → NO smart-detect events even with enableSmartDetect set.
-        // When the user has drawn no smart-detect zone but detection is enabled,
-        // synthesize that default full-frame zone (matches Protect's
-        // createDefaultSmartDetectZones), so detection runs across the whole frame.
-        zones: of('smartDetect').length
-            ? mapById(of('smartDetect'), z => ({
+        const smart: any = {
+            deviceID: ctx.mac,
+            // proven enable fields (match our baseline enableDetections) …
+            objectTypes: ctx.globalObjectTypes,
+            enable: ctx.globalObjectTypes.length > 0,
+            // … plus the reverse-engineered global toggle Protect actually sends.
+            enableSmartDetect: ctx.globalObjectTypes,
+            enableTamperDetection: !!ctx.tamperDetection,
+            // The zones map REPLACES the camera's zones. Protect cameras always carry a
+            // default full-frame smart-detect zone, so sending an empty map leaves zero
+            // detect region → NO smart-detect events even with enableSmartDetect set.
+            // When the user has drawn no smart-detect zone but detection is enabled,
+            // synthesize that default full-frame zone (matches Protect's
+            // createDefaultSmartDetectZones), so detection runs across the whole frame.
+            zones: of('smartDetect').length
+                ? mapById(of('smartDetect'), z => ({
+                    coord: polyCoord(z.points),
+                    sensitivity: clamp(z.sensitivity, 0, 100),
+                    objectTypes: z.objectTypes.length ? z.objectTypes : ['person'],
+                    triggerLight: true,
+                    triggerAccessTypes: [],
+                }))
+                : (ctx.globalObjectTypes.length
+                    ? { '1': { coord: FULL_FRAME_COORD, sensitivity: 50, objectTypes: ctx.globalObjectTypes, triggerLight: true, triggerAccessTypes: [] } }
+                    : {}),
+            excludeZones: mapById(of('exclude'), z => ({
                 coord: polyCoord(z.points),
+                objectTypes: ctx.supportedObjectTypes,
+                patrolSetID: -1,
+            })),
+            lines: mapById(of('line'), z => ({
+                coord: lineCoord(z.points),
+                crosslineDirection: CROSSLINE[z.direction] ?? 'none',
                 sensitivity: clamp(z.sensitivity, 0, 100),
                 objectTypes: z.objectTypes.length ? z.objectTypes : ['person'],
-                triggerLight: true,
-                triggerAccessTypes: [],
-            }))
-            : (ctx.globalObjectTypes.length
-                ? { '1': { coord: FULL_FRAME_COORD, sensitivity: 50, objectTypes: ctx.globalObjectTypes, triggerLight: true, triggerAccessTypes: [] } }
-                : {}),
-        excludeZones: mapById(of('exclude'), z => ({
-            coord: polyCoord(z.points),
-            objectTypes: ctx.supportedObjectTypes,
-            patrolSetID: -1,
-        })),
-        lines: mapById(of('line'), z => ({
-            coord: lineCoord(z.points),
-            crosslineDirection: CROSSLINE[z.direction] ?? 'none',
-            sensitivity: clamp(z.sensitivity, 0, 100),
-            objectTypes: z.objectTypes.length ? z.objectTypes : ['person'],
-            triggerLight: false,
-        })),
-        loiterZones: mapById(of('loiter'), z => {
-            const types = z.objectTypes.length ? z.objectTypes : ['person'];
-            const loiterTriggerTimeMaps: Record<string, any> = {};
-            types.forEach((ot, i) => {
-                loiterTriggerTimeMaps[String(i)] = {
-                    loiterTriggerTime: clamp(Math.round(z.loiterSeconds * 1000), 1, 300000),
-                    objectType: ot,
-                };
-            });
-            return {
-                coord: polyCoord(z.points),
-                sensitivity: clamp(z.sensitivity, 0, 100),
                 triggerLight: false,
-                triggerAccessTypes: [],
-                loiterTriggerTimeMaps,
-                objectTypes: types,
-            };
-        }),
-    };
-    cmds.push({ fn: 'ChangeSmartDetectSettings', payload: smart });
+            })),
+            loiterZones: mapById(of('loiter'), z => {
+                const types = z.objectTypes.length ? z.objectTypes : ['person'];
+                const loiterTriggerTimeMaps: Record<string, any> = {};
+                types.forEach((ot, i) => {
+                    loiterTriggerTimeMaps[String(i)] = {
+                        loiterTriggerTime: clamp(Math.round(z.loiterSeconds * 1000), 1, 300000),
+                        objectType: ot,
+                    };
+                });
+                return {
+                    coord: polyCoord(z.points),
+                    sensitivity: clamp(z.sensitivity, 0, 100),
+                    triggerLight: false,
+                    triggerAccessTypes: [],
+                    loiterTriggerTimeMaps,
+                    objectTypes: types,
+                };
+            }),
+        };
+        cmds.push({ fn: 'ChangeSmartDetectSettings', payload: smart });
     }
 
     // 2) Motion zones: send both algorithm variants; the camera honours the one
