@@ -7,12 +7,22 @@ import { dbg } from './debug';
 
 type Logger = { log?: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
+// ffmpeg emits a large keyframe as a burst of ~150+ RTP packets into the loopback
+// in well under a millisecond. The default OS UDP receive buffer (~200 KB) only
+// holds ~160 packets, so a keyframe burst — especially with several cameras' GOPs
+// coinciding while the event loop is briefly busy — overflows it and the kernel
+// silently drops packets. A shredded keyframe then corrupts video until the next
+// one (a full GOP later), which is exactly the periodic hitch. Grow the receive
+// buffer to hold several keyframes' worth so a burst can never overflow it (this is
+// the UDP analogue of the reliable, back-pressured TCP path the real controller uses).
+const UDP_RCVBUF = 8 * 1024 * 1024;
 async function bindUdp(): Promise<{ socket: dgram.Socket; port: number }> {
-    const socket = dgram.createSocket('udp4');
+    const socket = dgram.createSocket({ type: 'udp4', recvBufferSize: UDP_RCVBUF });
     await new Promise<void>((resolve, reject) => {
         socket.once('error', reject);
         socket.bind(0, '127.0.0.1', () => { socket.removeListener('error', reject); resolve(); });
     });
+    try { if (socket.getRecvBufferSize() < UDP_RCVBUF / 2) socket.setRecvBufferSize(UDP_RCVBUF); } catch { }
     return { socket, port: (socket.address() as AddressInfo).port };
 }
 
@@ -267,7 +277,7 @@ export async function startRtspServe(opts: {
             '-hide_banner', '-loglevel', 'error',
             '-analyzeduration', '3000000', '-probesize', '3000000', '-fflags', '+genpts',
             '-f', 'flv', '-i', 'pipe:0', ...extra,
-            '-f', 'rtp', `rtp://127.0.0.1:${port}?pkt_size=1200`,
+            '-f', 'rtp', `rtp://127.0.0.1:${port}?pkt_size=1200&buffer_size=${UDP_RCVBUF}`,
         ];
         const cp = spawn(ffmpegPath, args, { stdio: ['pipe', 'pipe', 'pipe'] });
         cp.stdin!.on('error', () => { });
