@@ -144,13 +144,23 @@ export function buildZonePayloads(zones: ZoneDef[], ctx: ZoneBuildContext): Came
         // … plus the reverse-engineered global toggle Protect actually sends.
         enableSmartDetect: ctx.globalObjectTypes,
         enableTamperDetection: !!ctx.tamperDetection,
-        zones: mapById(of('smartDetect'), z => ({
-            coord: polyCoord(z.points),
-            sensitivity: clamp(z.sensitivity, 0, 100),
-            objectTypes: z.objectTypes.length ? z.objectTypes : ['person'],
-            triggerLight: true,
-            triggerAccessTypes: [],
-        })),
+        // The zones map REPLACES the camera's zones. Protect cameras always carry a
+        // default full-frame smart-detect zone, so sending an empty map leaves zero
+        // detect region → NO smart-detect events even with enableSmartDetect set.
+        // When the user has drawn no smart-detect zone but detection is enabled,
+        // synthesize that default full-frame zone (matches Protect's
+        // createDefaultSmartDetectZones), so detection runs across the whole frame.
+        zones: of('smartDetect').length
+            ? mapById(of('smartDetect'), z => ({
+                coord: polyCoord(z.points),
+                sensitivity: clamp(z.sensitivity, 0, 100),
+                objectTypes: z.objectTypes.length ? z.objectTypes : ['person'],
+                triggerLight: true,
+                triggerAccessTypes: [],
+            }))
+            : (ctx.globalObjectTypes.length
+                ? { '1': { coord: FULL_FRAME_COORD, sensitivity: 50, objectTypes: ctx.globalObjectTypes, triggerLight: true, triggerAccessTypes: [] } }
+                : {}),
         excludeZones: mapById(of('exclude'), z => ({
             coord: polyCoord(z.points),
             objectTypes: ctx.supportedObjectTypes,

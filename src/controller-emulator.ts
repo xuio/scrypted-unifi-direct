@@ -219,7 +219,6 @@ export class ControllerEmulator extends EventEmitter {
             // may be empty to disable) right after 'online', so hardcoding an
             // enable-all here would fight the user's choice on every reconnect.
             s.send('ChangeSmartMotionSettings', { deviceID, enable: true }, true);
-            s.send('ChangeAnalyticsSettings', { deviceID, enable: true, motionAlgorithm: 'enhanced' }, true);
             dbg('emulator enableDetections (motion baseline)', s.mac);
         } catch (e) { dbg('enableDetections failed', s.mac, (e as Error)?.message); }
     }
