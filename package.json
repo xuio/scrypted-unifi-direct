@@ -1,5 +1,5 @@
 {
-  "name": "@scrypted/unifi-direct",
+  "name": "scrypted-unifi-direct",
   "version": "0.1.0",
   "description": "Connect Scrypted directly to UniFi Protect cameras with no NVR/Console — live video, snapshots, audio, on-camera detections, zones, and full camera settings.",
   "author": "moritz",
