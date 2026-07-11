@@ -43,7 +43,7 @@ function extractSdp(stderr: string, expectSections: number): string | undefined 
     return sdp.join('\r\n') + '\r\n';
 }
 
-interface SdpInfo {
+export interface SdpInfo {
     /** SDP annotated with per-track `a=control:trackID=N` lines. */
     sdp: string;
     /** trackID for the video/audio media section, if present. */
@@ -95,8 +95,10 @@ const MAX_RTP_BACKLOG = 16 * 1024 * 1024;
  * just enough RTSP-over-TCP: OPTIONS / DESCRIBE / SETUP (interleaved) / PLAY /
  * GET_PARAMETER / TEARDOWN, then relays RTP as interleaved frames on the same
  * socket. Compatible with ffmpeg's and Scrypted's RTSP clients.
+ * (Shared with the native-JS muxer path in native-rtsp.ts, so both paths
+ * present byte-identical RTSP behavior to clients.)
  */
-class RtspSession {
+export class RtspSession {
     private buf: Buffer = Buffer.alloc(0);
     private session = randomBytes(4).toString('hex');
     /** control (trackID=N) -> interleaved RTP channel the client requested. */
