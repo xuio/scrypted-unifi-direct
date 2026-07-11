@@ -571,38 +571,46 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     // ---- detections (driven by ControllerEmulator 'event') ----
     onCameraEvent(fn: string, payload: any) {
         if (fn === 'EventSmartDetect' || fn === 'EventSmartDetectZone') {
-            // The camera reports one descriptor per tracked object, each with a
-            // bounding box (`coord` = [x,y,w,h] normalised to 0..1000 of the full
-            // sensor FoV), a class, a confidence and a tracker id. We scale the box
-            // into real detection-frame pixels and report the frame's true 16:9
-            // dimensions so Scrypted maps/crops it correctly (a square input space
-            // would make Scrypted's aspect correction shift the box vertically).
+            // `edgeType:"none"` payloads are raw tracker noise (Protect only uses
+            // them for Insights); skip them for detection reporting.
+            if (payload?.edgeType === 'none') { this.triggerMotion(); return; }
+            // The event's top-level `objectTypes` is the AUTHORITATIVE list of what
+            // the camera actually detected; the per-descriptor `objectType` flickers
+            // per frame (e.g. a person momentarily classified as vehicle at ~0.5
+            // confidence). Reporting the descriptor's raw class made Scrypted show
+            // spurious extra types ("car + person" for a person). So use the
+            // confirmed list: keep a descriptor whose class is confirmed, and when
+            // exactly one type is confirmed, relabel a flickering descriptor to it
+            // (keeps the box + tracker); otherwise drop it. On 'leave' objectTypes
+            // is empty → nothing is reported (the object is gone).
+            const confirmed: string[] = Array.isArray(payload?.objectTypes)
+                ? payload.objectTypes.filter((t: any) => typeof t === 'string') : [];
             const fov = CHANNELS.high;                    // detection runs on the full FoV
             const sx = fov.w / 1000, sy = fov.h / 1000;
             const descriptors: any[] = Array.isArray(payload?.descriptors) ? payload.descriptors : [];
             const detections = descriptors
                 .filter(d => d && d.objectType)
                 .map(d => {
-                    const det: any = {
-                        className: d.objectType,
-                        score: typeof d.confidenceLevel === 'number' ? d.confidenceLevel / 100 : 1,
-                    };
+                    let className = d.objectType;
+                    if (!confirmed.includes(className)) {
+                        if (confirmed.length === 1) className = confirmed[0];  // per-frame flicker → authoritative type
+                        else return undefined;                                 // unconfirmed / ambiguous → drop
+                    }
+                    const det: any = { className, score: typeof d.confidenceLevel === 'number' ? d.confidenceLevel / 100 : 1 };
                     const c = d.coord;
                     if (Array.isArray(c) && c.length === 4)
                         det.boundingBox = [c[0] * sx, c[1] * sy, c[2] * sx, c[3] * sy];
                     if (d.trackerID != null) det.id = String(d.trackerID);
                     return det;
-                });
-            // firmware fallback: no descriptors, just the class list (no box).
+                })
+                .filter((d): d is any => !!d);
+            // fallback: no usable descriptors but confirmed types → class-only.
             if (!detections.length)
-                for (const t of (payload?.smartDetectTypes || payload?.objectTypes || []))
-                    detections.push({ className: t, score: 1 });
-            const detected: ObjectsDetected = {
-                timestamp: Date.now(),
-                detections,
-                inputDimensions: [fov.w, fov.h],
-            };
-            this.onDeviceEvent(ScryptedInterface.ObjectDetector, detected);
+                for (const t of confirmed) detections.push({ className: t, score: 1 });
+            if (detections.length) {
+                const detected: ObjectsDetected = { timestamp: Date.now(), detections, inputDimensions: [fov.w, fov.h] };
+                this.onDeviceEvent(ScryptedInterface.ObjectDetector, detected);
+            }
             this.triggerMotion();
         } else if (/motion/i.test(fn) || fn === 'EventAnalytics') {
             this.triggerMotion();
