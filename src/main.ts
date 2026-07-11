@@ -76,8 +76,14 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     async ensurePaired(): Promise<void> {
         const addr = this.provider.getPushAddress();
         if (!addr) throw new Error('set "Scrypted address (reachable from camera)" in the plugin settings');
-        if (this.provider.emulator?.isOnline(this.mac)) return;
+        if (this.mac && this.provider.emulator?.isOnline(this.mac)) return;
         try {
+            // Self-heal the stored MAC. The emulator keys sessions by the camera's
+            // real MAC; if the stored value ever drifts (e.g. an external tool
+            // overwrote the `mac` key — the HomeKit mixin also uses `mac`), the
+            // camera would look permanently "offline" and never stream. Whenever
+            // we're not online, reconcile against the camera's actual MAC.
+            await this.reconcileMac();
             const current = await this.getClient().getControllerAddr();
             if (current !== addr) {
                 this.console.log(`[unifi-direct] pairing ${this.mac}: controller.addr ${current} -> ${addr}`);
@@ -86,6 +92,17 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         } catch (e) {
             this.console.warn('pairing check failed', (e as Error)?.message);
         }
+    }
+
+    /** Repair the stored MAC if it no longer matches the camera's real MAC. */
+    private async reconcileMac(): Promise<void> {
+        try {
+            const real = await this.getClient().getMac();
+            if (real && real !== this.mac) {
+                this.console.warn(`[unifi-direct] stored mac "${this.mac}" != camera mac "${real}"; repairing`);
+                this.storage.setItem('mac', real);
+            }
+        } catch { /* camera unreachable — leave as-is */ }
     }
 
     // ---- Camera (snapshot) ----
@@ -222,9 +239,11 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         let statusLine = '';
         let cameraSettings: any;
         const online = this.provider.emulator?.isOnline(this.mac);
+        const live = [...this.streams.values()].some(s => s.alive);
+        const streamState = this.streams.size ? (live ? 'live' : 'stalled') : 'idle';
         try {
             const s = await this.getClient().getStatus();
-            statusLine = `${s.board?.name || '?'} · fw ${s.fw?.semver || '?'} · emulator=${online ? 'CONNECTED' : 'waiting'} · ctrl=${s.controller?.host}`;
+            statusLine = `${s.board?.name || '?'} · fw ${s.fw?.semver || '?'} · emulator=${online ? 'CONNECTED' : 'waiting'} · stream=${streamState} · ctrl=${s.controller?.host}`;
             cameraSettings = await this.getClient().getSettings();
         } catch (e: any) {
             statusLine = `not reachable: ${e?.message || e}`;

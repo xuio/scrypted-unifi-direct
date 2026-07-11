@@ -168,6 +168,7 @@ export class ControllerEmulator extends EventEmitter {
                 if (!session.authenticated) {
                     session.authenticated = true;
                     this.log('camera authenticated', session.mac);
+                    this.quiesceSubstreams(session);
                     this.enableDetections(session);
                     this.emit('online', session.mac);
                 }
@@ -201,6 +202,25 @@ export class ControllerEmulator extends EventEmitter {
             s.send('ChangeAnalyticsSettings', { deviceID, enable: true, motionAlgorithm: 'enhanced' }, true);
             dbg('emulator enableDetections', s.mac, objectTypes);
         } catch (e) { dbg('enableDetections failed', s.mac, (e as Error)?.message); }
+    }
+
+    /**
+     * On adoption, stop the low-res substreams (video2/video3) that a previous
+     * NVR may have left pushing to an external host at a different audio rate.
+     * That contention forces the camera's shared audio encoder into a
+     * scalable/SSR AAC that decodes as garbage on the stream we consume. Pointing
+     * them at /dev/null with audio off up front means the encoder comes up clean
+     * (no per-camera reboot needed) and the camera stops wasting uplink to a dead
+     * relay. The active stream re-asserts this in startStream.
+     */
+    private quiesceSubstreams(s: CameraSession) {
+        try {
+            const video: Record<string, any> = {};
+            for (const t of ['video2', 'video3'])
+                video[t] = { avSerializer: { type: 'extendedFlv', parameters: { withOpus: false }, destinations: ['file:///dev/null'] } };
+            s.send('ChangeVideoSettings', { video }, true);
+            dbg('emulator quiesceSubstreams', s.mac);
+        } catch (e) { dbg('quiesceSubstreams failed', s.mac, (e as Error)?.message); }
     }
 
     /** Command a camera to push the given channel's video to destHost:destPort. */
