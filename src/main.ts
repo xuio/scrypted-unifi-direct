@@ -349,6 +349,48 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         for (const a of UnifiCamera.ZONE_ATTRS) this.storage.removeItem(this.zoneKey(name, a));
     }
 
+    /**
+     * One-time import of zones already configured on the camera so they show up in
+     * Scrypted. Privacy masks persist as ISP settings (readable, non-destructively,
+     * from `isp.masks`) and are the ones that survive adoption — import them as
+     * privacy zones. (Smart-detect/motion zones are controller-managed: once a
+     * camera is adopted here we assert that config, so there's nothing pre-existing
+     * to preserve, and the only read path for them is destructive.)
+     */
+    private importCameraZones(cameraSettings: any): void {
+        if (this.storage.getItem('zonesImported') === 'true') return;
+        try {
+            const masks = cameraSettings?.isp?.masks || {};
+            const names = [...this.zoneNames];
+            let imported = 0;
+            for (const key of Object.keys(masks)) {
+                if (key === 'color' || key === '0') continue;
+                const coord = masks[key]?.coord;
+                if (!Array.isArray(coord) || coord.length < 6) continue;
+                const pts: [number, number][] = [];
+                for (let i = 0; i + 1 < coord.length; i += 2)
+                    pts.push([coord[i] / 1000, coord[i + 1] / 1000]);
+                const name = `Camera Privacy ${key}`;
+                if (names.includes(name)) continue;
+                this.seedZoneDefaults(name);
+                this.storage.setItem(this.zoneKey(name, 'type'), 'privacy');
+                this.storage.setItem(this.zoneKey(name, 'points'), JSON.stringify(pts));
+                names.push(name);
+                imported++;
+            }
+            if (imported) {
+                this.storage.setItem('zoneNames', JSON.stringify(names));
+                // Reflect that these masks are already on the camera so the next
+                // applyPrivacyMasks reconciles from the right count.
+                this.storage.setItem('privacyCount', String(imported));
+            }
+            this.storage.setItem('zonesImported', 'true');
+            dbg('importCameraZones', this.mac, 'imported', imported, 'privacy mask(s)');
+        } catch (e) {
+            dbg('importCameraZones failed', this.mac, (e as Error)?.message);
+        }
+    }
+
     /** Push the current zone configuration to the camera over the mgmt channel. */
     async applyZones(): Promise<void> {
         const emulator = this.provider.emulator;
@@ -599,6 +641,7 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             cameraFeatures = (s as any)?.features || {};
             this.cachedFeatures = cameraFeatures;
             cameraSettings = await this.getClient().getSettings();
+            this.importCameraZones(cameraSettings);
         } catch (e: any) {
             statusLine = `not reachable: ${e?.message || e}`;
         }
