@@ -11,6 +11,7 @@ import sdk, {
     MotionSensor,
     ObjectDetector,
     ObjectsDetected,
+    ObjectDetectionResult,
     RequestMediaStreamOptions,
     RequestPictureOptions,
     ResponseMediaStreamOptions,
@@ -653,47 +654,73 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             // `edgeType:"none"` payloads are raw tracker noise (Protect only uses
             // them for Insights); skip them for detection reporting.
             if (payload?.edgeType === 'none') { this.triggerMotion(); return; }
-            // The event's top-level `objectTypes` is the AUTHORITATIVE list of what
-            // the camera actually detected; the per-descriptor `objectType` flickers
-            // per frame (e.g. a person momentarily classified as vehicle at ~0.5
-            // confidence). Reporting the descriptor's raw class made Scrypted show
-            // spurious extra types ("car + person" for a person). So use the
-            // confirmed list: keep a descriptor whose class is confirmed, and when
-            // exactly one type is confirmed, relabel a flickering descriptor to it
-            // (keeps the box + tracker); otherwise drop it. On 'leave' objectTypes
-            // is empty → nothing is reported (the object is gone).
-            const confirmed: string[] = Array.isArray(payload?.objectTypes)
-                ? payload.objectTypes.filter((t: any) => typeof t === 'string') : [];
             const fov = CHANNELS.high;                    // detection runs on the full FoV
             const sx = fov.w / 1000, sy = fov.h / 1000;
             const descriptors: any[] = Array.isArray(payload?.descriptors) ? payload.descriptors : [];
-            const detections = descriptors
-                .filter(d => d && d.objectType)
-                .map(d => {
-                    let className = d.objectType;
-                    if (!confirmed.includes(className)) {
-                        if (confirmed.length === 1) className = confirmed[0];  // per-frame flicker → authoritative type
-                        else return undefined;                                 // unconfirmed / ambiguous → drop
-                    }
-                    const det: any = { className, score: typeof d.confidenceLevel === 'number' ? d.confidenceLevel / 100 : 1 };
-                    const c = d.coord;
-                    if (Array.isArray(c) && c.length === 4)
-                        det.boundingBox = [c[0] * sx, c[1] * sy, c[2] * sx, c[3] * sy];
-                    if (d.trackerID != null) det.id = String(d.trackerID);
-                    return det;
-                })
-                .filter((d): d is any => !!d);
-            // fallback: no usable descriptors but confirmed types → class-only.
-            if (!detections.length)
-                for (const t of confirmed) detections.push({ className: t, score: 1 });
+            const now = Date.now();
+
+            // Report ONE detection per physical object (trackerID). Each object's
+            // class is stabilised by a confidence-weighted vote across frames, the
+            // way Protect keeps one consistent type per track: the per-frame
+            // descriptor `objectType` can momentarily misclassify (e.g. a person
+            // flickering to "vehicle" at low confidence), and the event's top-level
+            // `objectTypes` is a CUMULATIVE union that never drops such a flicker —
+            // so neither is safe to report verbatim. Voting means a brief low-score
+            // "vehicle" can't overtake a sustained high-score "person", so a single
+            // object is never tagged with two types. Genuinely distinct objects keep
+            // separate trackerIDs and so still report as separate detections.
+            const byTracker = new Map<string, any>();     // one (best) descriptor per object this frame
+            for (const d of descriptors) {
+                if (!d || !d.objectType) continue;
+                const id = d.trackerID != null ? String(d.trackerID) : `anon:${d.objectType}`;
+                const prev = byTracker.get(id);
+                if (!prev || (d.confidenceLevel || 0) > (prev.confidenceLevel || 0)) byTracker.set(id, d);
+            }
+            const detections: ObjectDetectionResult[] = [];
+            for (const [id, d] of byTracker) {
+                const conf = typeof d.confidenceLevel === 'number' ? d.confidenceLevel : 50;
+                const className = d.trackerID != null ? this.stabilizeTrackerClass(id, d.objectType, conf, now) : d.objectType;
+                const det: ObjectDetectionResult = { className, score: conf / 100 };
+                const c = d.coord;
+                if (Array.isArray(c) && c.length === 4)
+                    det.boundingBox = [c[0] * sx, c[1] * sy, c[2] * sx, c[3] * sy];
+                if (d.trackerID != null) det.id = id;
+                detections.push(det);
+            }
+            // Fallback for a descriptor-less payload: only report a class when it's
+            // unambiguous (exactly one confirmed type). The cumulative objectTypes
+            // union could otherwise fabricate a second class for a single object.
+            if (!detections.length) {
+                const confirmed: string[] = Array.isArray(payload?.objectTypes)
+                    ? payload.objectTypes.filter((t: any) => typeof t === 'string') : [];
+                if (confirmed.length === 1) detections.push({ className: confirmed[0], score: 1 });
+            }
             if (detections.length) {
-                const detected: ObjectsDetected = { timestamp: Date.now(), detections, inputDimensions: [fov.w, fov.h] };
+                const detected: ObjectsDetected = { timestamp: now, detections, inputDimensions: [fov.w, fov.h] };
                 this.onDeviceEvent(ScryptedInterface.ObjectDetector, detected);
             }
             this.triggerMotion();
         } else if (/motion/i.test(fn) || fn === 'EventAnalytics') {
             this.triggerMotion();
         }
+    }
+
+    // Per-trackerID class stabiliser: a confidence-weighted running vote so a
+    // single tracked object keeps one consistent class despite per-frame flicker.
+    private trackerVotes = new Map<string, { hits: Record<string, number>, last: number }>();
+    private stabilizeTrackerClass(id: string, cls: string, conf: number, now: number): string {
+        // Bound memory: occasionally drop trackers idle for a while.
+        if (this.trackerVotes.size > 128)
+            for (const [k, v] of this.trackerVotes) if (now - v.last > 30000) this.trackerVotes.delete(k);
+        let v = this.trackerVotes.get(id);
+        // A trackerID idle >30s is treated as a new object (IDs get reused across
+        // unrelated events), so it doesn't inherit the previous object's votes.
+        if (!v || now - v.last > 30000) { v = { hits: {}, last: now }; this.trackerVotes.set(id, v); }
+        v.last = now;
+        v.hits[cls] = (v.hits[cls] || 0) + Math.max(1, conf);   // weight each vote by confidence
+        let best = cls, bestN = -1;
+        for (const [c, n] of Object.entries(v.hits)) if (n > bestN) { bestN = n; best = c; }
+        return best;
     }
 
     private triggerMotion() {
