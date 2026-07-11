@@ -9,12 +9,12 @@ type Logger = { log: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
-// The camera has ONE shared audio encoder feeding all stream serializers. Several
-// cameras have leftover substream (video2/video3) serializers locked at 24 kHz
-// that can't be changed via the settings API, so requesting a different rate on
-// video1 makes the encoder emit mixed-rate frames that decode as garbage on every
-// camera except the one whose substreams happen to be clean. Requesting the same
-// 24 kHz the substreams use keeps every serializer consistent → clean AAC.
+// The camera has ONE shared audio encoder feeding all stream serializers. Mixed
+// rates across serializers make it emit garbage-decoding AAC, so we quiesce the
+// substreams (video2/video3 → /dev/null, audio off) and request 16 kHz on video1
+// — 16000 is the camera's native Opus/AAC rate (features.opusSampleRates=[16000]),
+// verified clean on all cameras. (Older notes mentioned 24 kHz; that predates the
+// substream quiesce and no longer applies.)
 const AUDIO_SAMPLE_RATE = 16000;
 const AUDIO_WITH_OPUS = true;
 
@@ -31,6 +31,10 @@ function encodeFrame(payload: Buffer, opcode = 0x2) {
     return Buffer.concat([header, payload]);
 }
 
+// A single mgmt message is JSON config/status; anything beyond this is corruption
+// or a hostile peer. Cap it so a bogus 64-bit length can't make us buffer forever.
+const MAX_WS_FRAME = 8 * 1024 * 1024;
+
 function makeFrameParser(onMessage: (b: Buffer) => void, onControl: (t: string, b: Buffer) => void) {
     let buf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
     return (chunk: Buffer) => {
@@ -41,6 +45,7 @@ function makeFrameParser(onMessage: (b: Buffer) => void, onControl: (t: string, 
             let len = buf[1] & 0x7f, off = 2;
             if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
             else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
+            if (len > MAX_WS_FRAME) { onControl('close', Buffer.alloc(0)); return; }
             let mask: Buffer | undefined;
             if (masked) { if (buf.length < off + 4) return; mask = buf.subarray(off, off + 4); off += 4; }
             if (buf.length < off + len) return;
@@ -120,10 +125,18 @@ export class ControllerEmulator extends EventEmitter {
 
     private handleSession(mac: string, socket: net.Socket) {
         this.log('camera connected', mac);
+        // Detect a hard-powered-off / half-open camera: without keepalive the OS
+        // never surfaces the dead peer and the session would linger forever
+        // (isOnline() stays true, every stream attempt writes into a dead socket).
+        try { socket.setKeepAlive(true, 20000); } catch { }
         const send = (fn: string, payload: any, responseExpected = false, inResponseTo = 0) => {
             const env = { from: 'UniFiVideo', to: 'ubnt_avclient', functionName: fn, inResponseTo, messageId: this.msgId++, payload, responseExpected, timeStamp: new Date().toISOString() };
-            if (!socket.writableEnded) socket.write(encodeFrame(Buffer.from(JSON.stringify(env))));
+            if (!socket.writableEnded && !socket.destroyed) socket.write(encodeFrame(Buffer.from(JSON.stringify(env))));
         };
+        // If this MAC already has a session (reconnect before the old close fired),
+        // tear down the stale socket so its parser can't double-fire the handshake.
+        const prev = this.sessions.get(mac);
+        if (prev && prev.socket !== socket) { try { prev.socket.destroy(); } catch { } }
         const session: CameraSession = { mac, socket, send, authenticated: false };
         this.sessions.set(mac, session);
 
@@ -199,12 +212,15 @@ export class ControllerEmulator extends EventEmitter {
      */
     private enableDetections(s: CameraSession) {
         const deviceID = s.mac;
-        const objectTypes = ['person', 'vehicle', 'animal', 'package'];
         try {
-            s.send('ChangeSmartDetectSettings', { deviceID, objectTypes, enable: true }, true);
+            // Baseline motion enable only. Smart-detect (object types) is NOT set
+            // here — the camera device's applyZones() asserts the full smart-detect
+            // state (enableSmartDetect = the user's configured object types, which
+            // may be empty to disable) right after 'online', so hardcoding an
+            // enable-all here would fight the user's choice on every reconnect.
             s.send('ChangeSmartMotionSettings', { deviceID, enable: true }, true);
             s.send('ChangeAnalyticsSettings', { deviceID, enable: true, motionAlgorithm: 'enhanced' }, true);
-            dbg('emulator enableDetections', s.mac, objectTypes);
+            dbg('emulator enableDetections (motion baseline)', s.mac);
         } catch (e) { dbg('enableDetections failed', s.mac, (e as Error)?.message); }
     }
 

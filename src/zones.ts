@@ -70,6 +70,11 @@ export const ZONE_DEFAULTS: Omit<ZoneDef, 'name' | 'type' | 'points'> = {
 /** UniFi camera coordinate space: normalised 0..1 → integer 0..1000. */
 export const CAMERA_COORD_FACTOR = 1000;
 
+/** Full-frame polygon in camera coords (used to reset motion to "everywhere"). */
+const FULL_FRAME_COORD = [0, 0, 1000, 0, 1000, 1000, 0, 1000];
+/** Upper bound on privacy-mask indices to null out when clearing (features.privacyMasks.maxZones). */
+const PRIVACY_MAX_ZONES = 16;
+
 export interface CameraCommand { fn: string; payload: any; }
 
 export interface ZoneBuildContext {
@@ -78,12 +83,12 @@ export interface ZoneBuildContext {
     globalObjectTypes: string[];
     /** All camera-supported classes (featureFlags.smartDetectTypes) — used for exclude zones. */
     supportedObjectTypes: string[];
-    /** Emit a privacy-mask clear ({0:null}) even when no privacy zone exists
-     *  (used when the last privacy zone was just removed). */
+    /** Emit a privacy-mask clear even when no privacy zone exists (used when the
+     *  last privacy zone was just removed). */
     clearPrivacy?: boolean;
-    /** Emit an (empty) ChangeSmartDetectSettings to wipe zones even when no
-     *  smart-detect zone exists (used when the last one was just removed). */
-    clearSmart?: boolean;
+    /** Reset motion to a full-frame zone even when no motion zone exists (used
+     *  when the last motion zone was just removed). */
+    clearMotion?: boolean;
     /** Global tamper-detection enable (smartDetectSettings.enableTamperDetection). */
     tamperDetection?: boolean;
 }
@@ -122,16 +127,20 @@ function mapById<T>(zones: ZoneDef[], make: (z: ZoneDef, id: number) => T): Reco
  * enable); motion and privacy are emitted only when relevant.
  */
 export function buildZonePayloads(zones: ZoneDef[], ctx: ZoneBuildContext): CameraCommand[] {
-    const usable = zones.filter(z => z.enabled && z.points.length >= ZONE_TYPES[z.type].minPoints);
+    // Guard against an unknown stored zone type (corrupt storage) — skip it rather
+    // than throw on ZONE_TYPES[z.type].
+    const usable = zones.filter(z => ZONE_TYPES[z.type] && z.enabled && z.points.length >= ZONE_TYPES[z.type].minPoints);
     const of = (t: ZoneType) => usable.filter(z => z.type === t);
     const cmds: CameraCommand[] = [];
 
-    // 1) Smart detection: zones + exclude + lines + loiter, all in one message,
-    //    preserving the global object-type enable so we never disable detection.
-    //    Only emit when smart-detect-family zones exist (or need clearing) so
-    //    cameras with no zones keep the exact enable message that already works.
+    // 1) Smart detection: zones + exclude + lines + loiter, all in one message.
+    //    ALWAYS emit for a detection-capable camera so the global enable state
+    //    (enableSmartDetect = the user's chosen object types, possibly empty to
+    //    disable) is authoritatively asserted on every apply/reconnect — the
+    //    emulator no longer hardcodes the enable, so this is the single source of
+    //    truth. Skip only for cameras with no smart-detect capability at all.
     const smartFamily = of('smartDetect').length + of('exclude').length + of('line').length + of('loiter').length;
-    if (smartFamily || ctx.clearSmart || ctx.globalObjectTypes.length) {
+    if (smartFamily || ctx.supportedObjectTypes.length) {
     const smart: any = {
         deviceID: ctx.mac,
         // proven enable fields (match our baseline enableDetections) …
@@ -182,27 +191,30 @@ export function buildZonePayloads(zones: ZoneDef[], ctx: ZoneBuildContext): Came
     }
 
     // 2) Motion zones: send both algorithm variants; the camera honours the one
-    //    it runs. level = 100 - sensitivity (UniFi convention).
+    //    it runs. level = 100 - sensitivity (UniFi convention). When the last
+    //    motion zone was just removed (clearMotion), reset to a single full-frame
+    //    zone so motion is detected everywhere again — otherwise the deleted
+    //    zone's restriction would persist on the camera.
     const motion = of('motion');
-    if (motion.length) {
-        const zonesMap = mapById(motion, z => ({
-            coord: polyCoord(z.points),
-            level: clamp(100 - z.sensitivity, 0, 100),
-            triggerLight: false,
-        }));
+    if (motion.length || ctx.clearMotion) {
+        const zonesMap = motion.length
+            ? mapById(motion, z => ({ coord: polyCoord(z.points), level: clamp(100 - z.sensitivity, 0, 100), triggerLight: false }))
+            : { '1': { coord: FULL_FRAME_COORD, level: 50, triggerLight: false } };
         cmds.push({ fn: 'ChangeSmartMotionSettings', payload: { deviceID: ctx.mac, enable: true, bgmodel: 'default', zones: zonesMap } });
         cmds.push({ fn: 'ChangeAnalyticsSettings', payload: { deviceID: ctx.mac, sendEvents: 1, sendPulse: 1, bgmodel: 'default', pulsePeriodSec: 2, incremental: false, zones: zonesMap } });
     }
 
-    // 3) Privacy masks via ISP. Populated masks, or an explicit clear when the
-    //    last privacy zone was just removed.
+    // 3) Privacy masks via ISP. Send the current masks (keyed 1..N) AND null out
+    //    the indices above N up to the camera's max, so removing one of several
+    //    masks doesn't orphan the higher-numbered ones on the camera (masks merge
+    //    by key). A full clear (no privacy zones left) nulls index 0..max.
     const privacy = of('privacy');
-    if (privacy.length) {
+    if (privacy.length || ctx.clearPrivacy) {
         const masks: any = { color: [0, 128, 128] };
         privacy.forEach((z, i) => { masks[String(i + 1)] = { update: true, coord: polyCoord(z.points) }; });
+        for (let i = privacy.length + 1; i <= PRIVACY_MAX_ZONES; i++) masks[String(i)] = null;
+        if (!privacy.length) masks['0'] = null;
         cmds.push({ fn: 'ChangeIspSettings', payload: { deviceID: ctx.mac, masks } });
-    } else if (ctx.clearPrivacy) {
-        cmds.push({ fn: 'ChangeIspSettings', payload: { deviceID: ctx.mac, masks: { 0: null } } });
     }
 
     return cmds;

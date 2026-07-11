@@ -77,6 +77,8 @@ function combineSdp(videoSdp: string, audioSdp?: string): SdpInfo {
 }
 
 const RTSP_MAGIC = 0x24; // '$'
+/** Drop an RTSP client whose unsent TCP backlog exceeds this (slow/stalled reader). */
+const MAX_RTP_BACKLOG = 16 * 1024 * 1024;
 
 /**
  * A single RTSP client session (Scrypted connects out as the client). Speaks
@@ -193,6 +195,14 @@ class RtspSession {
         if (!this.playing || !control || this.socket.destroyed) return;
         const ch = this.channels.get(control);
         if (ch === undefined || !this.socket.writable) return;
+        // Backpressure guard: a client that stops reading keeps `writable` true while
+        // Node buffers every packet in memory at stream bitrate (~MB/s). Drop the
+        // session once the send queue blows past a threshold rather than grow unbounded.
+        if (this.socket.writableLength > MAX_RTP_BACKLOG) {
+            dbg('rtsp-serve client backpressure, dropping session', this.ua, this.socket.writableLength);
+            this.close();
+            return;
+        }
         const header = Buffer.allocUnsafe(4);
         header[0] = RTSP_MAGIC; header[1] = ch; header.writeUInt16BE(packet.length, 2);
         this.socket.write(Buffer.concat([header, packet]));
@@ -298,6 +308,12 @@ export async function startRtspServe(opts: {
         try { flv.destroy(); } catch { }
     };
 
+    // Register teardown triggers BEFORE the (multi-second) SDP awaits below, or an
+    // ffmpeg death / feed close during that window is missed (the event fires before
+    // the handler is attached) and the serve lingers until the RTP-stall reaper.
+    cpVideo.once('exit', code => { dbg('rtsp-serve video ffmpeg exited', code); videoAlive = false; destroy(); });
+    flv.once('close', destroy);
+
     const readSdp = (cp: ChildProcess, timeoutMs: number) => new Promise<string>((resolve, reject) => {
         let buf = '';
         const timer = setTimeout(() => reject(new Error('sdp timeout')), timeoutMs);
@@ -318,7 +334,6 @@ export async function startRtspServe(opts: {
         catch (e) { dbg('rtsp-serve audio unavailable, video-only:', (e as Error)?.message); try { cpAudio.kill('SIGKILL'); } catch { } }
     }
 
-    cpVideo.once('exit', code => { dbg('rtsp-serve video ffmpeg exited', code); videoAlive = false; destroy(); });
     const info = combineSdp(videoSdp, audioSdp);
     dbg('rtsp-serve sdp ready; video', info.videoTrack, 'audio', info.audioTrack);
 
@@ -337,8 +352,6 @@ export async function startRtspServe(opts: {
     await new Promise<void>(res => server!.listen(0, '127.0.0.1', () => res()));
     url = `rtsp://127.0.0.1:${(server.address() as AddressInfo).port}${pathToken}`;
     dbg('rtsp-serve listening', url);
-
-    flv.once('close', destroy);
 
     return {
         url, destroy,

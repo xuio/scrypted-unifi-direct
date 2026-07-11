@@ -40,9 +40,14 @@ const DEFAULT_OBJECT_TYPES = ['person', 'vehicle', 'animal', 'package'];
 /** Cap a full-res capture so a stream hiccup can never block a snapshot request
  *  (HomeKit shows a black tile if its snapshot request is slow). */
 const SNAPSHOT_TIMEOUT_MS = 3000;
-/** Frames smaller than this are treated as black/partial and never cached. A
- *  real 2688×1512 frame is hundreds of KB; a black one compresses to a few KB. */
-const MIN_VALID_SNAPSHOT = 20000;
+/** Frames smaller than this are treated as a broken/empty decode and not cached.
+ *  Kept low so a legitimately dark night scene (which still compresses to tens of
+ *  KB) is accepted — only a near-empty/corrupt result is rejected. */
+const MIN_VALID_SNAPSHOT = 3000;
+
+/** A cached snapshot frame: its capture timestamp doubles as a stable identity
+ *  for keying resized variants. */
+type SnapFrame = { ts: number; jpeg: Buffer };
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
     return new Promise<T>((resolve, reject) => {
@@ -67,6 +72,7 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     private client: CameraApiClient | undefined;
     private streams = new Map<string, DirectStream>();
     private creating = new Map<string, Promise<DirectStream>>();
+    private streamGen = 0;   // bumped on channel/codec change & release to cancel in-flight creates
     private motionTimer: any;
 
     constructor(public provider: UnifiDirectProvider, nativeId: string) {
@@ -92,9 +98,9 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         return Number.isFinite(v) && v >= 0 ? v * 1000 : 10_000;
     }
 
-    private snapCache?: { ts: number; jpeg: Buffer };
-    private snapLastGood?: Buffer;   // last valid frame, served when a fresh capture fails
-    private snapInflight?: Promise<Buffer>;
+    private snapCache?: SnapFrame;
+    private snapLastGood?: SnapFrame;   // last valid frame, served when a fresh capture fails
+    private snapInflight?: Promise<SnapFrame>;
     private clearSnapCache() { this.snapCache = undefined; this.snapResized?.clear(); }
 
     /**
@@ -184,18 +190,18 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
 
     // ---- Camera (snapshot) ----
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
-        const full = await this.getSnapshotBuffer(options);
+        const frame = await this.getSnapshotBuffer(options);
         // Honor the requested dimensions. HomeKit asks for a small tile-sized
         // snapshot; returning the full 2688×1512 (~400 KB) makes its previews go
         // black. Detection/NVR/UI that pass no size still get full resolution.
-        const sized = await this.resizeForRequest(full, options);
+        const sized = await this.resizeForRequest(frame, options);
         return mediaManager.createMediaObject(sized, 'image/jpeg', { sourceId: this.id });
     }
 
-    /** Get a full-res snapshot buffer with stale-while-revalidate caching: return
-     *  any cached frame INSTANTLY and refresh in the background when stale, so a
-     *  fresh decode never blocks the request. */
-    private async getSnapshotBuffer(options?: RequestPictureOptions): Promise<Buffer> {
+    /** Get a snapshot frame with stale-while-revalidate caching: return any cached
+     *  frame INSTANTLY and refresh in the background when stale, so a fresh decode
+     *  never blocks the request. */
+    private async getSnapshotBuffer(options?: RequestPictureOptions): Promise<SnapFrame> {
         const ttl = this.snapshotCacheTtlMs;
         if (this.snapCache && ttl > 0) {
             const age = Date.now() - this.snapCache.ts;
@@ -203,7 +209,7 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
                 this.snapInflight = this.captureJpeg(options).finally(() => { this.snapInflight = undefined; });
                 this.snapInflight.catch(() => { });   // background refresh; errors keep the stale frame
             }
-            return this.snapCache.jpeg;
+            return this.snapCache;
         }
         // No cached frame yet (or caching disabled): capture now, coalescing callers.
         if (!this.snapInflight)
@@ -211,64 +217,66 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         return this.snapInflight;
     }
 
-    // Cache of resized variants, keyed by "WxH" and tied to the source frame's
-    // timestamp so a burst of same-size requests (HomeKit polling all tiles)
-    // re-uses one resize until the underlying frame refreshes.
+    // Cache of resized variants, keyed by "WxH" and tied to the SOURCE FRAME's
+    // identity (its ts) so a burst of same-size requests re-uses one resize — and
+    // so a background refresh that swaps the source frame can't mislabel an old
+    // resized frame under the new timestamp.
     private snapResized = new Map<string, { srcTs: number; jpeg: Buffer }>();
 
-    /** Downscale a full-res JPEG to the requested picture size (never upscale).
-     *  Caches per size; falls back to the original on any error. */
-    private async resizeForRequest(full: Buffer, options?: RequestPictureOptions): Promise<Buffer> {
+    /** Downscale a snapshot frame to the requested picture size (never upscale).
+     *  Caches per size against the source frame; falls back to the original. */
+    private async resizeForRequest(frame: SnapFrame, options?: RequestPictureOptions): Promise<Buffer> {
         const w = options?.picture?.width, h = options?.picture?.height;
-        if (!w && !h) return full;   // no size hint → full resolution
+        if (!w && !h) return frame.jpeg;   // no size hint → full resolution
         const key = `${w || ''}x${h || ''}`;
-        const srcTs = this.snapCache?.ts ?? 0;
         const hit = this.snapResized.get(key);
-        if (hit && hit.srcTs === srcTs) return hit.jpeg;
+        if (hit && hit.srcTs === frame.ts) return hit.jpeg;
         try {
-            const mo = await mediaManager.createMediaObject(full, 'image/jpeg', { sourceId: this.id });
+            const mo = await mediaManager.createMediaObject(frame.jpeg, 'image/jpeg', { sourceId: this.id });
             const image = await mediaManager.convertMediaObject<Image>(mo, ScryptedMimeTypes.Image);
-            if ((!w || image.width <= w) && (!h || image.height <= h)) return full;   // already small enough
+            if ((!w || image.width <= w) && (!h || image.height <= h)) return frame.jpeg;   // already small enough
             const out = await image.toBuffer({ resize: { width: w || undefined, height: h || undefined }, format: 'jpg' });
-            const jpeg = out?.length ? out : full;
-            this.snapResized.set(key, { srcTs, jpeg });
+            const jpeg = out?.length ? out : frame.jpeg;
+            this.snapResized.set(key, { srcTs: frame.ts, jpeg });
             if (this.snapResized.size > 8) this.snapResized.delete(this.snapResized.keys().next().value!);
             return jpeg;
         } catch (e) {
             dbg('snapshot resize failed', this.mac, (e as Error)?.message);
-            return full;
+            return frame.jpeg;
         }
     }
 
     /**
-     * Produce a snapshot JPEG, robust enough for HomeKit which shows a black
+     * Produce a snapshot frame, robust enough for HomeKit which shows a black
      * tile if a snapshot is slow or invalid. Order:
      *   1. fresh full-res keyframe (bounded by a timeout so a stream hiccup can
      *      never block the request);
      *   2. last-known-good full-res frame;
      *   3. the camera's fast mjpg snapshot.
-     * A too-small (black/partial) frame is rejected and never cached.
+     * A near-empty/corrupt frame is rejected and never cached.
      */
-    private async captureJpeg(options?: RequestPictureOptions): Promise<Buffer> {
+    private async captureJpeg(options?: RequestPictureOptions): Promise<SnapFrame> {
         if (this.fullResSnapshots) {
             try {
                 const jpeg = await withTimeout(this.captureFullResJpeg(), SNAPSHOT_TIMEOUT_MS, 'full-res snapshot');
                 if (jpeg.length >= MIN_VALID_SNAPSHOT) {
-                    this.snapCache = { ts: Date.now(), jpeg };
-                    this.snapLastGood = jpeg;
-                    return jpeg;
+                    const frame = { ts: Date.now(), jpeg };
+                    this.snapCache = frame;
+                    this.snapLastGood = frame;
+                    return frame;
                 }
-                this.console.warn(`full-res snapshot too small (${jpeg.length}B), treating as black`);
+                this.console.warn(`full-res snapshot too small (${jpeg.length}B), treating as broken`);
             } catch (e) {
                 this.console.warn('full-res snapshot failed/slow:', (e as Error)?.message);
             }
             // full-res unavailable this time: serve the last good frame if we have
-            // one (do NOT cache it — next request retries a fresh capture).
+            // one (do NOT overwrite the cache — next request retries a fresh capture).
             if (this.snapLastGood) return this.snapLastGood;
         }
         const mjpg = await this.getClient().getSnapshot();
-        if (mjpg.length >= MIN_VALID_SNAPSHOT) this.snapCache = { ts: Date.now(), jpeg: mjpg };
-        return mjpg;
+        const frame = { ts: Date.now(), jpeg: mjpg };
+        if (mjpg.length >= MIN_VALID_SNAPSHOT) { this.snapCache = frame; this.snapLastGood = frame; }
+        return frame;
     }
 
     /** Decode a still from the live HIGH stream — the same mechanism UniFi
@@ -299,7 +307,10 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     /** Read one stored zone into a ZoneDef (with defaults for missing attrs). */
     private getZone(name: string): ZoneDef {
         const get = (a: string) => this.storage.getItem(this.zoneKey(name, a));
-        const type = (get('type') as ZoneType) || 'smartDetect';
+        // Normalise an unknown/corrupt stored type so ZONE_TYPES[type] can't throw
+        // and brick the whole settings page.
+        const rawType = get('type') as ZoneType;
+        const type: ZoneType = rawType && ZONE_TYPES[rawType] ? rawType : 'smartDetect';
         let points: [number, number][] = [];
         try { points = JSON.parse(get('points') || '[]'); } catch { }
         let objectTypes: string[] = [...ZONE_DEFAULTS.objectTypes];
@@ -344,9 +355,12 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             return;
         }
         const zones = this.getZones();
-        const active = (t: (z: ZoneDef) => boolean) => zones.some(z => z.enabled && t(z));
-        const smartActive = active(z => z.type === 'smartDetect' || z.type === 'exclude' || z.type === 'line' || z.type === 'loiter');
-        const privacyActive = active(z => z.type === 'privacy');
+        // "active" must match the builder's `usable` filter (enabled AND enough
+        // points) so a zone whose polygon was cleared correctly triggers a clear.
+        const active = (t: ZoneType) => zones.some(z => z.type === t && z.enabled
+            && ZONE_TYPES[z.type] && z.points.length >= ZONE_TYPES[z.type].minPoints);
+        const privacyActive = active('privacy');
+        const motionActive = active('motion');
         const features = await this.getFeatures();
         const cmds = buildZonePayloads(zones, {
             mac: this.mac,
@@ -354,11 +368,11 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             supportedObjectTypes: this.smartDetectTypes(features),
             tamperDetection: this.tamperDetection,
             clearPrivacy: this.storage.getItem('privacyApplied') === 'true' && !privacyActive,
-            clearSmart: this.storage.getItem('smartApplied') === 'true' && !smartActive,
+            clearMotion: this.storage.getItem('motionApplied') === 'true' && !motionActive,
         });
         for (const { fn, payload } of cmds) emulator.sendCommand(this.mac, fn, payload, true);
         this.storage.setItem('privacyApplied', String(privacyActive));
-        this.storage.setItem('smartApplied', String(smartActive));
+        this.storage.setItem('motionApplied', String(motionActive));
         dbg('applyZones', this.mac, 'sent', cmds.map(c => c.fn).join(',') || '(none)', 'zones', zones.length);
     }
 
@@ -425,10 +439,16 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         let creating = this.creating.get(track);
         if (!creating) {
             creating = (async () => {
+                const gen = this.streamGen;
                 const selfIp = this.provider.getPushAddress()!;
                 const ffmpegPath = await mediaManager.getFFmpegPath();
                 const s = new DirectStream(emulator, this.mac, track, this.codec, selfIp, this.cameraPort, ffmpegPath, this.console);
                 await s.start();
+                // If the channel/codec changed (or we were released) while this was
+                // building, discard it — otherwise it would re-insert a live stream
+                // for the old track and hold the single per-camera push port,
+                // deadlocking the new channel with EADDRINUSE.
+                if (gen !== this.streamGen) { s.stop(); throw new Error('stream creation superseded'); }
                 this.streams.set(track, s);
                 return s;
             })();
@@ -436,6 +456,13 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             creating.finally(() => this.creating.delete(track)).catch(() => { });
         }
         return creating;
+    }
+
+    /** Tear down all streams and cancel any in-flight creation (via streamGen). */
+    private resetStreams() {
+        this.streamGen++;
+        for (const s of this.streams.values()) { try { s.stop(); } catch { } }
+        this.streams.clear();
     }
 
     /**
@@ -512,15 +539,14 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     }
 
     async getObjectTypes() {
-        return { classes: ['person', 'vehicle', 'animal'] };
+        return { classes: [...DEFAULT_OBJECT_TYPES] };   // person, vehicle, animal, package
     }
     async getDetectionInput(detectionId: string): Promise<MediaObject> {
         return this.takePicture();
     }
 
     async release() {
-        for (const s of this.streams.values()) s.stop();
-        this.streams.clear();
+        this.resetStreams();   // stops streams + cancels any in-flight creation
         clearTimeout(this.motionTimer);
     }
 
@@ -645,6 +671,11 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     }
 
     async putSetting(key: string, value: SettingValue): Promise<void> {
+        // `snapshot:*` keys belong to the Scrypted snapshot mixin. If our own
+        // write-through (enforceSnapshotOwnership) lands here because the mixin
+        // isn't attached yet, don't persist it into our storage — just drop it and
+        // let the retry re-apply once the mixin is present.
+        if (key.startsWith('snapshot:')) return;
         const field = PARITY_FIELDS.find(f => f.key === key);
         if (field) {
             // Prefer the UniFi management channel (parity with Protect); fall back
@@ -709,8 +740,13 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             return;
         }
         this.storage.setItem(key, String(value));
-        if (key === 'host' || key === 'username' || key === 'password') this.client = undefined;
-        if (key === 'channel' || key === 'codec') { for (const s of this.streams.values()) s.stop(); this.streams.clear(); this.clearSnapCache(); }
+        if (key === 'host' || key === 'username' || key === 'password') {
+            this.client = undefined;
+            // Point at a different camera → drop everything cached from the old one
+            // (a stale last-good frame or feature flags would otherwise leak across).
+            this.clearSnapCache(); this.snapLastGood = undefined; this.cachedFeatures = undefined;
+        }
+        if (key === 'channel' || key === 'codec') { this.resetStreams(); this.clearSnapCache(); this.snapLastGood = undefined; }
         await this.onDeviceEvent(ScryptedInterface.Settings, undefined);
     }
 }

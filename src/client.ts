@@ -21,9 +21,12 @@ export interface CameraStatus {
  *
  * This talks to the CAMERA directly — not the Protect NVR/console.
  */
+const LOGIN_COOLDOWN_MS = 15000;
+
 export class CameraApiClient {
     private cookie: string | undefined;
     private loginPromise: Promise<void> | undefined;
+    private lastLoginFail = 0;
 
     constructor(
         public host: string,
@@ -77,6 +80,11 @@ export class CameraApiClient {
         // collapse concurrent logins
         if (this.loginPromise)
             return this.loginPromise;
+        // Back off after a failure so bad credentials / UI polling can't hammer the
+        // camera's login endpoint (which can rate-limit or lock out the account).
+        const since = Date.now() - this.lastLoginFail;
+        if (since < LOGIN_COOLDOWN_MS)
+            throw new Error(`login backing off (${Math.round((LOGIN_COOLDOWN_MS - since) / 1000)}s)`);
         this.loginPromise = (async () => {
             const body = JSON.stringify({ username: this.username, password: this.password });
             const res = await this.raw({
@@ -97,6 +105,10 @@ export class CameraApiClient {
         })();
         try {
             await this.loginPromise;
+            this.lastLoginFail = 0;
+        } catch (e) {
+            this.lastLoginFail = Date.now();
+            throw e;
         } finally {
             this.loginPromise = undefined;
         }

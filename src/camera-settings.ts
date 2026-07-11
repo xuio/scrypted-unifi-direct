@@ -177,7 +177,14 @@ export function coerceValue(field: FieldDef, value: any): any {
         const b = value === true || value === 'true';
         return field.bool01 ? (b ? 1 : 0) : b;
     }
-    if (field.type === 'integer' || field.type === 'number') return parseInt(String(value));
+    if (field.type === 'integer' || field.type === 'number') {
+        let n = field.type === 'integer' ? parseInt(String(value)) : parseFloat(String(value));
+        // Never send NaN (serialises to null and can wipe the camera field); fall
+        // back to the range minimum, and clamp in-range so bad input can't misbehave.
+        if (!Number.isFinite(n)) n = field.range ? field.range[0] : 0;
+        if (field.range) n = Math.max(field.range[0], Math.min(field.range[1], n));
+        return n;
+    }
     return value;
 }
 

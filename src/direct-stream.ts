@@ -104,6 +104,7 @@ function isFlvHeader(d: Buffer) {
 export class DirectStream {
     private cameraServer: net.Server | undefined;
     private cameraSocket: net.Socket | undefined;
+    private cameraSockets = new Set<net.Socket>();   // all inbound conns, for teardown
     private flv: PassThrough | undefined;
     private detrailer: ((c: Buffer) => Buffer) | undefined;
     private settleTimer: any;
@@ -149,9 +150,10 @@ export class DirectStream {
         // connection churn) so the provider can retry from scratch.
         try {
             await new Promise<void>((resolve, reject) => {
-                this.onServeReady = resolve;
-                this.onServeFail = reject;
-                setTimeout(() => reject(new Error('timed out waiting for a stable camera connection')), 25000);
+                let timer: any = setTimeout(() => reject(new Error('timed out waiting for a stable camera connection')), 25000);
+                const done = () => { clearTimeout(timer); timer = undefined; };
+                this.onServeReady = () => { done(); resolve(); };
+                this.onServeFail = (e) => { done(); reject(e); };
             });
         } catch (e) {
             this.stop();   // release cameraPort/emulator so the next attempt is clean
@@ -167,6 +169,9 @@ export class DirectStream {
     }
 
     private onCamera(sock: net.Socket) {
+        this.cameraSockets.add(sock);
+        sock.on('close', () => this.cameraSockets.delete(sock));
+        if (this.stopped) { sock.destroy(); return; }   // race: connection after stop
         sock.on('data', d => {
             if (!this.cameraSocket) {
                 // Adopt the connection that actually carries the FLV stream (starts
@@ -202,12 +207,17 @@ export class DirectStream {
         // if this settled connection later collapses, mark dead for rebuild.
         this.flv.once('close', () => { if (this.serveStarted && !this.stopped) this.stopped = true; });
         try {
-            this.serve = await startRtspServe({
+            const serve = await startRtspServe({
                 ffmpegPath: this.ffmpegPath,
                 flv: this.flv,
                 hasAudio: true,
                 logger: this.logger,
             });
+            // stop() may have run during the (multi-second) SDP wait; it destroyed a
+            // still-undefined this.serve, so the freshly-built one would leak (ffmpeg
+            // + sockets, unreferenced). Destroy it and bail.
+            if (this.stopped) { serve.destroy(); this.onServeFail?.(new Error('stopped')); return; }
+            this.serve = serve;
             this.onServeReady?.();
         } catch (e) {
             this.onServeFail?.(e as Error);
@@ -238,7 +248,9 @@ export class DirectStream {
         clearTimeout(this.settleTimer);
         try { this.emulator.stopStream(this.mac, this.channel); } catch { }
         this.streaming = false;
-        this.cameraSocket?.destroy();
+        for (const s of this.cameraSockets) { try { s.destroy(); } catch { } }   // incl. non-adopted strays
+        this.cameraSockets.clear();
+        this.cameraSocket = undefined;
         this.serve?.destroy();
         try { this.flv?.destroy(); } catch { }
         this.cameraServer?.close();
