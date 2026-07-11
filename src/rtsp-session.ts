@@ -167,6 +167,17 @@ export class RtspSession {
         this.sent++;
     }
 
+    /** Send an RTCP packet (e.g. a Sender Report) for a track, on its RTCP
+     *  interleaved channel (the RTP channel + 1), if the client is playing. */
+    sendRtcp(control: string | undefined, packet: Buffer) {
+        if (!this.playing || !control || this.socket.destroyed || !this.socket.writable) return;
+        const ch = this.channels.get(control);
+        if (ch === undefined) return;
+        const header = Buffer.allocUnsafe(4);
+        header[0] = RTSP_MAGIC; header[1] = ch + 1; header.writeUInt16BE(packet.length, 2);
+        this.socket.write(Buffer.concat([header, packet]));
+    }
+
     private closed = false;
     close() {
         if (this.closed) return;

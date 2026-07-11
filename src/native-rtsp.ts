@@ -154,6 +154,11 @@ function splitNals(d: Buffer, off: number, nalLen: number): Buffer[] {
 class RtpTrack {
     private seq = randomBytes(2).readUInt16BE(0);
     private ssrc = randomBytes(4).readUInt32BE(0);
+    private packets = 0;
+    private octets = 0;
+    private lastTs = 0;      // RTP timestamp of the most recent packet
+    private lastWall = 0;    // wall-clock (ms) when that packet was built
+    private sent = false;
     constructor(private pt: number) { }
 
     /** Build one RTP packet: 12-byte header + optional prefix + payload slice.
@@ -170,6 +175,32 @@ class RtpTrack {
         let o = 12;
         if (prefix) { prefix.copy(buf, o); o += prefix.length; }
         payload.copy(buf, o, start, end);
+        this.packets++;
+        this.octets = (this.octets + (o - 12) + plen) >>> 0;   // payload octets (RFC 3550)
+        this.lastTs = ts % 0x100000000;
+        this.lastWall = Date.now();
+        this.sent = true;
+        return buf;
+    }
+
+    /** RTCP Sender Report (28 bytes) mapping this track's RTP clock to wall time,
+     *  so a receiver can lip-sync the independent video and audio tracks. Returns
+     *  undefined until at least one packet has been sent. */
+    senderReport(): Buffer | undefined {
+        if (!this.sent) return;
+        const buf = Buffer.allocUnsafe(28);
+        buf[0] = 0x80;                          // V=2, P=0, RC=0
+        buf[1] = 200;                           // PT = SR
+        buf.writeUInt16BE(6, 2);                // length = 28/4 - 1
+        buf.writeUInt32BE(this.ssrc, 4);
+        // NTP timestamp for the instant the last RTP timestamp was sampled.
+        const sec = Math.floor(this.lastWall / 1000) + 2208988800;   // 1970→1900 epoch
+        const frac = Math.floor((this.lastWall % 1000) / 1000 * 0x100000000);
+        buf.writeUInt32BE(sec >>> 0, 8);
+        buf.writeUInt32BE(frac >>> 0, 12);
+        buf.writeUInt32BE(this.lastTs, 16);     // RTP timestamp matching that NTP time
+        buf.writeUInt32BE(this.packets >>> 0, 20);
+        buf.writeUInt32BE(this.octets >>> 0, 24);
         return buf;
     }
 }
@@ -367,9 +398,25 @@ export async function startNativeServe(opts: {
     const feed = (d: Buffer) => parser.push(d);
     flv.on('data', feed);
 
+    // Periodic RTCP Sender Reports so receivers can lip-sync the independent
+    // video and audio tracks (each has its own clock/SSRC). Cheap and best-effort
+    // — wrapped so it can never disturb the media path.
+    const rtcpTimer = setInterval(() => {
+        if (!sessions.size) return;
+        try {
+            const vsr = videoTrack.senderReport();
+            const asr = audioServed ? audioTrack.senderReport() : undefined;
+            for (const s of sessions) {
+                if (vsr) s.sendRtcp('trackID=0', vsr);
+                if (asr) s.sendRtcp('trackID=1', asr);
+            }
+        } catch { }
+    }, 5000);
+
     const destroy = () => {
         if (dead) return;
         dead = true;
+        clearInterval(rtcpTimer);
         flv.removeListener('data', feed);
         try { server?.close(); } catch { }
         for (const s of sessions) s.close();
