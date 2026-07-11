@@ -168,10 +168,13 @@ export class SnapshotManager {
     private async decodeKeyframeToJpeg(annexb: Buffer): Promise<Buffer> {
         const ffmpegPath = await mediaManager.getFFmpegPath();
         return new Promise<Buffer>((resolve, reject) => {
+            // stderr is discarded, not piped: an unread pipe fills at ~64KB and
+            // blocks ffmpeg, turning a chatty decode failure into a guaranteed
+            // wait for the SIGKILL timeout below.
             const cp = spawn(ffmpegPath, [
                 '-hide_banner', '-loglevel', 'error',
                 '-f', 'h264', '-i', 'pipe:0', '-frames:v', '1', '-f', 'mjpeg', 'pipe:1',
-            ], { stdio: ['pipe', 'pipe', 'pipe'] });
+            ], { stdio: ['pipe', 'pipe', 'ignore'] });
             const chunks: Buffer[] = [];
             const timer = setTimeout(() => { try { cp.kill('SIGKILL'); } catch { } reject(new Error('keyframe decode timeout')); }, 2500);
             cp.stdout.on('data', d => chunks.push(d));

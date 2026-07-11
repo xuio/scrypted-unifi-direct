@@ -27,11 +27,36 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
     public emulator: ControllerEmulator | undefined;
     private pairTimer: any;
     private healthTimer: any;
+    private initAttempt = 0;
     private cameraPorts = new Map<string, number>();   // nativeId -> assigned push port
 
     constructor(nativeId?: string) {
         super(nativeId);
-        this.init().catch(e => this.console.error('init failed', e));
+        this.loadCameraPorts();
+        this.init();
+    }
+
+    // Port assignments are persisted: cameras keep pushing FLV to their last
+    // commanded port across plugin restarts (the serializer config lives on the
+    // camera), so a restart must hand every camera the same port it had — a
+    // shifted assignment would deliver camera A's stray push to camera B's
+    // ingest. (DirectStream also validates the sender address as a second line
+    // of defense.)
+    private loadCameraPorts() {
+        try {
+            const raw = JSON.parse(this.storage.getItem('cameraPorts') || '{}');
+            const used = new Set<number>();
+            for (const [k, v] of Object.entries(raw)) {
+                if (typeof v === 'number' && v >= CAMERA_PORT_BASE && v < CAMERA_PORT_BASE + CAMERA_PORT_COUNT && !used.has(v)) {
+                    this.cameraPorts.set(k, v);
+                    used.add(v);
+                }
+            }
+        } catch { }
+    }
+
+    private saveCameraPorts() {
+        this.storage.setItem('cameraPorts', JSON.stringify(Object.fromEntries(this.cameraPorts)));
     }
 
     /** Assign a distinct, stable push port per camera from the firewalled range. */
@@ -49,38 +74,59 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
         }
         if (port < 0) throw new Error(`no free camera push port in ${CAMERA_PORT_BASE}-${CAMERA_PORT_BASE + CAMERA_PORT_COUNT - 1}`);
         this.cameraPorts.set(nativeId, port);
+        this.saveCameraPorts();
         return port;
     }
 
     private async init() {
-        this.emulator = new ControllerEmulator(MGMT_PORT, this.console);
-        this.emulator.on('online', (mac: string) => {
-            this.console.log('[unifi-direct] camera online:', mac);
-            for (const cam of this.cameras.values())
-                if (cam.mac === mac) {
-                    // Import any zones already on the camera FIRST (reads are only
-                    // valid before applyZones overwrites the smart-detect/motion
-                    // config), then re-assert our config over the live mgmt session.
-                    cam.importCameraZones()
-                        .then(() => cam.applyZones())
-                        .catch(e => dbg('online import/apply failed', mac, (e as Error)?.message));
-                }
-        });
-        this.emulator.on('event', (mac: string, fn: string, payload: any) => {
-            for (const cam of this.cameras.values())
-                if (cam.mac === mac) cam.onCameraEvent(fn, payload);
-        });
-        await this.emulator.start();
+        try {
+            this.emulator = new ControllerEmulator(MGMT_PORT, this.console);
+            this.emulator.on('online', (mac: string) => {
+                // handler runs inside a socket 'data' path — never let it throw.
+                try {
+                    this.console.log('[unifi-direct] camera online:', mac);
+                    for (const cam of this.cameras.values())
+                        if (cam.mac === mac) {
+                            // Import any zones already on the camera FIRST (reads are only
+                            // valid before applyZones overwrites the smart-detect/motion
+                            // config), then re-assert our config over the live mgmt session.
+                            cam.importCameraZones()
+                                .then(() => cam.applyZones())
+                                .catch(e => dbg('online import/apply failed', mac, (e as Error)?.message));
+                        }
+                } catch (e) { dbg('online handler failed', mac, (e as Error)?.message); }
+            });
+            this.emulator.on('event', (mac: string, fn: string, payload: any) => {
+                for (const cam of this.cameras.values())
+                    if (cam.mac === mac) {
+                        try { cam.onCameraEvent(fn, payload); }
+                        catch (e) { dbg('event handler failed', mac, fn, (e as Error)?.message); }
+                    }
+            });
+            await this.emulator.start();
 
-        // load existing cameras so their sessions/pairing resume
-        for (const nativeId of deviceManager.getNativeIds()) {
-            if (nativeId && nativeId.startsWith('cam:')) await this.getDevice(nativeId);
+            // load existing cameras so their sessions/pairing resume
+            for (const nativeId of deviceManager.getNativeIds()) {
+                if (nativeId && nativeId.startsWith('cam:')) await this.getDevice(nativeId);
+            }
+            // periodically (re)pair cameras that aren't connected (handles reboots/backoff)
+            this.pairTimer = setInterval(() => this.repairAll(), 30000);
+            setTimeout(() => this.repairAll(), 3000);
+            // health watchdog: reap dead/stalled streams so consumers reconnect fresh.
+            this.healthTimer = setInterval(() => this.reapAll(), 15000);
+            this.initAttempt = 0;
+        } catch (e) {
+            // e.g. EADDRINUSE on 7442 while an old plugin process lingers through a
+            // reload. Without a retry the plugin would sit dead until manually
+            // restarted — retry with backoff instead.
+            try { this.emulator?.stop(); } catch { }
+            this.emulator = undefined;
+            clearInterval(this.pairTimer);
+            clearInterval(this.healthTimer);
+            const delay = Math.min(15_000 * 2 ** this.initAttempt++, 120_000);
+            this.console.error(`init failed (retrying in ${delay / 1000}s):`, (e as Error)?.message ?? e);
+            setTimeout(() => this.init(), delay);
         }
-        // periodically (re)pair cameras that aren't connected (handles reboots/backoff)
-        this.pairTimer = setInterval(() => this.repairAll(), 30000);
-        setTimeout(() => this.repairAll(), 3000);
-        // health watchdog: reap dead/stalled streams so consumers reconnect fresh.
-        this.healthTimer = setInterval(() => this.reapAll(), 15000);
     }
 
     private async repairAll() {
@@ -175,6 +221,6 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
         const key = nativeId || '';
         const cam = this.cameras.get(key);
         if (cam) { await cam.release(); this.cameras.delete(key); }
-        this.cameraPorts.delete(key);
+        if (this.cameraPorts.delete(key)) this.saveCameraPorts();
     }
 }

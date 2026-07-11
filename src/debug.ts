@@ -5,6 +5,15 @@ import fs from 'fs';
 const PATH = '/tmp/unifi-direct.log';
 const MAX_BYTES = 5 * 1024 * 1024;   // rotate at 5 MB so the log can't grow unbounded
 let sinceCheck = 0;
+// Keep the fd open across calls: one write syscall per line instead of the
+// open+write+close triple appendFileSync does (this runs on the same event loop
+// that pumps the media path).
+let fd: number | undefined;
+
+function ensureFd(): number {
+    if (fd === undefined) fd = fs.openSync(PATH, 'a');
+    return fd;
+}
 
 export function dbg(...a: any[]) {
     try {
@@ -13,8 +22,19 @@ export function dbg(...a: any[]) {
         // cheap size check every ~200 lines: keep one rotated generation.
         if (++sinceCheck >= 200) {
             sinceCheck = 0;
-            try { if (fs.statSync(PATH).size > MAX_BYTES) fs.renameSync(PATH, PATH + '.1'); } catch { }
+            try {
+                if (fs.fstatSync(ensureFd()).size > MAX_BYTES) {
+                    fs.closeSync(fd!);
+                    fd = undefined;
+                    fs.renameSync(PATH, PATH + '.1');
+                }
+            } catch { }
         }
-        fs.appendFileSync(PATH, line);
-    } catch { }
+        fs.writeSync(ensureFd(), line);
+    } catch {
+        // drop the fd so a transient failure (file deleted, disk full) can
+        // recover by reopening on the next call.
+        try { if (fd !== undefined) fs.closeSync(fd); } catch { }
+        fd = undefined;
+    }
 }

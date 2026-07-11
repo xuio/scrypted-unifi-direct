@@ -1,3 +1,4 @@
+import dns from 'dns';
 import net from 'net';
 import { PassThrough } from 'stream';
 import type { ControllerEmulator } from './controller-emulator';
@@ -18,6 +19,56 @@ const MAX_TAG = 4 * 1024 * 1024;   // sanity bound on a single FLV tag's data si
 const MAX_TRAILER_SCAN = 1 << 16;  // how far to look for the next tag past a trailer
 
 /**
+ * FIFO byte accumulator backed by one reusable buffer. The detrailer must hold a
+ * whole tag (up to a ~500 KB keyframe) until the NEXT tag is confirmed, and a
+ * `Buffer.concat([buf, chunk])` accumulator re-copies everything pending on every
+ * socket read — O(tag² / chunk) per keyframe, continuously, even with no viewers.
+ * Here appends land at the write offset and the front is consumed by moving a
+ * read offset; data moves only when the buffer wraps (compact) or grows.
+ * view() returns a window into the shared store — it is only valid until the
+ * next push(), so consumers must copy anything they keep (they already do).
+ */
+class ByteQueue {
+    private store = Buffer.allocUnsafe(1 << 20);
+    private head = 0;
+    private tail = 0;
+
+    get length() { return this.tail - this.head; }
+
+    push(chunk: Buffer) {
+        if (this.tail + chunk.length > this.store.length) {
+            const len = this.length;
+            if (len + chunk.length > this.store.length) {
+                let size = this.store.length * 2;
+                while (size < len + chunk.length) size *= 2;
+                const ns = Buffer.allocUnsafe(size);
+                this.store.copy(ns, 0, this.head, this.tail);
+                this.store = ns;
+            } else {
+                this.store.copy(this.store, 0, this.head, this.tail);   // compact in place
+            }
+            this.head = 0;
+            this.tail = len;
+        }
+        chunk.copy(this.store, this.tail);
+        this.tail += chunk.length;
+    }
+
+    /** Window over the buffered bytes; valid only until the next push(). */
+    view(): Buffer { return this.store.subarray(this.head, this.tail); }
+
+    consume(n: number) {
+        this.head = Math.min(this.head + n, this.tail);
+        if (this.head === this.tail) {
+            this.head = this.tail = 0;
+            // shed an oversized store once drained, so one giant tag can't pin
+            // memory for the stream's lifetime.
+            if (this.store.length > (4 << 20)) this.store = Buffer.allocUnsafe(1 << 20);
+        }
+    }
+}
+
+/**
  * Convert UniFi "extendedFlv" to standard FLV for ffmpeg.
  *
  * UniFi inserts a variable-length trailer after each FLV tag (16 bytes for small
@@ -33,28 +84,31 @@ const MAX_TRAILER_SCAN = 1 << 16;  // how far to look for the next tag past a tr
  * (27 distinct trailer sizes, 16–784 bytes) with zero desyncs. Because confirming
  * the next tag requires it to be fully buffered, one tag of data is held back
  * (~one frame of latency; invisible behind the prebuffer).
+ *
+ * Exported only for the differential test harness — not part of the plugin API.
  */
-function makeDetrailer() {
-    let buf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+export function makeDetrailer() {
+    const q = new ByteQueue();
     let headerDone = false;
     return (chunk: Buffer) => {
-        buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
+        q.push(chunk);
         const out: Buffer[] = [];
         for (; ;) {
+            const buf = q.view();
             if (!headerDone) {
                 if (buf.length < 13) break;
                 const hdr = Buffer.from(buf.subarray(0, 13)); hdr[4] = 0x05;
-                out.push(hdr); buf = buf.subarray(13); headerDone = true; continue;
+                out.push(hdr); q.consume(13); headerDone = true; continue;
             }
             if (buf.length < 11) break;
             const type = buf[0];
             // must be sitting on a tag header; if not, we desynced — inch forward.
-            if (type !== 8 && type !== 9 && type !== 18) { buf = buf.subarray(1); continue; }
+            if (type !== 8 && type !== 9 && type !== 18) { q.consume(1); continue; }
             const dataSize = (buf[1] << 16) | (buf[2] << 8) | buf[3];
-            if (dataSize > MAX_TAG) { buf = buf.subarray(1); continue; }
+            if (dataSize > MAX_TAG) { q.consume(1); continue; }
             const tagLen = 11 + dataSize + 4;
             if (buf.length < tagLen) break;
-            if (buf.readUInt32BE(11 + dataSize) !== 11 + dataSize) { buf = buf.subarray(1); continue; }
+            if (buf.readUInt32BE(11 + dataSize) !== 11 + dataSize) { q.consume(1); continue; }
 
             // find where the next tag begins (past the variable trailer).
             let nextOff = -1, pendingMore = false;
@@ -74,11 +128,11 @@ function makeDetrailer() {
                 if (pendingMore) break;   // wait for more data to confirm the next tag
                 // no next tag within the scan window: emit and fall back to a 16-byte skip.
                 out.push(Buffer.from(buf.subarray(0, tagLen)));
-                buf = buf.subarray(Math.min(tagLen + 16, buf.length));
+                q.consume(Math.min(tagLen + 16, buf.length));
                 continue;
             }
             out.push(Buffer.from(buf.subarray(0, tagLen)));
-            buf = buf.subarray(nextOff);
+            q.consume(nextOff);
         }
         return out.length ? Buffer.concat(out) : Buffer.alloc(0);
     };
@@ -123,8 +177,46 @@ export class DirectStream {
         private codec: string,
         private selfIp: string,
         private cameraPort: number,
+        /** The camera's configured host — only its pushes are accepted (see
+         *  resolveAllowedSources). Empty disables the check. */
+        private expectedHost: string,
         private logger: Logger,
     ) { }
+
+    // IPs allowed to push FLV to our port; undefined = accept any (no host
+    // configured, or the hostname was unresolvable — fail open, see below).
+    private allowedSources: Set<string> | undefined;
+
+    /**
+     * Cameras keep pushing to their previously commanded destination across
+     * plugin restarts (the serializer config persists on-camera, reconnecting
+     * every second). Port assignments can shift across restarts, so without a
+     * sender check camera A's stray push could be adopted as camera B's stream —
+     * serving the wrong camera's video silently. Resolve the configured host to
+     * the set of acceptable source IPs up front.
+     */
+    private async resolveAllowedSources(): Promise<void> {
+        if (!this.expectedHost) return;
+        const allowed = new Set<string>([this.expectedHost]);
+        if (!net.isIP(this.expectedHost)) {
+            try {
+                const addrs = await dns.promises.lookup(this.expectedHost, { all: true });
+                for (const a of addrs) allowed.add(a.address);
+            } catch {
+                // hostname unresolvable right now: fail open rather than reject
+                // the camera's push and break the stream entirely.
+                dbg('DS', this.mac, 'cannot resolve', this.expectedHost, '— source check disabled');
+                return;
+            }
+        }
+        this.allowedSources = allowed;
+    }
+
+    private isAllowedSource(sock: net.Socket): boolean {
+        if (!this.allowedSources) return true;
+        const ip = (sock.remoteAddress || '').replace(/^::ffff:/, '');
+        return this.allowedSources.has(ip);
+    }
 
     get alive() {
         // Dead (→ provider rebuilds a clean pipeline) if we were stopped, the RTSP
@@ -144,6 +236,7 @@ export class DirectStream {
     latestKeyframe() { return this.serve?.latestKeyframe(); }
 
     async start(): Promise<void> {
+        await this.resolveAllowedSources();
         this.cameraServer = net.createServer(s => this.onCamera(s));
         await listen(this.cameraServer, this.cameraPort, '0.0.0.0');
         this.commandCameraStream();
@@ -174,6 +267,11 @@ export class DirectStream {
     }
 
     private onCamera(sock: net.Socket) {
+        if (!this.isAllowedSource(sock)) {
+            dbg('DS', this.mac, 'rejecting push from unexpected source', sock.remoteAddress || '?');
+            sock.destroy();
+            return;
+        }
         this.cameraSockets.add(sock);
         sock.on('close', () => this.cameraSockets.delete(sock));
         if (this.stopped) { sock.destroy(); return; }   // race: connection after stop

@@ -22,11 +22,36 @@ export interface CameraStatus {
  * This talks to the CAMERA directly — not the Protect NVR/console.
  */
 const LOGIN_COOLDOWN_MS = 15000;
+/** Backoff doubles per consecutive failure up to this cap, so bad credentials
+ *  can't hammer the camera's login endpoint (lockout risk) from the periodic
+ *  repair timer, whose 30s cadence would otherwise defeat a fixed cooldown. */
+const LOGIN_COOLDOWN_MAX_MS = 600_000;
 
 export class CameraApiClient {
     private cookie: string | undefined;
     private loginPromise: Promise<void> | undefined;
     private lastLoginFail = 0;
+    private loginFailures = 0;
+    // Reuse TLS sessions across requests: without keep-alive every status poll /
+    // snapshot / settings read pays a full handshake (and behavior would depend
+    // on the runtime's global-agent defaults).
+    private agent = new https.Agent({ keepAlive: true, maxSockets: 2, rejectUnauthorized: false });
+
+    private get loginCooldownMs() {
+        return Math.min(LOGIN_COOLDOWN_MS * 2 ** Math.max(0, this.loginFailures - 1), LOGIN_COOLDOWN_MAX_MS);
+    }
+
+    /** True while login attempts are suppressed after a failure. Callers doing
+     *  periodic maintenance should skip their cycle instead of provoking the
+     *  backoff error. */
+    get inLoginBackoff(): boolean {
+        return this.lastLoginFail > 0 && Date.now() - this.lastLoginFail < this.loginCooldownMs;
+    }
+
+    /** Release pooled keep-alive sockets. Call when replacing the client. */
+    destroy() {
+        this.agent.destroy();
+    }
 
     constructor(
         public host: string,
@@ -52,6 +77,7 @@ export class CameraApiClient {
                 port: 443,
                 method: options.method,
                 path: options.path,
+                agent: this.agent,
                 // camera uses a self-signed cert
                 rejectUnauthorized: false,
                 headers: {
@@ -85,9 +111,10 @@ export class CameraApiClient {
             return this.loginPromise;
         // Back off after a failure so bad credentials / UI polling can't hammer the
         // camera's login endpoint (which can rate-limit or lock out the account).
-        const since = Date.now() - this.lastLoginFail;
-        if (since < LOGIN_COOLDOWN_MS)
-            throw new Error(`login backing off (${Math.round((LOGIN_COOLDOWN_MS - since) / 1000)}s)`);
+        if (this.inLoginBackoff) {
+            const left = this.loginCooldownMs - (Date.now() - this.lastLoginFail);
+            throw new Error(`login backing off (${Math.round(left / 1000)}s)`);
+        }
         this.loginPromise = (async () => {
             const body = JSON.stringify({ username: this.username, password: this.password });
             const res = await this.raw({
@@ -109,8 +136,10 @@ export class CameraApiClient {
         try {
             await this.loginPromise;
             this.lastLoginFail = 0;
+            this.loginFailures = 0;
         } catch (e) {
             this.lastLoginFail = Date.now();
+            this.loginFailures++;
             throw e;
         } finally {
             this.loginPromise = undefined;

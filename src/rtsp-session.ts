@@ -36,6 +36,11 @@ export interface RtspServeHandle {
 const RTSP_MAGIC = 0x24; // '$'
 /** Drop an RTSP client whose unsent TCP backlog exceeds this (slow/stalled reader). */
 const MAX_RTP_BACKLOG = 16 * 1024 * 1024;
+/** A legitimate RTSP request is well under 1 KB, but a partial interleaved
+ *  frame can legitimately hold up to 4+65535 bytes unconsumed — the cap must
+ *  clear that, so 128 KB. Bounds memory and the repeated indexOf scan against
+ *  a broken/hostile client. */
+const MAX_REQUEST_BUF = 128 * 1024;
 
 /**
  * A single RTSP client session (Scrypted connects out as the client). Speaks
@@ -69,6 +74,11 @@ export class RtspSession {
 
     private onData(chunk: Buffer) {
         this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+        if (this.buf.length > MAX_REQUEST_BUF) {
+            dbg('rtsp client request buffer overflow, dropping session', this.id, this.ua);
+            this.close();
+            return;
+        }
         // Requests are plain text terminated by a blank line. Any interleaved
         // data the client might send (RTCP) starts with '$' — skip those frames.
         for (; ;) {
@@ -148,6 +158,25 @@ export class RtspSession {
         if (this.socket.destroyed) return;
         const head = ['RTSP/1.0 200 OK', `CSeq: ${cseq}`, ...headers, '', body || ''].join('\r\n');
         this.socket.write(head);
+    }
+
+    /**
+     * Relay a burst of RTP packets (typically one access unit) with the socket
+     * corked, so the burst flushes as a few writev() calls instead of two
+     * syscalls per packet — the sockets run with noDelay, and a keyframe AU is
+     * hundreds of packets in one synchronous tick.
+     */
+    sendRtpBatch(control: string | undefined, packets: Buffer[]) {
+        if (!packets.length || this.socket.destroyed) return;
+        this.socket.cork();
+        try {
+            for (const p of packets) {
+                this.sendRtp(control, p);
+                if (this.closed) break;   // backpressure guard closed us mid-burst
+            }
+        } finally {
+            if (!this.socket.destroyed) this.socket.uncork();
+        }
     }
 
     /** Relay an RTP packet for the given media track, if the client is playing. */

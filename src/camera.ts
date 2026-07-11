@@ -51,7 +51,13 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     // Detection runs on the full sensor FoV regardless of the streamed channel.
     private detections = new DetectionEngine(CHANNELS.high, {
         log: (...a) => this.console.log(...a),
-        emitDetected: d => this.onDeviceEvent(ScryptedInterface.ObjectDetector, d),
+        // onDeviceEvent is an RPC that rejects when the Scrypted link is degraded
+        // — exactly when a busy camera keeps emitting. An unhandled rejection
+        // here would take down the whole plugin process.
+        emitDetected: d => {
+            this.onDeviceEvent(ScryptedInterface.ObjectDetector, d)
+                .catch(e => dbg('emitDetected failed', this.mac, (e as Error)?.message));
+        },
         setMotionDetected: active => { if (this.motionDetected !== active) this.motionDetected = active; },
         debugEnabled: () => this.detectDebug,
     });
@@ -162,6 +168,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         if (!addr) throw new Error('set "Scrypted address (reachable from camera)" in the plugin settings');
         if (this.mac && this.provider.emulator?.isOnline(this.mac)) return;
         try {
+            // Don't hammer the camera's login endpoint from the 30s repair timer
+            // while the client is backing off after a failed login — repeated
+            // attempts can lock out the camera account.
+            if (this.getClient().inLoginBackoff) return;
             // Self-heal the stored MAC. The emulator keys sessions by the camera's
             // real MAC; if the stored value ever drifts (e.g. an external tool
             // overwrote the `mac` key — the HomeKit mixin also uses `mac`), the
@@ -377,8 +387,25 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         }
     }
 
+    // Zone applies are serialized per camera and coalesced: applyPrivacyMasks is
+    // a multi-second clear→settle→set sequence that desyncs the camera encoder
+    // if two runs interleave (see its comment), and the settings UI fires one
+    // applyZones per saved key. A run already queued behind the current one
+    // absorbs further requests — it reads the latest stored state when it runs.
+    private zoneApplyChain: Promise<void> = Promise.resolve();
+    private zoneApplyQueued = false;
+
     /** Push the current zone configuration to the camera over the mgmt channel. */
-    async applyZones(): Promise<void> {
+    applyZones(): Promise<void> {
+        if (this.zoneApplyQueued) return this.zoneApplyChain;
+        this.zoneApplyQueued = true;
+        this.zoneApplyChain = this.zoneApplyChain
+            .catch(() => { })   // a failed run must not wedge the chain
+            .then(() => { this.zoneApplyQueued = false; return this.doApplyZones(); });
+        return this.zoneApplyChain;
+    }
+
+    private async doApplyZones(): Promise<void> {
         const emulator = this.provider.emulator;
         if (!emulator || !this.mac || !emulator.hasSession(this.mac)) {
             dbg('applyZones: camera not connected, deferring', this.mac);
@@ -416,6 +443,15 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         const privacy = zones.filter(z => z.type === 'privacy' && z.enabled && z.points.length >= 3);
         const prev = parseInt(this.storage.getItem('privacyCount') || '0') || 0;
         if (!privacy.length && !prev) return;   // nothing to set and nothing to clear
+        // Skip the sequence when the desired masks equal what was last applied:
+        // the clear→settle→set below leaves the video UNMASKED for 3+ seconds,
+        // and applyZones runs on every camera reconnect — a flapping camera must
+        // not expose masked regions on each flap.
+        const fp = JSON.stringify(privacy.map(z => polyCoord(z.points)));
+        if (fp === this.storage.getItem('privacyMasksFp')) {
+            dbg('applyPrivacyMasks', this.mac, 'unchanged — skipping');
+            return;
+        }
         try {
             // The camera's encoder only reliably updates masks via two proven
             // primitives over the local HTTP API: a STANDALONE clear-all (every
@@ -433,6 +469,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 await this.getClient().putSettings({ isp: { masks } });
             }
             this.storage.setItem('privacyCount', String(privacy.length));
+            this.storage.setItem('privacyMasksFp', fp);
             dbg('applyPrivacyMasks', this.mac, 'cleared all, set', privacy.length);
         } catch (e) {
             this.console.warn('privacy mask apply failed:', (e as Error)?.message);
@@ -462,8 +499,15 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         const emulator = this.provider.emulator;
         if (!emulator) throw new Error('controller emulator not started');
 
-        const channelKey = (options?.id && CHANNELS[options.id]) ? options.id : this.channelKey;
-        const chan = CHANNELS[channelKey] || CHANNELS.high;
+        // All channels share the camera's single push port and only the configured
+        // channel is ever advertised — honoring a stale requested id (a consumer
+        // that cached a previous channel setting) would EADDRINUSE against the
+        // live stream on every retry, forever. Coerce every request to the
+        // configured channel.
+        if (options?.id && options.id !== this.channelKey)
+            dbg('getVideoStream', this.mac, 'coercing requested channel', options.id, '->', this.channelKey);
+        const channelKey = this.channelKey;
+        const chan = this.channel;
         dbg('getVideoStream', this.mac, 'channel', channelKey, 'online', emulator.isOnline(this.mac));
 
         await this.ensurePaired();
@@ -501,7 +545,8 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             creating = (async () => {
                 const gen = this.streamGen;
                 const selfIp = this.provider.getPushAddress()!;
-                const s = new DirectStream(emulator, this.mac, track, this.codec, selfIp, this.cameraPort, this.console);
+                const s = new DirectStream(emulator, this.mac, track, this.codec, selfIp, this.cameraPort,
+                    this.storage.getItem('host') || '', this.console);
                 await s.start();
                 // If the channel/codec changed (or we were released) while this was
                 // building, discard it — otherwise it would re-insert a live stream
@@ -545,8 +590,9 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     private waitOnline(emulator: ControllerEmulator, ms: number): Promise<void> {
         return new Promise(resolve => {
             if (emulator.isOnline(this.mac)) return resolve();
-            const t = setInterval(() => { if (emulator.isOnline(this.mac)) { clearInterval(t); resolve(); } }, 300);
-            setTimeout(() => { clearInterval(t); resolve(); }, ms);
+            const done = () => { clearInterval(t); clearTimeout(deadline); resolve(); };
+            const t = setInterval(() => { if (emulator.isOnline(this.mac)) done(); }, 300);
+            const deadline = setTimeout(done, ms);
         });
     }
 
@@ -776,11 +822,15 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         }
         this.storage.setItem(key, String(value));
         if (key === 'host' || key === 'username' || key === 'password') {
+            this.client?.destroy();
             this.client = undefined;
             // Point at a different camera → drop everything cached from the old one
             // (a stale last-good frame or feature flags would otherwise leak across).
             this.snapshots.reset();
             this.cachedFeatures = undefined;
+            // The mask fingerprint describes what was applied to the OLD camera;
+            // keeping it would skip pushing masks to the new one forever.
+            this.storage.removeItem('privacyMasksFp');
         }
         if (key === 'channel' || key === 'codec') { this.resetStreams(); this.snapshots.reset(); }
     }

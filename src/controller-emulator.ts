@@ -146,7 +146,11 @@ export class ControllerEmulator extends EventEmitter {
         const parser = makeFrameParser(payload => {
             let m: any;
             try { m = JSON.parse(payload.toString()); } catch { return; }
-            this.onMessage(session, m);
+            // A throwing handler (including downstream 'event'/'online' listeners)
+            // must never propagate into the socket 'data' handler — that would be
+            // an uncaught exception and crash the plugin.
+            try { this.onMessage(session, m); }
+            catch (e) { this.log('message handler error', mac, (e as Error)?.message); }
         }, (type, payload) => {
             if (type === 'ping') { if (!socket.writableEnded) socket.write(encodeFrame(payload, 0xa)); }
             else if (type === 'close') socket.end();

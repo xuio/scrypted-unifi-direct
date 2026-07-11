@@ -353,8 +353,9 @@ export async function startNativeServe(opts: {
         const ts = Math.max(0, tsMs + cts) * (VIDEO_CLOCK / 1000);
         const pkts: Buffer[] = [];
         packetizeH264(videoTrack, videoParams, nals, ts, frameType === 1, pkts);
-        for (const pkt of pkts)
-            for (const s of sessions) s.sendRtp('trackID=0', pkt);
+        // one corked burst per session: a keyframe AU is hundreds of packets, and
+        // per-packet writes on a noDelay socket would be 2 syscalls each.
+        for (const s of sessions) s.sendRtpBatch('trackID=0', pkts);
     };
 
     const handleAudioTag = (tsMs: number, d: Buffer) => {
@@ -378,7 +379,7 @@ export async function startNativeServe(opts: {
         const ts = Math.round(tsMs * audioParams.rate / 1000);
         const pkt = packetizeAac(audioTrack, d.subarray(2), ts);
         if (!pkt) return;
-        for (const s of sessions) s.sendRtp('trackID=1', pkt);
+        for (const s of sessions) s.sendRtpBatch('trackID=1', [pkt]);
     };
 
     const parser = new FlvTagParser((type, tsMs, data) => {
