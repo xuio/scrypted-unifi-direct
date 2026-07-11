@@ -1,6 +1,5 @@
 # UniFi Direct — UniFi Protect cameras in Scrypted with no NVR
 
-[![npm](https://img.shields.io/npm/v/scrypted-unifi-direct?color=cb3837&logo=npm)](https://www.npmjs.com/package/scrypted-unifi-direct)
 [![license: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](https://unlicense.org)
 [![Scrypted plugin](https://img.shields.io/badge/Scrypted-plugin-6a1b9a)](https://scrypted.app)
 
