@@ -221,14 +221,32 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     // ---- detections (driven by ControllerEmulator 'event') ----
     onCameraEvent(fn: string, payload: any) {
         if (fn === 'EventSmartDetect' || fn === 'EventSmartDetectZone') {
-            const types: string[] = payload?.smartDetectTypes || payload?.objectTypes || [];
-            if (types.length) {
-                const detected: ObjectsDetected = {
-                    timestamp: Date.now(),
-                    detections: types.map(t => ({ className: t, score: 1 })),
-                };
-                this.onDeviceEvent(ScryptedInterface.ObjectDetector, detected);
-            }
+            // The camera reports one descriptor per tracked object, each with a
+            // bounding box (`coord` = [x,y,w,h], normalised to 0..1000), a class,
+            // a confidence and a tracker id. Forwarding the box + dimensions lets
+            // Scrypted crop the event thumbnail to the object.
+            const descriptors: any[] = Array.isArray(payload?.descriptors) ? payload.descriptors : [];
+            const detections = descriptors
+                .filter(d => d && d.objectType)
+                .map(d => {
+                    const det: any = {
+                        className: d.objectType,
+                        score: typeof d.confidenceLevel === 'number' ? d.confidenceLevel / 100 : 1,
+                    };
+                    if (Array.isArray(d.coord) && d.coord.length === 4) det.boundingBox = d.coord.slice(0, 4);
+                    if (d.trackerID != null) det.id = String(d.trackerID);
+                    return det;
+                });
+            // firmware fallback: no descriptors, just the class list (no box).
+            if (!detections.length)
+                for (const t of (payload?.smartDetectTypes || payload?.objectTypes || []))
+                    detections.push({ className: t, score: 1 });
+            const detected: ObjectsDetected = {
+                timestamp: Date.now(),
+                detections,
+                inputDimensions: [1000, 1000],   // camera `coord` space
+            };
+            this.onDeviceEvent(ScryptedInterface.ObjectDetector, detected);
             this.triggerMotion();
         } else if (/motion/i.test(fn) || fn === 'EventAnalytics') {
             this.triggerMotion();
