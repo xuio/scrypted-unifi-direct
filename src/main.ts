@@ -222,9 +222,13 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     onCameraEvent(fn: string, payload: any) {
         if (fn === 'EventSmartDetect' || fn === 'EventSmartDetectZone') {
             // The camera reports one descriptor per tracked object, each with a
-            // bounding box (`coord` = [x,y,w,h], normalised to 0..1000), a class,
-            // a confidence and a tracker id. Forwarding the box + dimensions lets
-            // Scrypted crop the event thumbnail to the object.
+            // bounding box (`coord` = [x,y,w,h] normalised to 0..1000 of the full
+            // sensor FoV), a class, a confidence and a tracker id. We scale the box
+            // into real detection-frame pixels and report the frame's true 16:9
+            // dimensions so Scrypted maps/crops it correctly (a square input space
+            // would make Scrypted's aspect correction shift the box vertically).
+            const fov = CHANNELS.high;                    // detection runs on the full FoV
+            const sx = fov.w / 1000, sy = fov.h / 1000;
             const descriptors: any[] = Array.isArray(payload?.descriptors) ? payload.descriptors : [];
             const detections = descriptors
                 .filter(d => d && d.objectType)
@@ -233,7 +237,9 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
                         className: d.objectType,
                         score: typeof d.confidenceLevel === 'number' ? d.confidenceLevel / 100 : 1,
                     };
-                    if (Array.isArray(d.coord) && d.coord.length === 4) det.boundingBox = d.coord.slice(0, 4);
+                    const c = d.coord;
+                    if (Array.isArray(c) && c.length === 4)
+                        det.boundingBox = [c[0] * sx, c[1] * sy, c[2] * sx, c[3] * sy];
                     if (d.trackerID != null) det.id = String(d.trackerID);
                     return det;
                 });
@@ -244,7 +250,7 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             const detected: ObjectsDetected = {
                 timestamp: Date.now(),
                 detections,
-                inputDimensions: [1000, 1000],   // camera `coord` space
+                inputDimensions: [fov.w, fov.h],
             };
             this.onDeviceEvent(ScryptedInterface.ObjectDetector, detected);
             this.triggerMotion();
