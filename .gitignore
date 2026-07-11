@@ -5,3 +5,6 @@ dist/
 .DS_Store
 # contains real camera/host passwords — do not commit
 CREDENTIALS.md
+
+# internal dev notes — not for publication
+HANDOVER.md
