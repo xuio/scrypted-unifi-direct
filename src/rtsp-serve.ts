@@ -212,7 +212,18 @@ export interface RtspServeHandle {
     url: string;
     destroy(): void;
     readonly clientCount: number;
+    /**
+     * False once the video pipeline is no longer usable: the video ffmpeg exited,
+     * the handle was destroyed, or no RTP has been produced for a while (a stalled
+     * ffmpeg after an FLV desync keeps the process alive but stops emitting). The
+     * provider treats a non-alive serve as dead and rebuilds it from scratch.
+     */
+    readonly alive: boolean;
 }
+
+// If the video ffmpeg produces no RTP for this long the pipeline is considered
+// stalled (typically an unrecoverable FLV desync) and the stream is rebuilt.
+const RTP_STALL_MS = 8000;
 
 /**
  * Serve a de-trailered FLV Readable as a native RTSP camera that Scrypted
@@ -264,10 +275,14 @@ export async function startRtspServe(opts: {
     });
 
     let dead = false;
+    let videoAlive = true;
+    // updated on every RTP datagram the video ffmpeg emits; ages out on a stall.
+    let lastVideoRtp = Date.now();
     const sessions = new Set<RtspSession>();
     let server: net.Server | undefined;
     const destroy = () => {
         if (dead) return; dead = true;
+        videoAlive = false;
         try { server?.close(); } catch { }
         for (const s of sessions) s.close();
         sessions.clear();
@@ -298,12 +313,13 @@ export async function startRtspServe(opts: {
         catch (e) { dbg('rtsp-serve audio unavailable, video-only:', (e as Error)?.message); try { cpAudio.kill('SIGKILL'); } catch { } }
     }
 
-    cpVideo.once('exit', code => { dbg('rtsp-serve video ffmpeg exited', code); destroy(); });
+    cpVideo.once('exit', code => { dbg('rtsp-serve video ffmpeg exited', code); videoAlive = false; destroy(); });
     const info = combineSdp(videoSdp, audioSdp);
     dbg('rtsp-serve sdp ready; video', info.videoTrack, 'audio', info.audioTrack);
 
     // fan received RTP out to every connected client by track
-    video.socket.on('message', buf => { for (const s of sessions) s.sendRtp(info.videoTrack, buf); });
+    lastVideoRtp = Date.now();
+    video.socket.on('message', buf => { lastVideoRtp = Date.now(); for (const s of sessions) s.sendRtp(info.videoTrack, buf); });
     if (audio && info.audioTrack)
         audio.socket.on('message', buf => { for (const s of sessions) s.sendRtp(info.audioTrack, buf); });
 
@@ -319,5 +335,9 @@ export async function startRtspServe(opts: {
 
     flv.once('close', destroy);
 
-    return { url, destroy, get clientCount() { return sessions.size; } };
+    return {
+        url, destroy,
+        get clientCount() { return sessions.size; },
+        get alive() { return !dead && videoAlive && (Date.now() - lastVideoRtp) < RTP_STALL_MS; },
+    };
 }
