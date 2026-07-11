@@ -1,13 +1,20 @@
-# UniFi Direct (Scrypted plugin)
+# UniFi Direct — UniFi Protect cameras in Scrypted with no NVR
 
-Connect Scrypted **directly to UniFi Protect cameras** — with **no UniFi Protect
-NVR, Console, or Cloud Key** in the path. The plugin emulates the UniFi controller
-side of the camera management protocol, so each camera streams video, audio, and
-detection events straight to Scrypted as if it were talking to a Protect console.
+[![npm](https://img.shields.io/npm/v/scrypted-unifi-direct?color=cb3837&logo=npm)](https://www.npmjs.com/package/scrypted-unifi-direct)
+[![license: Unlicense](https://img.shields.io/badge/license-Unlicense-blue.svg)](https://unlicense.org)
+[![Scrypted plugin](https://img.shields.io/badge/Scrypted-plugin-6a1b9a)](https://scrypted.app)
 
-Built and verified against **UVC G5 Turret Ultra** (firmware 5.3.90). Other UniFi
-camera models should work; model-specific capabilities are auto-detected and the
-settings surface adapts accordingly.
+**Use UniFi Protect cameras with no NVR, Cloud Key, or Console.** A
+[Scrypted](https://scrypted.app) plugin that talks **directly** to Ubiquiti UniFi
+Protect cameras — it emulates the UniFi controller so each camera streams live
+**RTSP** video, audio, full-resolution snapshots, and **on-camera person / vehicle
+/ animal detection** with zones straight into Scrypted, and on to **HomeKit**, Home
+Assistant, Google Home, or Scrypted NVR — no Protect NVR, Cloud Key, or Console
+required.
+
+Built and verified against **UVC G5 Turret Ultra** (firmware 5.3.90). Other UniFi /
+Ubiquiti camera models should work; model-specific capabilities are auto-detected
+and the settings surface adapts accordingly.
 
 ## Features
 
