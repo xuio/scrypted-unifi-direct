@@ -32,6 +32,7 @@ const { deviceManager, mediaManager } = sdk;
 
 const MGMT_PORT = 7442;
 const CAMERA_PORT_BASE = 17550; // firewall range 17550-17560
+const CAMERA_PORT_COUNT = 11;   // ports 17550..17560
 
 const CHANNELS: Record<string, { track: string; label: string; w: number; h: number }> = {
     high: { track: 'video1', label: 'High', w: 2688, h: 1512 },
@@ -65,10 +66,11 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     private get channelKey() { return this.storage.getItem('channel') || 'high'; }
     private get channel() { return CHANNELS[this.channelKey] || CHANNELS.high; }
     private get codec() { return this.storage.getItem('codec') || 'h264'; }
-    // unique, stable per-camera port derived from the host's last octet (17550-17560)
+    // distinct per-camera push port in the firewalled range, assigned by the
+    // provider so two cameras can never collide (an IP-octet hash alone would
+    // clash for hosts 11 apart → EADDRINUSE and a dead stream).
     private get cameraPort() {
-        const last = parseInt((this.storage.getItem('host') || '').split('.').pop() || '0') || 0;
-        return CAMERA_PORT_BASE + (last % 11);
+        return this.provider.allocateCameraPort(this.nativeId || '', this.storage.getItem('host') || '');
     }
 
     // ---- pairing ----
@@ -190,6 +192,24 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         return creating;
     }
 
+    /**
+     * Health watchdog: tear down any stream whose pipeline has died/stalled so a
+     * zombie RTSP server (ffmpeg alive but emitting no RTP) can't keep a viewer
+     * connected to a silent stream. Killing it forces the consumer (prebuffer) to
+     * reconnect, which rebuilds a fresh stream on the next getVideoStream. Only
+     * reaps built streams, never one mid-creation.
+     */
+    reapDeadStreams() {
+        for (const [track, s] of [...this.streams]) {
+            if (this.creating.has(track)) continue;
+            if (!s.alive) {
+                dbg('reaping dead stream', this.mac, track);
+                try { s.stop(); } catch { }
+                this.streams.delete(track);
+            }
+        }
+    }
+
     private waitOnline(emulator: ControllerEmulator, ms: number): Promise<void> {
         return new Promise(resolve => {
             if (emulator.isOnline(this.mac)) return resolve();
@@ -291,10 +311,30 @@ class UnifiDirectProvider extends ScryptedDeviceBase implements DeviceProvider, 
     private cameras = new Map<string, UnifiCamera>();
     public emulator: ControllerEmulator | undefined;
     private pairTimer: any;
+    private healthTimer: any;
+    private cameraPorts = new Map<string, number>();   // nativeId -> assigned push port
 
     constructor(nativeId?: string) {
         super(nativeId);
         this.init().catch(e => this.console.error('init failed', e));
+    }
+
+    /** Assign a distinct, stable push port per camera from the firewalled range. */
+    allocateCameraPort(nativeId: string, host: string): number {
+        const existing = this.cameraPorts.get(nativeId);
+        if (existing) return existing;
+        const used = new Set(this.cameraPorts.values());
+        const preferred = CAMERA_PORT_BASE + ((parseInt(host.split('.').pop() || '0') || 0) % CAMERA_PORT_COUNT);
+        let port = used.has(preferred) ? -1 : preferred;
+        if (port < 0) {
+            for (let i = 0; i < CAMERA_PORT_COUNT; i++) {
+                const p = CAMERA_PORT_BASE + i;
+                if (!used.has(p)) { port = p; break; }
+            }
+        }
+        if (port < 0) throw new Error(`no free camera push port in ${CAMERA_PORT_BASE}-${CAMERA_PORT_BASE + CAMERA_PORT_COUNT - 1}`);
+        this.cameraPorts.set(nativeId, port);
+        return port;
     }
 
     private async init() {
@@ -313,11 +353,19 @@ class UnifiDirectProvider extends ScryptedDeviceBase implements DeviceProvider, 
         // periodically (re)pair cameras that aren't connected (handles reboots/backoff)
         this.pairTimer = setInterval(() => this.repairAll(), 30000);
         setTimeout(() => this.repairAll(), 3000);
+        // health watchdog: reap dead/stalled streams so consumers reconnect fresh.
+        this.healthTimer = setInterval(() => this.reapAll(), 15000);
     }
 
     private async repairAll() {
         for (const cam of this.cameras.values()) {
             try { await cam.ensurePaired(); } catch { }
+        }
+    }
+
+    private reapAll() {
+        for (const cam of this.cameras.values()) {
+            try { cam.reapDeadStreams(); } catch { }
         }
     }
 
@@ -401,6 +449,7 @@ class UnifiDirectProvider extends ScryptedDeviceBase implements DeviceProvider, 
         const key = nativeId || '';
         const cam = this.cameras.get(key);
         if (cam) { await cam.release(); this.cameras.delete(key); }
+        this.cameraPorts.delete(key);
     }
 }
 
