@@ -2,6 +2,8 @@ import sdk, {
     Camera,
     Device,
     DeviceCreator,
+    Image,
+    ScryptedMimeTypes,
     DeviceCreatorSettings,
     DeviceProvider,
     FFmpegInput,
@@ -182,25 +184,48 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
 
     // ---- Camera (snapshot) ----
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
+        const full = await this.getSnapshotBuffer(options);
+        // Honor the requested dimensions. HomeKit asks for a small tile-sized
+        // snapshot; returning the full 2688×1512 (~400 KB) makes its previews go
+        // black. Detection/NVR/UI that pass no size still get full resolution.
+        const sized = await this.resizeForRequest(full, options);
+        return mediaManager.createMediaObject(sized, 'image/jpeg', { sourceId: this.id });
+    }
+
+    /** Get a full-res snapshot buffer with stale-while-revalidate caching: return
+     *  any cached frame INSTANTLY and refresh in the background when stale, so a
+     *  fresh decode never blocks the request. */
+    private async getSnapshotBuffer(options?: RequestPictureOptions): Promise<Buffer> {
         const ttl = this.snapshotCacheTtlMs;
-        // Stale-while-revalidate: whenever we have any cached frame, return it
-        // INSTANTLY and refresh in the background if it's stale. HomeKit shows a
-        // black tile if a snapshot request is slow, so takePicture must never block
-        // on a fresh decode once a frame exists — a few-seconds-old still is fine.
         if (this.snapCache && ttl > 0) {
             const age = Date.now() - this.snapCache.ts;
             if (age >= ttl && !this.snapInflight) {
                 this.snapInflight = this.captureJpeg(options).finally(() => { this.snapInflight = undefined; });
                 this.snapInflight.catch(() => { });   // background refresh; errors keep the stale frame
             }
-            return mediaManager.createMediaObject(this.snapCache.jpeg, 'image/jpeg', { sourceId: this.id });
+            return this.snapCache.jpeg;
         }
-        // No cached frame yet (or caching disabled): capture now. Coalesce
-        // concurrent callers so a burst triggers a single capture.
+        // No cached frame yet (or caching disabled): capture now, coalescing callers.
         if (!this.snapInflight)
             this.snapInflight = this.captureJpeg(options).finally(() => { this.snapInflight = undefined; });
-        const jpeg = await this.snapInflight;
-        return mediaManager.createMediaObject(jpeg, 'image/jpeg', { sourceId: this.id });
+        return this.snapInflight;
+    }
+
+    /** Downscale a full-res JPEG to the requested picture size (never upscale).
+     *  Falls back to the original on any error. */
+    private async resizeForRequest(full: Buffer, options?: RequestPictureOptions): Promise<Buffer> {
+        const w = options?.picture?.width, h = options?.picture?.height;
+        if (!w && !h) return full;   // no size hint → full resolution
+        try {
+            const mo = await mediaManager.createMediaObject(full, 'image/jpeg', { sourceId: this.id });
+            const image = await mediaManager.convertMediaObject<Image>(mo, ScryptedMimeTypes.Image);
+            if ((!w || image.width <= w) && (!h || image.height <= h)) return full;   // already small enough
+            const out = await image.toBuffer({ resize: { width: w || undefined, height: h || undefined }, format: 'jpg' });
+            return out?.length ? out : full;
+        } catch (e) {
+            dbg('snapshot resize failed', this.mac, (e as Error)?.message);
+            return full;
+        }
     }
 
     /**
