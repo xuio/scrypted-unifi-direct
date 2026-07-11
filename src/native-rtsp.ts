@@ -1,7 +1,7 @@
 import net, { AddressInfo } from 'net';
 import { randomBytes } from 'crypto';
 import type { Readable } from 'stream';
-import { RtspSession, RtspServeHandle, SdpInfo } from './rtsp-serve';
+import { RtspSession, RtspServeHandle, SdpInfo } from './rtsp-session';
 import { dbg } from './debug';
 
 type Logger = { log?: (...a: any[]) => void; warn?: (...a: any[]) => void };
@@ -244,19 +244,14 @@ function buildSdp(v: VideoParams, a?: AudioParams): SdpInfo {
 // ---------------------------------------------------------------------------
 
 /**
- * Serve a de-trailered (standard) FLV Readable as an in-process RTSP server —
- * the pure-JS replacement for the two-ffmpeg + UDP-loopback path in
- * rtsp-serve.ts. The FLV is demuxed and RTP-packetized directly (H.264 RFC 6184
- * + AAC RFC 3640) and fanned out to every connected RTSP client over
- * interleaved TCP, so there is no localhost UDP hop to drop keyframe bursts and
- * no per-camera ffmpeg processes.
+ * Serve a de-trailered (standard) FLV Readable as an in-process RTSP server. The
+ * FLV is demuxed and RTP-packetized directly (H.264 RFC 6184 + AAC RFC 3640) and
+ * fanned out to every connected RTSP client over interleaved TCP — no ffmpeg
+ * subprocess and no localhost UDP hop to drop keyframe bursts.
  *
- * H.264 + AAC only; callers must route h265 to the ffmpeg path. Audio is
+ * H.264 + AAC only (the camera must be commanded to push h264). Audio is
  * best-effort: any uncertainty (non-AAC, unparsable ASC, missing config) yields
  * a video-only SDP rather than a stalled or broken stream.
- *
- * Returns the same handle shape as startRtspServe so the two paths are
- * drop-in interchangeable.
  */
 export async function startNativeServe(opts: {
     flv: Readable;

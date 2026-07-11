@@ -562,6 +562,11 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             throw new Error(`camera ${this.mac} has not connected to the Scrypted controller emulator yet`);
         dbg('getVideoStream', this.mac, 'proceeding, online now', emulator.isOnline(this.mac));
 
+        // The in-process muxer is H.264-only; fail clearly instead of timing out
+        // waiting for a sequence header the muxer can't parse.
+        if (/265|hevc/i.test(this.codec))
+            throw new Error('Video Codec is set to h265, which the native RTSP muxer does not support yet — set it back to h264 in the camera settings.');
+
         // reuse a persistent per-channel stream (prebuffer + viewers share it).
         // start() blocks until the in-process RTSP server has an SDP and is
         // accepting, so once it resolves the url is immediately connectable.
@@ -598,8 +603,7 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             creating = (async () => {
                 const gen = this.streamGen;
                 const selfIp = this.provider.getPushAddress()!;
-                const ffmpegPath = await mediaManager.getFFmpegPath();
-                const s = new DirectStream(emulator, this.mac, track, this.codec, selfIp, this.cameraPort, ffmpegPath, this.console);
+                const s = new DirectStream(emulator, this.mac, track, this.codec, selfIp, this.cameraPort, this.console);
                 await s.start();
                 // If the channel/codec changed (or we were released) while this was
                 // building, discard it — otherwise it would re-insert a live stream
@@ -773,7 +777,7 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             {
                 key: 'codec', title: 'Video Codec', group: 'Stream', value: this.codec, type: 'string',
                 choices: ['h264', 'h265'],
-                description: 'Codec requested from the camera for the selected channel.',
+                description: 'Codec requested from the camera. The in-process RTSP muxer currently supports H.264 only; leave this on h264 (HEVC support is planned).',
             },
             {
                 key: 'fullResSnapshots', title: 'Full-resolution snapshots', group: 'Snapshots',

@@ -1,27 +1,15 @@
 import net from 'net';
 import { PassThrough } from 'stream';
 import type { ControllerEmulator } from './controller-emulator';
-import { startRtspServe, RtspServeHandle } from './rtsp-serve';
+import { RtspServeHandle } from './rtsp-session';
 import { startNativeServe } from './native-rtsp';
 import { dbg } from './debug';
 
 type Logger = { log: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
-/**
- * Media-path toggle. When true (and the stream codec is H.264), the FLV is
- * demuxed and RTP-packetized in pure JS (native-rtsp.ts): no per-camera ffmpeg
- * processes and no localhost UDP loopback (whose receive buffer drops packets
- * during keyframe bursts). When false, the proven dual-ffmpeg path
- * (rtsp-serve.ts) is used. Both return the same RtspServeHandle, so this is the
- * only switch point. DEFAULT: false (ffmpeg) until the native path has been
- * validated on real hardware. h265 always uses the ffmpeg path — the native
- * muxer implements H.264+AAC only.
- */
-const USE_NATIVE_MUX: boolean = true;
-
 // The camera cycles a few short-lived TCP connections while a push is being set
 // up before settling on the one that carries the continuous stream. Only after a
-// connection has stayed open this long (still delivering FLV) do we spawn ffmpeg,
+// connection has stayed open this long (still delivering FLV) do we start serving,
 // so a transient setup connection can never poison the pipeline. Prebuffer keeps
 // streams warm, so this one-time settle delay is invisible to viewers.
 const SETTLE_MS = 1500;
@@ -104,10 +92,9 @@ function isFlvHeader(d: Buffer) {
  * One live direct stream for a camera+channel.
  *
  * The camera pushes UniFi "extendedFlv" to a TCP port we own; we de-trailer it to
- * standard FLV and feed a local in-process RTSP server that Scrypted connects out
- * to like any native RTSP camera. Video is never re-encoded — it's either muxed to
- * RTP in pure JS (native-rtsp.ts, default) or copied through ffmpeg (rtsp-serve.ts,
- * for h265 or when USE_NATIVE_MUX is off).
+ * standard FLV and feed the in-process RTSP muxer (native-rtsp.ts) that Scrypted
+ * connects out to like any native RTSP camera. Video is never re-encoded — the FLV
+ * is demuxed and RTP-packetized in pure JS (no ffmpeg, no UDP hop).
  *
  * The muxer cannot recover from a second FLV header appearing mid-input, so exactly
  * one FLV connection maps to one de-trailer + one muxer for the life of this
@@ -136,7 +123,6 @@ export class DirectStream {
         private codec: string,
         private selfIp: string,
         private cameraPort: number,
-        private ffmpegPath: string,
         private logger: Logger,
     ) { }
 
@@ -213,31 +199,22 @@ export class DirectStream {
         this.settleTimer = setTimeout(() => this.promote(), SETTLE_MS);
     }
 
-    /** The candidate connection stayed up — start serving (native JS mux, or ffmpeg). */
+    /** The candidate connection stayed up — start serving. */
     private async promote() {
         if (this.stopped || this.serveStarted || !this.cameraSocket || !this.flv) return;
         this.serveStarted = true;
-        // The native JS muxer speaks H.264 only; h265/hevc streams stay on ffmpeg.
-        const useNative = USE_NATIVE_MUX && !/265|hevc/i.test(this.codec);
-        dbg('DS', this.mac, 'connection stable; starting rtsp serve', useNative ? '(native mux)' : '(ffmpeg)');
+        dbg('DS', this.mac, 'connection stable; starting native rtsp serve');
         // if this settled connection later collapses, mark dead for rebuild.
         this.flv.once('close', () => { if (this.serveStarted && !this.stopped) this.stopped = true; });
         try {
-            const serve = useNative
-                ? await startNativeServe({
-                    flv: this.flv,
-                    hasAudio: true,
-                    logger: this.logger,
-                })
-                : await startRtspServe({
-                    ffmpegPath: this.ffmpegPath,
-                    flv: this.flv,
-                    hasAudio: true,
-                    logger: this.logger,
-                });
+            const serve = await startNativeServe({
+                flv: this.flv,
+                hasAudio: true,
+                logger: this.logger,
+            });
             // stop() may have run during the (multi-second) SDP wait; it destroyed a
-            // still-undefined this.serve, so the freshly-built one would leak (ffmpeg
-            // + sockets, unreferenced). Destroy it and bail.
+            // still-undefined this.serve, so the freshly-built one would leak
+            // (sockets, unreferenced). Destroy it and bail.
             if (this.stopped) { serve.destroy(); this.onServeFail?.(new Error('stopped')); return; }
             this.serve = serve;
             this.onServeReady?.();
