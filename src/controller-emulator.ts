@@ -290,7 +290,7 @@ export class ControllerEmulator extends EventEmitter {
             if (other === channel) continue;
             // Point the unused substreams at /dev/null AND disable their audio.
             // Several cameras still actively push a substream to the old NVR
-            // (e.g. tcp://old-nvr.example:7550) at a different audio rate, which
+            // (e.g. tcp://<old-nvr-host>:7550) at a different audio rate, which
             // is what forces the shared encoder into scalable/SSR AAC. Only the
             // controller (us) can override an active serializer, so we stop them.
             video[other] = {
