@@ -18,7 +18,19 @@ export interface FieldDef {
     /** camera stores this boolean as 0/1 rather than true/false */
     bool01?: boolean;
     description?: string;
+    /**
+     * Capability gate: only expose this field when the camera's `features` flags
+     * say the model supports it. Return true to show. If omitted, the field is
+     * gated purely on whether its path exists in the camera's settings JSON.
+     * (Presence alone is insufficient for some fields — e.g. speaker volume is
+     * present in settings on speakerless models — hence the explicit flag check.)
+     */
+    cap?: (features: Record<string, any>) => boolean;
 }
+
+const hasMic = (f: Record<string, any>) => !!f.mic;
+const hasSpeaker = (f: Record<string, any>) => !!(f.speaker || f.adjustableSpeakerVolume);
+const hasStatusLed = (f: Record<string, any>) => !!f.ledStatus;
 
 export const PARITY_FIELDS: FieldDef[] = [
     // ---- Image (ISP) ----
@@ -38,6 +50,16 @@ export const PARITY_FIELDS: FieldDef[] = [
     { key: 'isp.lensDistortionCorrection', title: 'Distortion correction', group: 'Image', type: 'boolean', paths: ['isp.lensDistortionCorrection'], bool01: true },
     { key: 'isp.flip', title: 'Flip vertically', group: 'Image', type: 'boolean', paths: ['isp.flip'], bool01: true },
     { key: 'isp.mirror', title: 'Mirror horizontally', group: 'Image', type: 'boolean', paths: ['isp.mirror'], bool01: true },
+    // ---- Image (ISP) advanced — gated by presence in the camera settings ----
+    {
+        key: 'isp.aeMode', title: 'Exposure mode', group: 'Image', type: 'string',
+        paths: ['isp.aeMode'], choices: ['auto', 'flick50', 'flick60', 'manual', 'shutter'],
+        description: 'flick50 / flick60 = anti-flicker for 50 Hz / 60 Hz artificial lighting.',
+    },
+    { key: 'isp.aeTargetPercent', title: 'Exposure target', group: 'Image', type: 'integer', paths: ['isp.aeTargetPercent'], range: [0, 100] },
+    { key: 'isp.colorNightVision', title: 'Color night vision', group: 'Image', type: 'boolean', paths: ['isp.colorNightVision'], bool01: true },
+    { key: 'isp.aggressiveAntiFlicker', title: 'Aggressive anti-flicker', group: 'Image', type: 'boolean', paths: ['isp.aggressiveAntiFlicker'], bool01: true },
+    { key: 'isp.autoFlipMirror', title: 'Auto flip & mirror', group: 'Image', type: 'boolean', paths: ['isp.autoFlipMirror'], bool01: true },
 
     // ---- Video (applies to the active channel track) ----
     { key: 'video.fps', title: 'Frame rate (fps)', group: 'Video', type: 'integer', paths: ['av.video.<track>.fps', 'av.video.<track>.maxFps'], range: [1, 30] },
@@ -49,17 +71,29 @@ export const PARITY_FIELDS: FieldDef[] = [
         description: 'Seconds between keyframes. Lower = faster stream start / lower latency in Scrypted and HomeKit, at the cost of somewhat larger recordings. 1s recommended for instant playback.',
     },
 
-    // ---- Audio ----
-    { key: 'audio.enabled', title: 'Microphone enabled', group: 'Audio', type: 'boolean', paths: ['av.audio.enabled'] },
-    { key: 'audio.volume', title: 'Microphone volume', group: 'Audio', type: 'integer', paths: ['av.audio.volume'], range: [0, 100] },
+    // ---- Audio (microphone) — gated on the camera having a mic ----
+    { key: 'audio.enabled', title: 'Microphone enabled', group: 'Audio', type: 'boolean', paths: ['av.audio.enabled'], cap: hasMic },
+    { key: 'audio.volume', title: 'Microphone volume', group: 'Audio', type: 'integer', paths: ['av.audio.volume'], range: [0, 100], cap: hasMic },
+    { key: 'audio.agc', title: 'Mic auto gain (AGC)', group: 'Audio', type: 'boolean', paths: ['av.audio.agc'], cap: hasMic },
+    { key: 'audio.denoise', title: 'Mic noise reduction', group: 'Audio', type: 'boolean', paths: ['av.audio.denoise'], cap: hasMic },
+    { key: 'audio.highpass', title: 'Mic high-pass filter', group: 'Audio', type: 'boolean', paths: ['av.audio.highpass'], cap: hasMic },
+
+    // ---- Speaker — gated on the camera having a (adjustable) speaker ----
+    { key: 'soundled.speakerEnabled', title: 'Speaker', group: 'Speaker', type: 'boolean', paths: ['soundled.speakerEnabled'], bool01: true, cap: hasSpeaker },
+    { key: 'soundled.speakerVolume', title: 'Speaker volume', group: 'Speaker', type: 'integer', paths: ['soundled.speakerVolume'], range: [0, 100], cap: f => !!f.adjustableSpeakerVolume },
 
     // ---- Overlay (OSD) ----
     { key: 'osd.enableDate', title: 'Timestamp overlay', group: 'Overlay', type: 'boolean', paths: ['osd._1.enableDate', 'osd._2.enableDate', 'osd._3.enableDate', 'osd._4.enableDate'], bool01: true },
     { key: 'osd.enableLogo', title: 'Name/logo overlay', group: 'Overlay', type: 'boolean', paths: ['osd._1.enableLogo', 'osd._2.enableLogo', 'osd._3.enableLogo', 'osd._4.enableLogo'], bool01: true },
+    { key: 'osd.tag', title: 'On-screen name text', group: 'Overlay', type: 'string', paths: ['osd._1.tag', 'osd._2.tag', 'osd._3.tag', 'osd._4.tag'], description: 'Custom camera-name text drawn on the video overlay.' },
     { key: 'osd.overlayLocation', title: 'Overlay location', group: 'Overlay', type: 'string', paths: ['osd.overlayLocation'], choices: ['topLeft', 'topRight', 'bottomLeft', 'bottomRight'] },
 
-    // ---- Status light ----
-    { key: 'soundled.ledFaceEnabled', title: 'Status light', group: 'Status Light', type: 'boolean', paths: ['soundled.ledFaceEnabled'], bool01: true },
+    // ---- Status light — gated on the camera having a status LED ----
+    { key: 'soundled.ledFaceEnabled', title: 'Status light', group: 'Status Light', type: 'boolean', paths: ['soundled.ledFaceEnabled'], bool01: true, cap: hasStatusLed },
+
+    // ---- General ----
+    { key: 'device.name', title: 'Camera name (on-device)', group: 'General', type: 'string', paths: ['device.name'], description: 'The name stored on the camera itself (separate from the Scrypted device name).' },
+    { key: 'httpd.anonSnapshot', title: 'Anonymous snapshot', group: 'General', type: 'boolean', paths: ['httpd.anonSnapshot'], bool01: true, description: 'Allow unauthenticated GET /snap.jpeg from the camera.' },
 ];
 
 export function getByPath(obj: any, path: string): any {
@@ -82,29 +116,94 @@ function resolvePaths(field: FieldDef, track: string): string[] {
     return field.paths.map(p => p.replace('<track>', track));
 }
 
+/** True if the camera's settings JSON actually contains this field (⇒ supported). */
+export function isFieldPresent(field: FieldDef, settings: any, track: string): boolean {
+    return resolvePaths(field, track).some(p => getByPath(settings, p) !== undefined);
+}
+
+/** Is this field supported by the camera (capability flag + presence in settings)? */
+export function isFieldSupported(field: FieldDef, settings: any, features: Record<string, any>, track: string): boolean {
+    if (field.cap && !field.cap(features || {})) return false;
+    return isFieldPresent(field, settings, track);
+}
+
 /** Read the current value of a field from the camera settings JSON, coerced for Scrypted. */
 export function readField(field: FieldDef, settings: any, track: string): any {
-    const raw = getByPath(settings, resolvePaths(field, track)[0]);
+    let raw: any;
+    for (const p of resolvePaths(field, track)) {
+        const v = getByPath(settings, p);
+        if (v !== undefined) { raw = v; break; }
+    }
     if (field.type === 'boolean')
         return field.bool01 ? raw === 1 : !!raw;
     return raw;
 }
 
-/** Build the settings partial to write a Scrypted value back to the camera. */
-export function writeField(field: FieldDef, value: any, track: string): any {
-    let out: any;
+/** Coerce a Scrypted setting value to the camera's on-wire form for this field. */
+export function coerceValue(field: FieldDef, value: any): any {
     if (field.type === 'boolean') {
         const b = value === true || value === 'true';
-        out = field.bool01 ? (b ? 1 : 0) : b;
-    } else if (field.type === 'integer' || field.type === 'number') {
-        out = parseInt(String(value));
-    } else {
-        out = value;
+        return field.bool01 ? (b ? 1 : 0) : b;
     }
+    if (field.type === 'integer' || field.type === 'number') return parseInt(String(value));
+    return value;
+}
+
+/** Build the settings partial to write a Scrypted value back to the camera (HTTP). */
+export function writeField(field: FieldDef, value: any, track: string): any {
+    const out = coerceValue(field, value);
     const partial = {};
     for (const p of resolvePaths(field, track))
         setByPath(partial, p, out);
     return partial;
+}
+
+/**
+ * Fields that UniFi Protect does NOT set over the management channel (proven
+ * absent from the Protect backend) — these stay on the camera's local HTTP API:
+ *  - isp.aeTargetPercent: no such key in any Change* builder
+ *  - audio.*: only mic volume is mgmt-settable (as audio.volume), and it conflates
+ *    enable/volume; keep our discrete audio toggles on HTTP where av.audio.* are
+ *    first-class fields (agc/denoise/highpass have no mgmt key at all)
+ *  - httpd.anonSnapshot: absent from the entire backend; local-API only
+ */
+const MGMT_HTTP_ONLY = new Set([
+    'isp.aeTargetPercent',
+    'audio.enabled', 'audio.volume', 'audio.agc', 'audio.denoise', 'audio.highpass',
+    'httpd.anonSnapshot',
+]);
+
+/**
+ * Map a field write to the exact `Change*Settings` management command UniFi
+ * Protect sends the camera (reverse-engineered from protect-service.js). Returns
+ * undefined when the field isn't mgmt-settable → caller falls back to HTTP.
+ * Payloads are partials (single changed key); the camera merges by key.
+ */
+export function buildMgmtSetting(field: FieldDef, value: any, track: string): { fn: string; payload: any } | undefined {
+    if (MGMT_HTTP_ONLY.has(field.key)) return undefined;
+    const v = coerceValue(field, value);
+    const k = field.key;
+
+    if (k.startsWith('isp.'))
+        return { fn: 'ChangeIspSettings', payload: { [k.slice(4)]: v } };
+
+    if (k === 'video.fps') return { fn: 'ChangeVideoSettings', payload: { video: { [track]: { fps: v } } } };
+    if (k === 'video.isCbr') return { fn: 'ChangeVideoSettings', payload: { video: { [track]: { isCbr: v } } } };
+    if (k === 'video.bitrate') return { fn: 'ChangeVideoSettings', payload: { video: { [track]: { bitRateVbrMax: v } } } };
+    if (k === 'video.keyframeInterval') return { fn: 'ChangeVideoSettings', payload: { video: { [track]: { nMultiplier: v } } } };
+
+    if (k === 'osd.overlayLocation') return { fn: 'ChangeOsdSettings', payload: { overlayLocation: v } };
+    if (k.startsWith('osd.')) {
+        const inner = { [k.slice(4)]: v };
+        return { fn: 'ChangeOsdSettings', payload: { _1: inner, _2: inner, _3: inner, _4: inner } };
+    }
+
+    if (k.startsWith('soundled.'))
+        return { fn: 'ChangeSoundLedSettings', payload: { [k.slice('soundled.'.length)]: v } };
+
+    if (k === 'device.name') return { fn: 'ChangeDeviceSettings', payload: { name: v } };
+
+    return undefined;
 }
 
 /** Deep-merge b into a (objects only). */

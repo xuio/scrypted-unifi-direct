@@ -150,6 +150,10 @@ export class ControllerEmulator extends EventEmitter {
     private onMessage(session: CameraSession, m: any) {
         const fn = m.functionName;
         if (fn !== 'ubnt_avclient_timeSync') dbg('emu recv', session.mac, fn);
+        // Surface the camera's reply to our Change*Settings commands so we can see
+        // whether it accepted (success/echo) or rejected (error) a config push.
+        if (/Settings$/.test(fn) && m.inResponseTo)
+            dbg('emu recv reply', session.mac, fn, 'payload', JSON.stringify(m.payload ?? {}).slice(0, 800));
         switch (fn) {
             case 'ubnt_avclient_hello':
                 session.send('ubnt_avclient_hello', {
@@ -222,6 +226,27 @@ export class ControllerEmulator extends EventEmitter {
             dbg('emulator quiesceSubstreams', s.mac);
         } catch (e) { dbg('quiesceSubstreams failed', s.mac, (e as Error)?.message); }
     }
+
+    /**
+     * Send an arbitrary controller→camera management command over the avclient
+     * channel (e.g. zone config: ChangeSmartDetectSettings / ChangeSmartMotionSettings
+     * / ChangeIspSettings). Returns false if the camera isn't currently connected.
+     */
+    sendCommand(mac: string, fn: string, payload: any, responseExpected = true): boolean {
+        const s = this.sessions.get(mac);
+        if (!s) { dbg('sendCommand: camera not connected', mac, fn); return false; }
+        try {
+            s.send(fn, payload, responseExpected);
+            dbg('emulator sendCommand', mac, fn);
+            return true;
+        } catch (e) {
+            dbg('sendCommand failed', mac, fn, (e as Error)?.message);
+            return false;
+        }
+    }
+
+    /** Is a camera currently connected to the emulator? */
+    hasSession(mac: string): boolean { return this.sessions.has(mac); }
 
     /** Command a camera to push the given channel's video to destHost:destPort. */
     startStream(mac: string, channel: string, destHost: string, destPort: number, videoCodec = 'h264') {
