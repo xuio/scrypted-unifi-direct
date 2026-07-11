@@ -1,9 +1,25 @@
 {
-  "name": "@scrypted/unifi-direct",
-  "version": "0.0.1",
-  "description": "Connect directly to UniFi Protect cameras (no NVR) for snapshots and live video.",
+  "name": "scrypted-unifi-direct",
+  "version": "0.1.0",
+  "description": "Connect Scrypted directly to UniFi Protect cameras with no NVR/Console — live video, snapshots, audio, on-camera detections, zones, and full camera settings.",
   "author": "moritz",
   "license": "MIT",
+  "keywords": [
+    "scrypted",
+    "scrypted-plugin",
+    "unifi",
+    "unifi-protect",
+    "ubiquiti",
+    "camera",
+    "homekit",
+    "rtsp"
+  ],
+  "files": [
+    "dist",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
   "scripts": {
     "scrypted-setup-project": "scrypted-setup-project",
     "prescrypted-setup-project": "scrypted-package-json",
