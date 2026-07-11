@@ -25,6 +25,12 @@ export interface RtspServeHandle {
      * serve as dead and rebuilds it from scratch.
      */
     readonly alive: boolean;
+    /**
+     * The most recent decoded-ready keyframe as an Annex-B H.264 access unit
+     * (SPS + PPS + IDR), for instant snapshots without opening a video stream.
+     * undefined until the first keyframe has been muxed.
+     */
+    latestKeyframe(): { ts: number; annexb: Buffer } | undefined;
 }
 
 const RTSP_MAGIC = 0x24; // '$'

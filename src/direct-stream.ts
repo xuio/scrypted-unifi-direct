@@ -140,6 +140,9 @@ export class DirectStream {
     /** RTSP url Scrypted connects to. Available after start() resolves. */
     get url() { return this.serve?.url; }
 
+    /** Freshest keyframe (Annex-B H.264) for instant snapshots, if any. */
+    latestKeyframe() { return this.serve?.latestKeyframe(); }
+
     async start(): Promise<void> {
         this.cameraServer = net.createServer(s => this.onCamera(s));
         await listen(this.cameraServer, this.cameraPort, '0.0.0.0');

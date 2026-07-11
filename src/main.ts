@@ -25,6 +25,7 @@ import sdk, {
     SettingValue,
     VideoCamera,
 } from '@scrypted/sdk';
+import { spawn } from 'child_process';
 import { CameraApiClient } from './client';
 import { ControllerEmulator } from './controller-emulator';
 import { DirectStream } from './direct-stream';
@@ -75,6 +76,9 @@ const SNAPSHOT_TIMEOUT_MS = 3000;
  *  Kept low so a legitimately dark night scene (which still compresses to tens of
  *  KB) is accepted — only a near-empty/corrupt result is rejected. */
 const MIN_VALID_SNAPSHOT = 3000;
+/** Ignore a cached keyframe older than this (stream stalled) and fall back to the
+ *  live grab. A healthy stream produces a keyframe every ~1s. */
+const KEYFRAME_SNAPSHOT_MAX_AGE_MS = 10_000;
 
 /** A cached snapshot frame: its capture timestamp doubles as a stable identity
  *  for keying resized variants. */
@@ -316,16 +320,48 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         return frame;
     }
 
-    /** Decode a still from the live HIGH stream — the same mechanism UniFi
-     *  Protect's media server uses (these cameras have no full-res still API).
-     *  Sources from the prebuffer (buffered keyframes → near-instant grab). */
+    /** Decode a full-res still — the same mechanism UniFi Protect's media server
+     *  uses (these cameras have no full-res still API). Fast path: the native
+     *  muxer already holds the freshest decoded-ready keyframe, so decode that one
+     *  frame directly — no RTSP round-trip, no waiting for the next IDR, and it
+     *  can't be black. Falls back to grabbing a frame off the live stream (which
+     *  also spins the stream up if nothing is currently connected). */
     private async captureFullResJpeg(): Promise<Buffer> {
+        const kf = this.streams.get(this.channel.track)?.latestKeyframe();
+        if (kf && Date.now() - kf.ts < KEYFRAME_SNAPSHOT_MAX_AGE_MS) {
+            try {
+                const jpeg = await this.decodeKeyframeToJpeg(kf.annexb);
+                if (jpeg.length >= MIN_VALID_SNAPSHOT) { dbg('captureFullResJpeg', this.mac, 'keyframe', jpeg.length); return jpeg; }
+            } catch (e) { dbg('keyframe decode failed', this.mac, (e as Error)?.message); }
+        }
         const proxy = systemManager.getDeviceById<VideoCamera>(this.id);
         if (!proxy?.getVideoStream) throw new Error('video stream proxy unavailable');
         const mo = await proxy.getVideoStream({ id: this.channelKey });
         const jpeg = await mediaManager.convertMediaObjectToBuffer(mo, 'image/jpeg');
-        dbg('captureFullResJpeg', this.mac, jpeg.length, 'bytes');
+        dbg('captureFullResJpeg', this.mac, 'stream', jpeg.length, 'bytes');
         return jpeg;
+    }
+
+    /** One-shot decode of an Annex-B H.264 keyframe to a JPEG via ffmpeg. */
+    private async decodeKeyframeToJpeg(annexb: Buffer): Promise<Buffer> {
+        const ffmpegPath = await mediaManager.getFFmpegPath();
+        return new Promise<Buffer>((resolve, reject) => {
+            const cp = spawn(ffmpegPath, [
+                '-hide_banner', '-loglevel', 'error',
+                '-f', 'h264', '-i', 'pipe:0', '-frames:v', '1', '-f', 'mjpeg', 'pipe:1',
+            ], { stdio: ['pipe', 'pipe', 'pipe'] });
+            const chunks: Buffer[] = [];
+            const timer = setTimeout(() => { try { cp.kill('SIGKILL'); } catch { } reject(new Error('keyframe decode timeout')); }, 2500);
+            cp.stdout.on('data', d => chunks.push(d));
+            cp.on('error', e => { clearTimeout(timer); reject(e); });
+            cp.on('close', () => {
+                clearTimeout(timer);
+                const out = Buffer.concat(chunks);
+                out.length ? resolve(out) : reject(new Error('empty jpeg from keyframe decode'));
+            });
+            cp.stdin.on('error', () => { });
+            cp.stdin.end(annexb);
+        });
     }
 
     async getPictureOptions(): Promise<ResponsePictureOptions[]> {

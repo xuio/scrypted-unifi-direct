@@ -121,6 +121,17 @@ function parseAsc(d: Buffer): AudioParams | undefined {
     } catch { return; }
 }
 
+const ANNEXB_SC = Buffer.from([0, 0, 0, 1]);
+/** Assemble an Annex-B access unit (SPS + PPS + slice NALs, start-code framed)
+ *  — a self-contained, decodable keyframe for one-shot snapshot decoding. */
+function toAnnexB(params: VideoParams, nals: Buffer[]): Buffer {
+    const parts: Buffer[] = [];
+    for (const s of params.sps) parts.push(ANNEXB_SC, s);
+    for (const p of params.pps) parts.push(ANNEXB_SC, p);
+    for (const n of nals) parts.push(ANNEXB_SC, n);
+    return Buffer.concat(parts);
+}
+
 /** Split length-prefixed (AVCC) NAL units. Returned views alias `d`. */
 function splitNals(d: Buffer, off: number, nalLen: number): Buffer[] {
     const out: Buffer[] = [];
@@ -273,6 +284,7 @@ export async function startNativeServe(opts: {
     let audioParams: AudioParams | undefined;
     let audioBroken = false;      // audio is best-effort; once broken, video-only
     let audioServed = false;      // audio made it into the SDP
+    let latestKeyframe: { ts: number; annexb: Buffer } | undefined;   // for snapshots
     let onVideoParams: (() => void) | undefined;
     let onAudioParams: (() => void) | undefined;
 
@@ -303,6 +315,9 @@ export async function startNativeServe(opts: {
         const nals = splitNals(d, 5, videoParams.nalLen);
         if (!nals.length) return;
         lastVideoRtp = Date.now();   // liveness: video is flowing, clients or not
+        // Cache the freshest keyframe (decodable Annex-B AU) for instant snapshots,
+        // regardless of whether anyone is streaming.
+        if (frameType === 1) latestKeyframe = { ts: lastVideoRtp, annexb: toAnnexB(videoParams, nals) };
         if (!sessions.size) return;
         const ts = Math.max(0, tsMs + cts) * (VIDEO_CLOCK / 1000);
         const pkts: Buffer[] = [];
@@ -416,5 +431,6 @@ export async function startNativeServe(opts: {
         destroy,
         get clientCount() { return sessions.size; },
         get alive() { return !dead && (Date.now() - lastVideoRtp) < RTP_STALL_MS; },
+        latestKeyframe: () => latestKeyframe,
     };
 }
