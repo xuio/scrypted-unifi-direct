@@ -72,8 +72,6 @@ export const CAMERA_COORD_FACTOR = 1000;
 
 /** Full-frame polygon in camera coords (used to reset motion to "everywhere"). */
 const FULL_FRAME_COORD = [0, 0, 1000, 0, 1000, 1000, 0, 1000];
-/** Upper bound on privacy-mask indices to null out when clearing (features.privacyMasks.maxZones). */
-const PRIVACY_MAX_ZONES = 16;
 
 export interface CameraCommand { fn: string; payload: any; }
 
@@ -83,9 +81,6 @@ export interface ZoneBuildContext {
     globalObjectTypes: string[];
     /** All camera-supported classes (featureFlags.smartDetectTypes) — used for exclude zones. */
     supportedObjectTypes: string[];
-    /** Emit a privacy-mask clear even when no privacy zone exists (used when the
-     *  last privacy zone was just removed). */
-    clearPrivacy?: boolean;
     /** Reset motion to a full-frame zone even when no motion zone exists (used
      *  when the last motion zone was just removed). */
     clearMotion?: boolean;
@@ -97,7 +92,7 @@ const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n
 const c1000 = (v: number) => Math.round(clamp(v, 0, 1) * CAMERA_COORD_FACTOR);
 
 /** Closed-polygon coord: flat interleaved [x0,y0,x1,y1,...] × 1000. */
-function polyCoord(points: [number, number][]): number[] {
+export function polyCoord(points: [number, number][]): number[] {
     const out: number[] = [];
     for (const [x, y] of points) { out.push(c1000(x), c1000(y)); }
     return out;
@@ -204,18 +199,11 @@ export function buildZonePayloads(zones: ZoneDef[], ctx: ZoneBuildContext): Came
         cmds.push({ fn: 'ChangeAnalyticsSettings', payload: { deviceID: ctx.mac, sendEvents: 1, sendPulse: 1, bgmodel: 'default', pulsePeriodSec: 2, incremental: false, zones: zonesMap } });
     }
 
-    // 3) Privacy masks via ISP. Send the current masks (keyed 1..N) AND null out
-    //    the indices above N up to the camera's max, so removing one of several
-    //    masks doesn't orphan the higher-numbered ones on the camera (masks merge
-    //    by key). A full clear (no privacy zones left) nulls index 0..max.
-    const privacy = of('privacy');
-    if (privacy.length || ctx.clearPrivacy) {
-        const masks: any = { color: [0, 128, 128] };
-        privacy.forEach((z, i) => { masks[String(i + 1)] = { update: true, coord: polyCoord(z.points) }; });
-        for (let i = privacy.length + 1; i <= PRIVACY_MAX_ZONES; i++) masks[String(i)] = null;
-        if (!privacy.length) masks['0'] = null;
-        cmds.push({ fn: 'ChangeIspSettings', payload: { deviceID: ctx.mac, masks } });
-    }
+    // NOTE: privacy masks are applied SEPARATELY over the camera's local HTTP API
+    // (see UnifiCamera.applyPrivacyMasks), NOT here over the mgmt channel: removing
+    // a mask via ChangeIspSettings updates the stored config but the camera's
+    // encoder keeps rendering the old mask (verified on-camera). The HTTP settings
+    // write with `{update:true, coord:[]}` per removed mask makes it drop live.
 
     return cmds;
 }

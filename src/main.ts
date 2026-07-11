@@ -30,12 +30,14 @@ import { DirectStream } from './direct-stream';
 import { PARITY_FIELDS, readField, writeField, toSetting, isFieldSupported, buildMgmtSetting } from './camera-settings';
 import {
     ZoneDef, ZoneType, ZONE_TYPES, ZONE_TYPE_LABEL_TO_KEY, ZONE_DEFAULTS,
-    OBJECT_TYPES, LINE_DIRECTIONS, buildZonePayloads,
+    OBJECT_TYPES, LINE_DIRECTIONS, buildZonePayloads, polyCoord,
 } from './zones';
 import { dbg } from './debug';
 
 /** Default per-camera detection classes (global enable + exclude coverage). */
 const DEFAULT_OBJECT_TYPES = ['person', 'vehicle', 'animal', 'package'];
+/** Privacy-mask indices to clear (camera reports features.privacyMasks.maxZones=16). */
+const PRIVACY_INDEX_CAP = 16;
 
 /** Cap a full-res capture so a stream hiccup can never block a snapshot request
  *  (HomeKit shows a black tile if its snapshot request is slow). */
@@ -359,7 +361,6 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         // points) so a zone whose polygon was cleared correctly triggers a clear.
         const active = (t: ZoneType) => zones.some(z => z.type === t && z.enabled
             && ZONE_TYPES[z.type] && z.points.length >= ZONE_TYPES[z.type].minPoints);
-        const privacyActive = active('privacy');
         const motionActive = active('motion');
         const features = await this.getFeatures();
         const cmds = buildZonePayloads(zones, {
@@ -367,13 +368,47 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             globalObjectTypes: this.detectObjectTypes(features),
             supportedObjectTypes: this.smartDetectTypes(features),
             tamperDetection: this.tamperDetection,
-            clearPrivacy: this.storage.getItem('privacyApplied') === 'true' && !privacyActive,
             clearMotion: this.storage.getItem('motionApplied') === 'true' && !motionActive,
         });
         for (const { fn, payload } of cmds) emulator.sendCommand(this.mac, fn, payload, true);
-        this.storage.setItem('privacyApplied', String(privacyActive));
         this.storage.setItem('motionApplied', String(motionActive));
+        // Privacy masks go over the local HTTP API (mgmt removes don't re-render).
+        await this.applyPrivacyMasks(zones);
         dbg('applyZones', this.mac, 'sent', cmds.map(c => c.fn).join(',') || '(none)', 'zones', zones.length);
+    }
+
+    /**
+     * Apply privacy masks via the camera's local HTTP settings API. A mask is
+     * removed by sending `{update:true, coord:[]}` for its index — NOT null, and
+     * NOT over the mgmt channel: only this makes the camera's encoder drop the
+     * mask from the live video (verified on-camera). We track how many masks were
+     * last applied so the now-unused higher indices are actively cleared.
+     */
+    private async applyPrivacyMasks(zones: ZoneDef[]): Promise<void> {
+        const privacy = zones.filter(z => z.type === 'privacy' && z.enabled && z.points.length >= 3);
+        const prev = parseInt(this.storage.getItem('privacyCount') || '0') || 0;
+        if (!privacy.length && !prev) return;   // nothing to set and nothing to clear
+        try {
+            // The camera's encoder only reliably updates masks via two proven
+            // primitives over the local HTTP API: a STANDALONE clear-all (every
+            // index sent with empty coord, nothing else), and a set from a clean
+            // state. A mixed/immediate clear-then-set desyncs it. So we always
+            // clear all indices first, let it settle, then (re)set the current
+            // masks from clean. `null` and the mgmt channel do NOT drop masks live.
+            const clear: any = {};
+            for (let i = 1; i <= PRIVACY_INDEX_CAP; i++) clear[String(i)] = { update: true, coord: [] };
+            await this.getClient().putSettings({ isp: { masks: clear } });
+            if (privacy.length) {
+                await new Promise(r => setTimeout(r, 3000));   // let the clear apply before re-setting
+                const masks: any = { color: [0, 128, 128] };
+                privacy.forEach((z, i) => { masks[String(i + 1)] = { update: true, coord: polyCoord(z.points) }; });
+                await this.getClient().putSettings({ isp: { masks } });
+            }
+            this.storage.setItem('privacyCount', String(privacy.length));
+            dbg('applyPrivacyMasks', this.mac, 'cleared all, set', privacy.length);
+        } catch (e) {
+            this.console.warn('privacy mask apply failed:', (e as Error)?.message);
+        }
     }
 
     // ---- VideoCamera (direct live) ----
