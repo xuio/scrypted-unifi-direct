@@ -63,7 +63,7 @@ function makeFrameParser(onMessage: (b: Buffer) => void, onControl: (t: string, 
 interface CameraSession {
     mac: string;
     socket: net.Socket;
-    send: (fn: string, payload: any, responseExpected?: boolean, inResponseTo?: number) => void;
+    send: (fn: string, payload: any, responseExpected?: boolean, inResponseTo?: number) => number;
     authenticated: boolean;
 }
 
@@ -84,6 +84,7 @@ export class ControllerEmulator extends EventEmitter {
     private server: https.Server | undefined;
     private sessions = new Map<string, CameraSession>();
     private msgId = 1;
+    private pending = new Map<number, (payload: any) => void>();   // messageId -> reply resolver
     public readonly controllerUuid = 'e6f3f5f0-0000-4000-8000-' + crypto.randomBytes(6).toString('hex');
 
     constructor(private port: number, private logger: Logger) {
@@ -129,9 +130,11 @@ export class ControllerEmulator extends EventEmitter {
         // never surfaces the dead peer and the session would linger forever
         // (isOnline() stays true, every stream attempt writes into a dead socket).
         try { socket.setKeepAlive(true, 20000); } catch { }
-        const send = (fn: string, payload: any, responseExpected = false, inResponseTo = 0) => {
-            const env = { from: 'UniFiVideo', to: 'ubnt_avclient', functionName: fn, inResponseTo, messageId: this.msgId++, payload, responseExpected, timeStamp: new Date().toISOString() };
+        const send = (fn: string, payload: any, responseExpected = false, inResponseTo = 0): number => {
+            const messageId = this.msgId++;
+            const env = { from: 'UniFiVideo', to: 'ubnt_avclient', functionName: fn, inResponseTo, messageId, payload, responseExpected, timeStamp: new Date().toISOString() };
             if (!socket.writableEnded && !socket.destroyed) socket.write(encodeFrame(Buffer.from(JSON.stringify(env))));
+            return messageId;
         };
         // If this MAC already has a session (reconnect before the old close fired),
         // tear down the stale socket so its parser can't double-fire the handshake.
@@ -167,6 +170,12 @@ export class ControllerEmulator extends EventEmitter {
         // whether it accepted (success/echo) or rejected (error) a config push.
         if (/Settings$/.test(fn) && m.inResponseTo)
             dbg('emu recv reply', session.mac, fn, 'payload', JSON.stringify(m.payload ?? {}).slice(0, 800));
+        // Resolve a pending readSetting() awaiting this reply.
+        if (m.inResponseTo && this.pending.has(m.inResponseTo)) {
+            const resolve = this.pending.get(m.inResponseTo)!;
+            this.pending.delete(m.inResponseTo);
+            resolve(m.payload);
+        }
         switch (fn) {
             case 'ubnt_avclient_hello':
                 session.send('ubnt_avclient_hello', {
@@ -240,6 +249,24 @@ export class ControllerEmulator extends EventEmitter {
             s.send('ChangeVideoSettings', { video }, true);
             dbg('emulator quiesceSubstreams', s.mac);
         } catch (e) { dbg('quiesceSubstreams failed', s.mac, (e as Error)?.message); }
+    }
+
+    /**
+     * Read a camera setting group by sending an empty `Change*Settings {}` with a
+     * response expected and returning the echoed payload — the way Protect reads
+     * camera state during adoption. Returns undefined if not connected / times out.
+     * Whether an empty payload is a NON-destructive read must be verified per
+     * message type before relying on it (some replace on empty). Note the G5 can
+     * drop the reply when other writes are in flight, so callers should retry.
+     */
+    readSetting(mac: string, fn: string, payload: any = {}, timeoutMs = 6000): Promise<any | undefined> {
+        const s = this.sessions.get(mac);
+        if (!s) return Promise.resolve(undefined);
+        return new Promise(resolve => {
+            const id = s.send(fn, payload, true);
+            const timer = setTimeout(() => { this.pending.delete(id); resolve(undefined); }, timeoutMs);
+            this.pending.set(id, p => { clearTimeout(timer); resolve(p); });
+        });
     }
 
     /**

@@ -351,41 +351,120 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
 
     /**
      * One-time import of zones already configured on the camera so they show up in
-     * Scrypted. Privacy masks persist as ISP settings (readable, non-destructively,
-     * from `isp.masks`) and are the ones that survive adoption — import them as
-     * privacy zones. (Smart-detect/motion zones are controller-managed: once a
-     * camera is adopted here we assert that config, so there's nothing pre-existing
-     * to preserve, and the only read path for them is destructive.)
+     * Scrypted. Reads every zone type non-destructively (verified on-camera):
+     *  - privacy masks from the local HTTP `isp.masks`;
+     *  - smart-detect / exclude / line / loiter zones from an empty
+     *    `ChangeSmartDetectSettings {}` read (state echoed under `.payload`);
+     *  - motion zones from an empty `ChangeSmartMotionSettings {}` read.
+     * Camera coords (0..1000, flat) are converted back to normalised points.
+     * Default full-frame zones are skipped (they're the baseline, not user zones).
+     * MUST run before applyZones on first 'online', or applyZones would overwrite
+     * the camera's smart-detect/motion zones with our config first.
      */
-    private importCameraZones(cameraSettings: any): void {
-        if (this.storage.getItem('zonesImported') === 'true') return;
+    private importInFlight?: Promise<void>;
+    async importCameraZones(): Promise<void> {
+        // Versioned flag: bumped from the original privacy-only import so cameras
+        // adopted before this fuller import (which also reads smart-detect / motion /
+        // line / loiter / exclude zones over mgmt) re-run it exactly once.
+        if (this.storage.getItem('zonesImportedV2') === 'true') return;
+        // Serialise concurrent callers (first 'online' + a lazy getSettings can
+        // race); a second entrant awaits the first rather than double-importing.
+        if (this.importInFlight) return this.importInFlight;
+        this.importInFlight = this.doImportCameraZones().finally(() => { this.importInFlight = undefined; });
+        return this.importInFlight;
+    }
+    private async doImportCameraZones(): Promise<void> {
+        const existing = new Set(this.zoneNames);
+        const added: string[] = [];
+        const toPoints = (coord: any): [number, number][] => {
+            const out: [number, number][] = [];
+            if (Array.isArray(coord)) for (let i = 0; i + 1 < coord.length; i += 2) out.push([coord[i] / 1000, coord[i + 1] / 1000]);
+            return out;
+        };
+        const isFullFrame = (pts: [number, number][]) => {
+            if (pts.length < 3) return false;
+            const xs = pts.map(p => p[0]), ys = pts.map(p => p[1]);
+            return Math.min(...xs) <= 0.02 && Math.min(...ys) <= 0.02 && Math.max(...xs) >= 0.98 && Math.max(...ys) >= 0.98;
+        };
+        const add = (name: string, type: ZoneType, pts: [number, number][], attrs: Record<string, any> = {}) => {
+            if (existing.has(name) || pts.length < ZONE_TYPES[type].minPoints) return;
+            this.seedZoneDefaults(name);
+            this.storage.setItem(this.zoneKey(name, 'type'), type);
+            this.storage.setItem(this.zoneKey(name, 'points'), JSON.stringify(pts));
+            for (const [k, v] of Object.entries(attrs))
+                this.storage.setItem(this.zoneKey(name, k), typeof v === 'string' ? v : JSON.stringify(v));
+            existing.add(name); added.push(name);
+        };
         try {
-            const masks = cameraSettings?.isp?.masks || {};
-            const names = [...this.zoneNames];
-            let imported = 0;
-            for (const key of Object.keys(masks)) {
-                if (key === 'color' || key === '0') continue;
-                const coord = masks[key]?.coord;
-                if (!Array.isArray(coord) || coord.length < 6) continue;
-                const pts: [number, number][] = [];
-                for (let i = 0; i + 1 < coord.length; i += 2)
-                    pts.push([coord[i] / 1000, coord[i + 1] / 1000]);
-                const name = `Camera Privacy ${key}`;
-                if (names.includes(name)) continue;
-                this.seedZoneDefaults(name);
-                this.storage.setItem(this.zoneKey(name, 'type'), 'privacy');
-                this.storage.setItem(this.zoneKey(name, 'points'), JSON.stringify(pts));
-                names.push(name);
-                imported++;
+            // Privacy masks (HTTP).
+            try {
+                const masks = (await this.getClient().getSettings())?.isp?.masks || {};
+                for (const key of Object.keys(masks)) {
+                    if (key === 'color' || key === '0') continue;
+                    add(`Camera Privacy ${key}`, 'privacy', toPoints(masks[key]?.coord));
+                }
+            } catch (e) { dbg('import privacy failed', this.mac, (e as Error)?.message); }
+
+            // Read the mgmt-only zones. The G5 firmware coalesces/drops replies when
+            // the emulator's own adoption writes (enableDetections, quiesce) are still
+            // in flight, so an empty `{}` read can time out transiently — retry each a
+            // few times until a reply lands. A defined reply means the read succeeded
+            // (empty zone maps are still a defined object); undefined = timed out.
+            const em = this.provider.emulator;
+            let mgmtOk = true;
+            if (em && em.hasSession(this.mac)) {
+                const read = async (fn: string): Promise<any> => {
+                    for (let i = 0; i < 4; i++) {
+                        const r = await em.readSetting(this.mac, fn, {}, 3000);
+                        if (r !== undefined) return r;
+                        await new Promise(res => setTimeout(res, 700));
+                    }
+                    return undefined;
+                };
+                // Smart-detect family (state echoed under .payload).
+                const sdReply = await read('ChangeSmartDetectSettings');
+                const mReply = await read('ChangeSmartMotionSettings');
+                if (sdReply === undefined || mReply === undefined) mgmtOk = false;
+                const sd = sdReply?.payload ?? sdReply ?? {};
+                for (const [id, z] of Object.entries<any>(sd.zones || {})) {
+                    const pts = toPoints(z?.coord);
+                    if (isFullFrame(pts)) continue;   // baseline default, not a user zone
+                    add(`Camera Smart ${id}`, 'smartDetect', pts, { objects: z?.objectTypes || ['person'], sens: z?.sensitivity ?? 50 });
+                }
+                for (const [id, z] of Object.entries<any>(sd.excludeZones || {}))
+                    add(`Camera Exclude ${id}`, 'exclude', toPoints(z?.coord));
+                for (const [id, z] of Object.entries<any>(sd.lines || {})) {
+                    const c = z?.coord || [];   // [Ax,Ay,Bx,By,normalX,normalY] — take the two endpoints
+                    const pts: [number, number][] = [[c[0] / 1000, c[1] / 1000], [c[2] / 1000, c[3] / 1000]];
+                    const dir = z?.crosslineDirection === 'A2B' ? 'in' : z?.crosslineDirection === 'B2A' ? 'out' : 'both';
+                    add(`Camera Line ${id}`, 'line', pts, { objects: z?.objectTypes || ['person'], sens: z?.sensitivity ?? 50, dir });
+                }
+                for (const [id, z] of Object.entries<any>(sd.loiterZones || {})) {
+                    const first: any = Object.values(z?.loiterTriggerTimeMaps || {})[0];
+                    const secs = first?.loiterTriggerTime ? Math.round(first.loiterTriggerTime / 1000) : ZONE_DEFAULTS.loiterSeconds;
+                    add(`Camera Loiter ${id}`, 'loiter', toPoints(z?.coord), { objects: z?.objectTypes || ['person'], sens: z?.sensitivity ?? 50, loiter: secs });
+                }
+                // Motion zones (flat map).
+                const mz = (mReply?.zones ?? mReply?.payload?.zones) || {};
+                for (const [id, z] of Object.entries<any>(mz)) {
+                    const pts = toPoints(z?.coord);
+                    if (isFullFrame(pts)) continue;   // baseline default
+                    add(`Camera Motion ${id}`, 'motion', pts, { sens: 100 - (z?.level ?? 50) });
+                }
             }
-            if (imported) {
-                this.storage.setItem('zoneNames', JSON.stringify(names));
-                // Reflect that these masks are already on the camera so the next
-                // applyPrivacyMasks reconciles from the right count.
-                this.storage.setItem('privacyCount', String(imported));
+
+            if (added.length) {
+                const merged = [...new Set([...this.zoneNames, ...added])];
+                this.storage.setItem('zoneNames', JSON.stringify(merged));
+                const privCount = merged.filter(n => this.getZone(n).type === 'privacy').length;
+                if (privCount) this.storage.setItem('privacyCount', String(privCount));
             }
-            this.storage.setItem('zonesImported', 'true');
-            dbg('importCameraZones', this.mac, 'imported', imported, 'privacy mask(s)');
+            // Only latch "imported" once the mgmt reads actually succeeded — if a read
+            // timed out we may have missed zones, so leave the flag unset to retry on
+            // the next reconnect / settings open rather than silently giving up.
+            if (mgmtOk) this.storage.setItem('zonesImportedV2', 'true');
+            else dbg('importCameraZones', this.mac, 'mgmt read incomplete — will retry');
+            dbg('importCameraZones', this.mac, 'imported', added.length, added.join(','));
         } catch (e) {
             dbg('importCameraZones failed', this.mac, (e as Error)?.message);
         }
@@ -649,7 +728,8 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             cameraFeatures = (s as any)?.features || {};
             this.cachedFeatures = cameraFeatures;
             cameraSettings = await this.getClient().getSettings();
-            this.importCameraZones(cameraSettings);
+            // Lazy import for a camera already online when the user opens settings.
+            this.importCameraZones().catch(() => { });
         } catch (e: any) {
             statusLine = `not reachable: ${e?.message || e}`;
         }
@@ -871,10 +951,15 @@ class UnifiDirectProvider extends ScryptedDeviceBase implements DeviceProvider, 
         this.emulator = new ControllerEmulator(MGMT_PORT, this.console);
         this.emulator.on('online', (mac: string) => {
             this.console.log('[unifi-direct] camera online:', mac);
-            // Re-assert this camera's zone config once it (re)connects; the mgmt
-            // channel only accepts commands while a session is live.
             for (const cam of this.cameras.values())
-                if (cam.mac === mac) cam.applyZones().catch(e => dbg('applyZones on online failed', mac, (e as Error)?.message));
+                if (cam.mac === mac) {
+                    // Import any zones already on the camera FIRST (reads are only
+                    // valid before applyZones overwrites the smart-detect/motion
+                    // config), then re-assert our config over the live mgmt session.
+                    cam.importCameraZones()
+                        .then(() => cam.applyZones())
+                        .catch(e => dbg('online import/apply failed', mac, (e as Error)?.message));
+                }
         });
         this.emulator.on('event', (mac: string, fn: string, payload: any) => {
             for (const cam of this.cameras.values())
