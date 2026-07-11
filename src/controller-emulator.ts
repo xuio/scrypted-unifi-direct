@@ -9,6 +9,15 @@ type Logger = { log: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
+// The camera has ONE shared audio encoder feeding all stream serializers. Several
+// cameras have leftover substream (video2/video3) serializers locked at 24 kHz
+// that can't be changed via the settings API, so requesting a different rate on
+// video1 makes the encoder emit mixed-rate frames that decode as garbage on every
+// camera except the one whose substreams happen to be clean. Requesting the same
+// 24 kHz the substreams use keeps every serializer consistent → clean AAC.
+const AUDIO_SAMPLE_RATE = 16000;
+const AUDIO_WITH_OPUS = true;
+
 function wsAccept(key: string) {
     return crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
 }
@@ -199,18 +208,39 @@ export class ControllerEmulator extends EventEmitter {
         const s = this.sessions.get(mac);
         if (!s) throw new Error(`camera ${mac} is not connected to the emulator`);
         const streamName = crypto.randomBytes(8).toString('hex');
-        s.send('ChangeVideoSettings', {
-            video: {
-                [channel]: {
-                    avSerializer: {
-                        type: 'extendedFlv',
-                        parameters: { streamName, withOpus: true, opusSampleRate: 16000 },
-                        destinations: [`tcp://${destHost}:${destPort}?retryInterval=1&connectTimeout=5`],
-                    },
-                    type: videoCodec,
+        // The camera has ONE shared audio encoder. If the substreams we don't
+        // consume (video2/video3) have leftover serializers requesting a different
+        // audio rate, the encoder switches to a scalable/multi-config AAC (SSR,
+        // multi-channel) that decodes as garbage on our video1 stream. The HTTP
+        // settings API can't clear those substream params, but this management
+        // command can — so we explicitly disable audio on every other track,
+        // leaving video1 as the sole audio consumer → clean AAC-LC mono.
+        const video: Record<string, any> = {
+            [channel]: {
+                avSerializer: {
+                    type: 'extendedFlv',
+                    parameters: { streamName, withOpus: AUDIO_WITH_OPUS, opusSampleRate: AUDIO_SAMPLE_RATE },
+                    destinations: [`tcp://${destHost}:${destPort}?retryInterval=1&connectTimeout=5`],
                 },
+                type: videoCodec,
             },
-        }, true);
+        };
+        for (const other of ['video1', 'video2', 'video3']) {
+            if (other === channel) continue;
+            // Point the unused substreams at /dev/null AND disable their audio.
+            // Several cameras still actively push a substream to the old NVR
+            // (e.g. tcp://old-nvr.example:7550) at a different audio rate, which
+            // is what forces the shared encoder into scalable/SSR AAC. Only the
+            // controller (us) can override an active serializer, so we stop them.
+            video[other] = {
+                avSerializer: {
+                    type: 'extendedFlv',
+                    parameters: { withOpus: false, opusSampleRate: AUDIO_SAMPLE_RATE },
+                    destinations: ['file:///dev/null'],
+                },
+            };
+        }
+        s.send('ChangeVideoSettings', { video }, true);
         dbg('emulator startStream', mac, channel, `-> ${destHost}:${destPort}`, videoCodec, 'streamName', streamName);
         this.log(`commanded ${mac} ${channel} -> ${destHost}:${destPort} (${videoCodec})`);
     }

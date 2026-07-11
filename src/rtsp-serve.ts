@@ -266,6 +266,11 @@ export async function startRtspServe(opts: {
     };
 
     const cpVideo = spawnRtp(['-map', '0:v', '-c:v', 'copy', '-bsf:v', 'h264_mp4toannexb', '-payload_type', '96', '-dn', '-sn', '-an'], video.port);
+    // Audio is copied (no re-encode). This only yields clean AAC if every one of
+    // the camera's stream serializers agrees on one audio sample rate: the camera
+    // has a single shared audio encoder, so if substreams request a different rate
+    // than video1 the frames get mixed and decode as garbage. We request the rate
+    // the (immutable) substreams use — see AUDIO_SAMPLE_RATE in controller-emulator.
     const cpAudio = audio ? spawnRtp(['-map', '0:a?', '-c:a', 'copy', '-payload_type', '97', '-dn', '-sn', '-vn'], audio.port) : undefined;
 
     // tee the FLV to both ffmpegs (both need the sequence headers at the start).
