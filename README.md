@@ -86,4 +86,4 @@ API of their own.
 
 ## License
 
-MIT
+[The Unlicense](https://unlicense.org) — public domain.
