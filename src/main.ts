@@ -95,7 +95,7 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     private snapCache?: { ts: number; jpeg: Buffer };
     private snapLastGood?: Buffer;   // last valid frame, served when a fresh capture fails
     private snapInflight?: Promise<Buffer>;
-    private clearSnapCache() { this.snapCache = undefined; }
+    private clearSnapCache() { this.snapCache = undefined; this.snapResized?.clear(); }
 
     /**
      * Make Scrypted's snapshot mixin delegate to our takePicture() instead of
@@ -211,17 +211,29 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
         return this.snapInflight;
     }
 
+    // Cache of resized variants, keyed by "WxH" and tied to the source frame's
+    // timestamp so a burst of same-size requests (HomeKit polling all tiles)
+    // re-uses one resize until the underlying frame refreshes.
+    private snapResized = new Map<string, { srcTs: number; jpeg: Buffer }>();
+
     /** Downscale a full-res JPEG to the requested picture size (never upscale).
-     *  Falls back to the original on any error. */
+     *  Caches per size; falls back to the original on any error. */
     private async resizeForRequest(full: Buffer, options?: RequestPictureOptions): Promise<Buffer> {
         const w = options?.picture?.width, h = options?.picture?.height;
         if (!w && !h) return full;   // no size hint → full resolution
+        const key = `${w || ''}x${h || ''}`;
+        const srcTs = this.snapCache?.ts ?? 0;
+        const hit = this.snapResized.get(key);
+        if (hit && hit.srcTs === srcTs) return hit.jpeg;
         try {
             const mo = await mediaManager.createMediaObject(full, 'image/jpeg', { sourceId: this.id });
             const image = await mediaManager.convertMediaObject<Image>(mo, ScryptedMimeTypes.Image);
             if ((!w || image.width <= w) && (!h || image.height <= h)) return full;   // already small enough
             const out = await image.toBuffer({ resize: { width: w || undefined, height: h || undefined }, format: 'jpg' });
-            return out?.length ? out : full;
+            const jpeg = out?.length ? out : full;
+            this.snapResized.set(key, { srcTs, jpeg });
+            if (this.snapResized.size > 8) this.snapResized.delete(this.snapResized.keys().next().value!);
+            return jpeg;
         } catch (e) {
             dbg('snapshot resize failed', this.mac, (e as Error)?.message);
             return full;

@@ -28,9 +28,15 @@ export interface FieldDef {
     cap?: (features: Record<string, any>) => boolean;
 }
 
+// Capability predicates, keyed off the camera's status `features` flags. These
+// mirror how UniFi Protect derives its per-camera featureFlags (e.g.
+// hasInfrared=truedaynight, hasLdc=ldc), so gating adapts across models.
 const hasMic = (f: Record<string, any>) => !!f.mic;
 const hasSpeaker = (f: Record<string, any>) => !!(f.speaker || f.adjustableSpeakerVolume);
 const hasStatusLed = (f: Record<string, any>) => !!f.ledStatus;
+const hasInfrared = (f: Record<string, any>) => !!(f.truedaynight || f.ledIr);   // night vision / IR
+const hasLdc = (f: Record<string, any>) => !!f.ldc;                              // lens distortion correction
+const hasOrientation = (f: Record<string, any>) => !!(f.orientation || f.horizontalFlip);
 
 export const PARITY_FIELDS: FieldDef[] = [
     // ---- Image (ISP) ----
@@ -40,16 +46,19 @@ export const PARITY_FIELDS: FieldDef[] = [
     { key: 'isp.sharpness', title: 'Sharpness', group: 'Image', type: 'integer', paths: ['isp.sharpness'], range: [0, 100] },
     { key: 'isp.hue', title: 'Hue', group: 'Image', type: 'integer', paths: ['isp.hue'], range: [0, 100] },
     { key: 'isp.denoise', title: 'Denoise', group: 'Image', type: 'integer', paths: ['isp.denoise'], range: [0, 100] },
-    { key: 'isp.wdr', title: 'WDR / HDR level', group: 'Image', type: 'integer', paths: ['isp.wdr'], range: [0, 3] },
+    // WDR is the software wide-dynamic-range control; on cameras with hardware HDR
+    // (features.hdr) it is locked/superseded (the camera ignores wdr writes), so
+    // only expose it on non-HDR models.
+    { key: 'isp.wdr', title: 'WDR level', group: 'Image', type: 'integer', paths: ['isp.wdr'], range: [0, 3], cap: f => !f.hdr },
     {
         key: 'isp.irLedMode', title: 'Night vision (IR)', group: 'Image', type: 'string',
-        paths: ['isp.irLedMode'], choices: ['auto', 'on', 'off'],
-        description: 'IR LED / infrared cut filter mode.',
+        paths: ['isp.irLedMode'], choices: ['auto', 'on', 'off'], cap: hasInfrared,
+        description: 'auto = switch IR by light level; on/off = force the IR illuminators. (Mapped to the camera’s irLedMode/irLedLevel.)',
     },
     { key: 'isp.enable3dnr', title: '3D noise reduction', group: 'Image', type: 'boolean', paths: ['isp.enable3dnr'], bool01: true },
-    { key: 'isp.lensDistortionCorrection', title: 'Distortion correction', group: 'Image', type: 'boolean', paths: ['isp.lensDistortionCorrection'], bool01: true },
-    { key: 'isp.flip', title: 'Flip vertically', group: 'Image', type: 'boolean', paths: ['isp.flip'], bool01: true },
-    { key: 'isp.mirror', title: 'Mirror horizontally', group: 'Image', type: 'boolean', paths: ['isp.mirror'], bool01: true },
+    { key: 'isp.lensDistortionCorrection', title: 'Distortion correction', group: 'Image', type: 'boolean', paths: ['isp.lensDistortionCorrection'], bool01: true, cap: hasLdc },
+    { key: 'isp.flip', title: 'Flip vertically', group: 'Image', type: 'boolean', paths: ['isp.flip'], bool01: true, cap: hasOrientation },
+    { key: 'isp.mirror', title: 'Mirror horizontally', group: 'Image', type: 'boolean', paths: ['isp.mirror'], bool01: true, cap: hasOrientation },
     // ---- Image (ISP) advanced — gated by presence in the camera settings ----
     {
         key: 'isp.aeMode', title: 'Exposure mode', group: 'Image', type: 'string',
@@ -57,9 +66,14 @@ export const PARITY_FIELDS: FieldDef[] = [
         description: 'flick50 / flick60 = anti-flicker for 50 Hz / 60 Hz artificial lighting.',
     },
     { key: 'isp.aeTargetPercent', title: 'Exposure target', group: 'Image', type: 'integer', paths: ['isp.aeTargetPercent'], range: [0, 100] },
-    { key: 'isp.colorNightVision', title: 'Color night vision', group: 'Image', type: 'boolean', paths: ['isp.colorNightVision'], bool01: true },
-    { key: 'isp.aggressiveAntiFlicker', title: 'Aggressive anti-flicker', group: 'Image', type: 'boolean', paths: ['isp.aggressiveAntiFlicker'], bool01: true },
-    { key: 'isp.autoFlipMirror', title: 'Auto flip & mirror', group: 'Image', type: 'boolean', paths: ['isp.autoFlipMirror'], bool01: true },
+    // NOT exposed — present in the settings JSON but non-functional on our models
+    // (the camera silently ignores writes) and with no capability flag to gate on:
+    //  - isp.colorNightVision: no cap flag; Protect shows it only on cameras that
+    //    have it (ours are truedaynight/IR only).
+    //  - isp.aggressiveAntiFlicker: camera ignores it; anti-flicker is controlled
+    //    via aeMode (flick50/flick60).
+    // Auto flip/mirror needs an accelerometer to sense orientation.
+    { key: 'isp.autoFlipMirror', title: 'Auto flip & mirror', group: 'Image', type: 'boolean', paths: ['isp.autoFlipMirror'], bool01: true, cap: f => !!f.accelerometer },
 
     // ---- Video (applies to the active channel track) ----
     { key: 'video.fps', title: 'Frame rate (fps)', group: 'Video', type: 'integer', paths: ['av.video.<track>.fps', 'av.video.<track>.maxFps'], range: [1, 30] },
@@ -127,8 +141,26 @@ export function isFieldSupported(field: FieldDef, settings: any, features: Recor
     return isFieldPresent(field, settings, track);
 }
 
+/**
+ * Night vision (IR) is special: the UI exposes auto/on/off, but the camera field
+ * `irLedMode` only accepts `auto`/`manual` paired with a 0..255 `irLedLevel`
+ * (verified: sending raw "on"/"off" is silently ignored). Protect computes the
+ * same mapping. These translate between the two representations.
+ */
+export function irLedToCamera(uiValue: string): { irLedMode: string; irLedLevel: number } {
+    if (uiValue === 'on') return { irLedMode: 'manual', irLedLevel: 255 };
+    if (uiValue === 'off') return { irLedMode: 'manual', irLedLevel: 0 };
+    return { irLedMode: 'auto', irLedLevel: 255 };
+}
+function irLedToUi(settings: any): string {
+    const mode = getByPath(settings, 'isp.irLedMode');
+    if (mode === 'manual') return getByPath(settings, 'isp.irLedLevel') > 0 ? 'on' : 'off';
+    return 'auto';
+}
+
 /** Read the current value of a field from the camera settings JSON, coerced for Scrypted. */
 export function readField(field: FieldDef, settings: any, track: string): any {
+    if (field.key === 'isp.irLedMode') return irLedToUi(settings);
     let raw: any;
     for (const p of resolvePaths(field, track)) {
         const v = getByPath(settings, p);
@@ -151,6 +183,7 @@ export function coerceValue(field: FieldDef, value: any): any {
 
 /** Build the settings partial to write a Scrypted value back to the camera (HTTP). */
 export function writeField(field: FieldDef, value: any, track: string): any {
+    if (field.key === 'isp.irLedMode') return { isp: irLedToCamera(String(value)) };
     const out = coerceValue(field, value);
     const partial = {};
     for (const p of resolvePaths(field, track))
@@ -171,6 +204,10 @@ const MGMT_HTTP_ONLY = new Set([
     'isp.aeTargetPercent',
     'audio.enabled', 'audio.volume', 'audio.agc', 'audio.denoise', 'audio.highpass',
     'httpd.anonSnapshot',
+    // Encoder params: the camera ignores partial ChangeVideoSettings for these
+    // (Protect resends the FULL per-channel object); HTTP applies them reliably,
+    // so keep video on HTTP rather than risk disrupting the live encoder.
+    'video.fps', 'video.isCbr', 'video.bitrate', 'video.keyframeInterval',
 ]);
 
 /**
@@ -184,6 +221,8 @@ export function buildMgmtSetting(field: FieldDef, value: any, track: string): { 
     const v = coerceValue(field, value);
     const k = field.key;
 
+    if (k === 'isp.irLedMode')
+        return { fn: 'ChangeIspSettings', payload: irLedToCamera(String(v)) };
     if (k.startsWith('isp.'))
         return { fn: 'ChangeIspSettings', payload: { [k.slice(4)]: v } };
 
