@@ -180,7 +180,10 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
     get mac() { return this.storage.getItem('mac') || ''; }
     private get channelKey() { return this.storage.getItem('channel') || 'high'; }
     private get channel() { return CHANNELS[this.channelKey] || CHANNELS.high; }
-    private get codec() { return this.storage.getItem('codec') || 'h264'; }
+    // H.264 only — the muxer passes the stream through untranscoded and HomeKit
+    // requires H.264, so we never request H.265 from the camera (see the codec
+    // setting). Hardcoded so a stale stored value can't command an h265 push.
+    private get codec() { return 'h264'; }
     // distinct per-camera push port in the firewalled range, assigned by the
     // provider so two cameras can never collide (an IP-octet hash alone would
     // clash for hosts 11 apart → EADDRINUSE and a dead stream).
@@ -593,11 +596,6 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
             throw new Error(`camera ${this.mac} has not connected to the Scrypted controller emulator yet`);
         dbg('getVideoStream', this.mac, 'proceeding, online now', emulator.isOnline(this.mac));
 
-        // The in-process muxer is H.264-only; fail clearly instead of timing out
-        // waiting for a sequence header the muxer can't parse.
-        if (/265|hevc/i.test(this.codec))
-            throw new Error('Video Codec is set to h265, which the native RTSP muxer does not support yet — set it back to h264 in the camera settings.');
-
         // reuse a persistent per-channel stream (prebuffer + viewers share it).
         // start() blocks until the in-process RTSP server has an SDP and is
         // accepting, so once it resolves the url is immediately connectable.
@@ -983,9 +981,9 @@ class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Set
                 description: 'high=video1 2688x1512 (full res), medium=video2 720p, low=video3 360p.',
             },
             {
-                key: 'codec', title: 'Video Codec', group: 'Stream', value: this.codec, type: 'string',
-                choices: ['h264', 'h265'],
-                description: 'Codec requested from the camera. The in-process RTSP muxer currently supports H.264 only; leave this on h264 (HEVC support is planned).',
+                key: 'codec', title: 'Video Codec', group: 'Stream', value: 'h264', type: 'string',
+                choices: ['h264'], readonly: true,
+                description: 'H.264 only. The stream is passed through without transcoding, and HomeKit only accepts H.264 — an H.265 camera stream would force a CPU-heavy re-encode, so this plugin keeps the camera on H.264.',
             },
             {
                 key: 'fullResSnapshots', title: 'Full-resolution snapshots', group: 'Snapshots',
