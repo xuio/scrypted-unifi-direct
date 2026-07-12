@@ -491,13 +491,21 @@ export async function startNativeServe(opts: {
     audioServed = !!info.audioTrack;
     dbg('native-rtsp sdp ready; video', info.videoTrack, 'audio', info.audioTrack ?? '(none)');
 
-    // Replay the buffered GOP to a client the moment it PLAYs, so it renders
-    // instantly instead of waiting for the next keyframe.
-    const replayGop = (s: RtspSession) => {
-        if (!gop.length) return;
+    // On PLAY: replay the buffered GOP so the client renders instantly instead
+    // of waiting for the next keyframe, then send RTCP Sender Reports right
+    // away — a joiner otherwise waits up to the 5s SR interval for the RTP↔
+    // wall-clock mapping it needs to lip-sync, and players can hold back or
+    // stutter until they have it.
+    const onSessionPlay = (s: RtspSession) => {
         try {
-            s.sendMixedBatch(gop);
-            dbg('native-rtsp gop replay:', gop.length, 'packets,', gopBytes, 'bytes');
+            if (gop.length) {
+                s.sendMixedBatch(gop);
+                dbg('native-rtsp gop replay:', gop.length, 'packets,', gopBytes, 'bytes');
+            }
+            const vsr = videoTrack.senderReport();
+            const asr = audioServed ? audioTrack.senderReport() : undefined;
+            if (vsr) s.sendRtcp('trackID=0', vsr);
+            if (asr) s.sendRtcp('trackID=1', asr);
         } catch (e) {
             dbg('native-rtsp gop replay failed:', (e as Error)?.message);
         }
@@ -506,7 +514,7 @@ export async function startNativeServe(opts: {
     const pathToken = '/' + randomBytes(8).toString('hex');
     let url = '';
     server = net.createServer(socket => {
-        const s = new RtspSession(socket, info, url, () => sessions.delete(s), replayGop);
+        const s = new RtspSession(socket, info, url, () => sessions.delete(s), onSessionPlay);
         sessions.add(s);
     });
     await new Promise<void>(res => server!.listen(0, '127.0.0.1', () => res()));

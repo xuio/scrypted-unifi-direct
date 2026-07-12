@@ -236,13 +236,19 @@ test('a client joining mid-GOP receives the buffered GOP instantly', async () =>
                 off = e + 4; headerEnds++;
             }
             const payloads: Buffer[] = [];
+            let sawSenderReport = false;
             if (headerEnds === 2) {
                 let frags: Buffer[] = [];
                 while (off + 4 <= all.length) {
+                    const channel = all[off + 1];
                     const len = all.readUInt16BE(off + 2);
                     if (off + 4 + len > all.length) break;
                     const rtp = all.subarray(off + 4, off + 4 + len);
                     off += 4 + len;
+                    if (channel === 1) {   // RTCP channel
+                        if (rtp[1] === 200) sawSenderReport = true;
+                        continue;
+                    }
                     const pl = rtp.subarray(12);
                     if ((pl[0] & 0x1f) === 28) {   // FU-A — reassemble
                         if (pl[1] & 0x80) frags = [Buffer.from([(pl[0] & 0x60) | (pl[1] & 0x1f)])];
@@ -253,7 +259,12 @@ test('a client joining mid-GOP receives the buffered GOP instantly', async () =>
                     }
                 }
             }
-            if (wanted.every(w => payloads.some(p => p.equals(w)))) break;   // got the whole GOP
+            if (wanted.every(w => payloads.some(p => p.equals(w)))) {
+                // the join burst must also carry an immediate RTCP Sender Report
+                // (lip-sync mapping), not leave the client waiting for the 5s timer.
+                assert.ok(sawSenderReport, 'no Sender Report in the join burst');
+                break;
+            }
             assert.ok(Date.now() < deadline, `timed out; got ${payloads.length} NALs`);
             await new Promise(r => setTimeout(r, 10));
         }
