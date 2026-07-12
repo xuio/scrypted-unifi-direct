@@ -173,6 +173,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         return CHANNELS[v] ? v : 'none';
     }
 
+    /** Opt-in camera audio DSP profile (e.g. 'nature' for bioacoustics). Empty /
+     *  'default' means leave the camera's own setting untouched. */
+    private get audioTuning(): string { return this.storage.getItem('audio.tuning') || ''; }
+
     /** The channels offered to consumers: the configured channel, plus the
      *  substream when set. Each streams on its own fixed per-track port, so
      *  they can run concurrently. */
@@ -424,6 +428,23 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             .catch(() => { })   // a failed run must not wedge the chain
             .then(() => { this.zoneApplyQueued = false; return this.doApplyZones(); });
         return this.zoneApplyChain;
+    }
+
+    /** Re-assert the opt-in audio DSP profile over the mgmt channel (the same
+     *  AudioAgentChangeTuning command Protect uses). Runs when the user changes it
+     *  and on every reconnect. The camera keeps the profile across mgmt reconnects,
+     *  but a reboot re-inits it — re-asserting restores our stored choice and keeps
+     *  it authoritative. No-op unless the user picked a non-default style (picking
+     *  'default' does NOT revert; it just stops us commanding one). */
+    applyAudioTuning(): void {
+        const style = this.audioTuning;
+        if (!style || style === 'default') return;
+        const emulator = this.provider.emulator;
+        if (!emulator || !this.mac || !emulator.hasSession(this.mac)) return;
+        try {
+            emulator.sendCommand(this.mac, 'AudioAgentChangeTuning', { tuningStyle: style }, true);
+            dbg('applyAudioTuning', this.mac, style);
+        } catch (e) { dbg('applyAudioTuning failed', this.mac, (e as Error)?.message); }
     }
 
     private async doApplyZones(): Promise<void> {
@@ -709,6 +730,15 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 description: 'Reuse the last snapshot for this many seconds so bursts of requests don’t each trigger a fresh decode. 0 = always capture fresh.',
             },
         ];
+        // Camera audio DSP profile (opt-in), only on models that advertise it.
+        if (Array.isArray(cameraFeatures?.audioStyle) && cameraFeatures.audioStyle.length) {
+            base.push({
+                key: 'audio.tuning', title: 'Audio tuning', group: 'Audio', type: 'string',
+                value: this.audioTuning || 'default',
+                choices: ['default', ...cameraFeatures.audioStyle],
+                description: 'Camera audio DSP profile (a processing stage before the encoder). "nature" leaves the sound open — measured ~+5 dB more content across the 1–6 kHz bird band vs "noiseReduced", which suppresses that range for speech — so "nature" is better for bioacoustics / BirdNET. "default" sends no command (the camera keeps its current profile) and does NOT undo a previously-applied style until the camera reboots. Audio stays mono 16 kHz / 8 kHz regardless.',
+            });
+        }
         const parity: Setting[] = [];
         if (cameraSettings) {
             for (const f of PARITY_FIELDS) {
@@ -846,6 +876,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             case 'snapshotCacheTtl':
                 this.storage.setItem('snapshotCacheTtl', String(value));
                 this.snapshots.clearCache();
+                return;
+            case 'audio.tuning':
+                this.storage.setItem('audio.tuning', String(value));
+                this.applyAudioTuning();
                 return;
             case 'detectObjectTypes': {
                 const types = (Array.isArray(value) ? value : (value != null && value !== '' ? [value] : [])).map(String);
