@@ -19,7 +19,7 @@ and the settings surface adapts accordingly.
 
 | Feature | Status |
 |---|---|
-| **Live video** (H.264 / H.265, up to 2688×1512) served as native RTSP | ✅ |
+| **Live video** (H.264, up to 2688×1512) served as native RTSP — no transcoding, no ffmpeg in the media path | ✅ |
 | **Audio** (AAC) | ✅ |
 | **Snapshots** — full-resolution, decoded from the live keyframe like Protect does, with a configurable cache | ✅ |
 | **On-camera detections** — person / vehicle / animal / package + motion, as `ObjectDetector` / `MotionSensor` events | ✅ |
@@ -37,10 +37,12 @@ controller:
    server (camera port `7442`) that runs the UniFi adoption handshake. Each camera
    is pointed at the Scrypted host via its `controller.addr` and connects here.
 2. **Direct stream** (`src/direct-stream.ts`) — commands the camera to push its
-   `extendedFlv` stream over TCP, de-trailers the proprietary framing, and feeds it
-   to ffmpeg.
-3. **Native RTSP** (`src/rtsp-serve.ts`) — an in-process RTSP server (no re-encode,
-   no external media server) that Scrypted connects to for video/audio.
+   `extendedFlv` stream over TCP and strips UniFi's proprietary variable-length
+   trailers back to standard FLV.
+3. **Native RTSP** (`src/native-rtsp.ts` + `src/rtsp-session.ts`) — the FLV is
+   demuxed and RTP-packetized in pure JS (H.264 RFC 6184, AAC RFC 3640) and served
+   by an in-process RTSP server — no re-encode, no ffmpeg subprocess, no external
+   media server. Scrypted connects to it like any RTSP camera.
 4. **Management commands** — settings, detection enables, and all zone types are
    applied with the same `Change*Settings` messages Protect uses (not the camera's
    local HTTP API), for true parity.
@@ -89,6 +91,15 @@ API of their own.
   full-res snapshot API); the low-res mjpg endpoint remains available as a fallback.
 - Verified primarily on the G5 Turret Ultra. Other models rely on capability
   auto-detection; please report gaps.
+
+## Development
+
+- `npm run build` — build the plugin bundle (scrypted-webpack).
+- `npm test` — run the unit/integration test suite (`test/`, node:test; covers the
+  extendedFlv de-trailer, FLV/RTP/SDP handling, the RTSP session, zone payload
+  building, camera-settings mapping, and the detection engine — no camera needed).
+- H.265 is deliberately not requested from cameras: the stream is passed through
+  untranscoded and HomeKit requires H.264.
 
 ## License
 

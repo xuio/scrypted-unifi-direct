@@ -576,6 +576,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
      * reconnect, which rebuilds a fresh stream on the next getVideoStream. Only
      * reaps built streams, never one mid-creation.
      */
+    // Rebuild history for the status line (in-memory; resets with the plugin).
+    private streamRebuilds = 0;
+    private lastRebuild?: number;
+
     reapDeadStreams() {
         for (const [track, s] of [...this.streams]) {
             if (this.creating.has(track)) continue;
@@ -583,6 +587,8 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 dbg('reaping dead stream', this.mac, track);
                 try { s.stop(); } catch { }
                 this.streams.delete(track);
+                this.streamRebuilds++;
+                this.lastRebuild = Date.now();
             }
         }
     }
@@ -604,7 +610,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     private get detectDebug() { return this.storage.getItem('detectDebug') === 'true'; }
 
     async getObjectTypes() {
-        return { classes: [...DEFAULT_OBJECT_TYPES] };   // person, vehicle, animal, package
+        // Report what this camera model actually supports (falls back to the
+        // standard classes when the camera is unreachable / declares nothing).
+        const supported = this.smartDetectTypes(await this.getFeatures());
+        return { classes: supported.length ? supported : [...DEFAULT_OBJECT_TYPES] };
     }
     async getDetectionInput(detectionId: string): Promise<MediaObject> {
         return this.takePicture();
@@ -622,7 +631,15 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         let cameraFeatures: Record<string, any> = {};
         const online = this.provider.emulator?.isOnline(this.mac);
         const live = [...this.streams.values()].some(s => s.alive);
-        const streamState = this.streams.size ? (live ? 'live' : 'stalled') : 'idle';
+        let streamState = this.streams.size ? (live ? 'live' : 'stalled') : 'idle';
+        if (live) {
+            const clients = [...this.streams.values()].reduce((n, s) => n + s.clients, 0);
+            const kf = this.streams.get(this.channel.track)?.latestKeyframe();
+            const kfAge = kf ? `${((Date.now() - kf.ts) / 1000).toFixed(1)}s` : 'none';
+            streamState += ` (${clients} client${clients === 1 ? '' : 's'}, keyframe ${kfAge})`;
+        }
+        if (this.streamRebuilds)
+            streamState += ` · rebuilds=${this.streamRebuilds} (last ${Math.round((Date.now() - this.lastRebuild!) / 60000)}m ago)`;
         try {
             const s = await this.getClient().getStatus();
             statusLine = `${s.board?.name || '?'} · fw ${s.fw?.semver || '?'} · emulator=${online ? 'CONNECTED' : 'waiting'} · stream=${streamState} · ctrl=${s.controller?.host}`;
@@ -639,6 +656,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             { key: 'host', title: 'Camera IP / Host', group: 'Connection', value: this.storage.getItem('host') || '', type: 'string' },
             { key: 'username', title: 'Username', group: 'Connection', value: this.storage.getItem('username') || '', type: 'string' },
             { key: 'password', title: 'Password', group: 'Connection', value: this.storage.getItem('password') || '', type: 'password' },
+            {
+                key: 'rebootCamera', title: 'Reboot Camera', group: 'Connection', type: 'button',
+                description: 'Reboot the camera via its local API. The camera reconnects and re-adopts automatically (~1 minute).',
+            },
             {
                 key: 'channel', title: 'Stream Channel', group: 'Stream', value: this.channelKey, type: 'string',
                 choices: ['high', 'medium', 'low'],
@@ -769,6 +790,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             return;
         }
         switch (key) {
+            case 'rebootCamera':
+                this.console.log(`[unifi-direct] rebooting camera ${this.mac}`);
+                await this.getClient().reboot();
+                return;
             case 'fullResSnapshots':
                 this.storage.setItem('fullResSnapshots', String(value === true || value === 'true'));
                 this.snapshots.clearCache();

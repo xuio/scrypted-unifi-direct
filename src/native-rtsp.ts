@@ -23,7 +23,9 @@ const VIDEO_CLOCK = 90000;
 
 type FlvTagHandler = (type: number, timestampMs: number, data: Buffer) => void;
 
-class FlvTagParser {
+// NOTE: FlvTagParser and the parse/packetize helpers below are exported only for
+// tests — they are not part of the plugin's API surface.
+export class FlvTagParser {
     private buf: Buffer = Buffer.alloc(0);
     private headerDone = false;
     constructor(private onTag: FlvTagHandler) { }
@@ -60,7 +62,7 @@ class FlvTagParser {
 // Codec parameter parsing (from the FLV sequence headers)
 // ---------------------------------------------------------------------------
 
-interface VideoParams {
+export interface VideoParams {
     sps: Buffer[];
     pps: Buffer[];
     /** NAL length prefix size in the AVCC data (1/2/4, from lengthSizeMinusOne). */
@@ -68,7 +70,7 @@ interface VideoParams {
 }
 
 /** Parse an AVCDecoderConfigurationRecord (avcC) into SPS/PPS + NAL length size. */
-function parseAvcC(d: Buffer): VideoParams | undefined {
+export function parseAvcC(d: Buffer): VideoParams | undefined {
     try {
         if (d.length < 7 || d[0] !== 1) return;
         const nalLen = (d[4] & 0x03) + 1;
@@ -90,7 +92,7 @@ function parseAvcC(d: Buffer): VideoParams | undefined {
     } catch { return; }
 }
 
-interface AudioParams {
+export interface AudioParams {
     rate: number;
     channels: number;
     /** Raw AudioSpecificConfig bytes (for the SDP `config=` fmtp param). */
@@ -100,7 +102,7 @@ interface AudioParams {
 const AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 
 /** Parse an AAC AudioSpecificConfig into sample rate + channel count. */
-function parseAsc(d: Buffer): AudioParams | undefined {
+export function parseAsc(d: Buffer): AudioParams | undefined {
     try {
         if (d.length < 2) return;
         const freqIdx = ((d[0] & 0x07) << 1) | (d[1] >> 7);
@@ -124,7 +126,7 @@ function parseAsc(d: Buffer): AudioParams | undefined {
 const ANNEXB_SC = Buffer.from([0, 0, 0, 1]);
 /** Assemble an Annex-B access unit (SPS + PPS + slice NALs, start-code framed)
  *  — a self-contained, decodable keyframe for one-shot snapshot decoding. */
-function toAnnexB(params: VideoParams, nals: Buffer[]): Buffer {
+export function toAnnexB(params: VideoParams, nals: Buffer[]): Buffer {
     const parts: Buffer[] = [];
     for (const s of params.sps) parts.push(ANNEXB_SC, s);
     for (const p of params.pps) parts.push(ANNEXB_SC, p);
@@ -133,7 +135,7 @@ function toAnnexB(params: VideoParams, nals: Buffer[]): Buffer {
 }
 
 /** Split length-prefixed (AVCC) NAL units. Returned views alias `d`. */
-function splitNals(d: Buffer, off: number, nalLen: number): Buffer[] {
+export function splitNals(d: Buffer, off: number, nalLen: number): Buffer[] {
     const out: Buffer[] = [];
     while (off + nalLen <= d.length) {
         let len = 0;
@@ -151,7 +153,7 @@ function splitNals(d: Buffer, off: number, nalLen: number): Buffer[] {
 // ---------------------------------------------------------------------------
 
 /** Per-track RTP state (shared across all clients, like the ffmpeg relay). */
-class RtpTrack {
+export class RtpTrack {
     private seq = randomBytes(2).readUInt16BE(0);
     private ssrc = randomBytes(4).readUInt32BE(0);
     private packets = 0;
@@ -211,7 +213,7 @@ class RtpTrack {
  * keyframes, SPS+PPS are sent first (in-band, same timestamp) so late joiners
  * recover within one GOP — the camera only puts them in the sequence header.
  */
-function packetizeH264(track: RtpTrack, params: VideoParams, nals: Buffer[], ts: number, keyframe: boolean, out: Buffer[]) {
+export function packetizeH264(track: RtpTrack, params: VideoParams, nals: Buffer[], ts: number, keyframe: boolean, out: Buffer[]) {
     if (keyframe) {
         for (const s of params.sps) out.push(track.build(ts, false, undefined, s));
         for (const p of params.pps) out.push(track.build(ts, false, undefined, p));
@@ -241,7 +243,7 @@ function packetizeH264(track: RtpTrack, params: VideoParams, nals: Buffer[], ts:
 
 /** Packetize one raw AAC frame (RFC 3640 AAC-hbr): 4-byte AU-header-section
  *  (16-bit headers-length + 13-bit size / 3-bit index) then the frame. */
-function packetizeAac(track: RtpTrack, frame: Buffer, ts: number): Buffer | undefined {
+export function packetizeAac(track: RtpTrack, frame: Buffer, ts: number): Buffer | undefined {
     if (!frame.length || frame.length >= (1 << 13)) return;   // size must fit 13 bits
     const au = Buffer.allocUnsafe(4);
     au.writeUInt16BE(16, 0);                  // AU-headers-length (bits)
@@ -253,7 +255,7 @@ function packetizeAac(track: RtpTrack, frame: Buffer, ts: number): Buffer | unde
 // SDP
 // ---------------------------------------------------------------------------
 
-function buildSdp(v: VideoParams, a?: AudioParams): SdpInfo {
+export function buildSdp(v: VideoParams, a?: AudioParams): SdpInfo {
     const sprop = [...v.sps, ...v.pps].map(x => x.toString('base64')).join(',');
     const profile = v.sps[0].subarray(1, 4).toString('hex');   // profile_idc, constraints, level_idc
     const lines = [

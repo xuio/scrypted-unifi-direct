@@ -27,8 +27,9 @@ const MAX_TRAILER_SCAN = 1 << 16;  // how far to look for the next tag past a tr
  * read offset; data moves only when the buffer wraps (compact) or grows.
  * view() returns a window into the shared store — it is only valid until the
  * next push(), so consumers must copy anything they keep (they already do).
+ * Exported only for tests.
  */
-class ByteQueue {
+export class ByteQueue {
     private store = Buffer.allocUnsafe(1 << 20);
     private head = 0;
     private tail = 0;
@@ -231,6 +232,9 @@ export class DirectStream {
 
     /** RTSP url Scrypted connects to. Available after start() resolves. */
     get url() { return this.serve?.url; }
+
+    /** Connected RTSP clients (for the status line). */
+    get clients() { return this.serve?.clientCount ?? 0; }
 
     /** Freshest keyframe (Annex-B H.264) for instant snapshots, if any. */
     latestKeyframe() { return this.serve?.latestKeyframe(); }

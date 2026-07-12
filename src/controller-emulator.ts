@@ -95,6 +95,11 @@ export class ControllerEmulator extends EventEmitter {
 
     isOnline(mac: string) { return !!this.sessions.get(mac)?.authenticated; }
 
+    /** MACs of all cameras that have completed the handshake (for diagnostics). */
+    onlineMacs(): string[] {
+        return [...this.sessions.values()].filter(s => s.authenticated).map(s => s.mac);
+    }
+
     start(): Promise<void> {
         return new Promise((resolve, reject) => {
             const server = https.createServer({ cert: EMULATOR_CERT, key: EMULATOR_KEY });

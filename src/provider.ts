@@ -14,7 +14,7 @@ import sdk, {
 import { CameraApiClient } from './client';
 import { ControllerEmulator } from './controller-emulator';
 import { UnifiCamera } from './camera';
-import { dbg } from './debug';
+import { dbg, setDbgEnabled } from './debug';
 
 const { deviceManager } = sdk;
 
@@ -30,9 +30,12 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
     private initAttempt = 0;
     private cameraPorts = new Map<string, number>();   // nativeId -> assigned push port
 
+    private initError: string | undefined;
+
     constructor(nativeId?: string) {
         super(nativeId);
         this.loadCameraPorts();
+        setDbgEnabled(this.storage.getItem('fileLog') !== 'false');
         this.init();
     }
 
@@ -115,6 +118,7 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
             // health watchdog: reap dead/stalled streams so consumers reconnect fresh.
             this.healthTimer = setInterval(() => this.reapAll(), 15000);
             this.initAttempt = 0;
+            this.initError = undefined;
         } catch (e) {
             // e.g. EADDRINUSE on 7442 while an old plugin process lingers through a
             // reload. Without a retry the plugin would sit dead until manually
@@ -124,7 +128,8 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
             clearInterval(this.pairTimer);
             clearInterval(this.healthTimer);
             const delay = Math.min(15_000 * 2 ** this.initAttempt++, 120_000);
-            this.console.error(`init failed (retrying in ${delay / 1000}s):`, (e as Error)?.message ?? e);
+            this.initError = (e as Error)?.message ?? String(e);
+            this.console.error(`init failed (retrying in ${delay / 1000}s):`, this.initError);
             setTimeout(() => this.init(), delay);
         }
     }
@@ -146,7 +151,19 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
     }
 
     async getSettings(): Promise<Setting[]> {
+        let status: string;
+        if (this.initError) {
+            status = `emulator FAILED: ${this.initError} (retrying)`;
+        } else if (!this.emulator) {
+            status = 'emulator starting…';
+        } else {
+            const online = this.emulator.onlineMacs();
+            const known = [...this.cameras.values()].filter(c => c.mac).length;
+            status = `emulator listening on ${MGMT_PORT} · cameras connected: ${online.length}/${known}`
+                + (online.length ? ` (${online.join(', ')})` : '');
+        }
         return [
+            { key: 'providerStatus', title: 'Status', readonly: true, value: status, type: 'string' },
             {
                 key: 'scryptedAddress',
                 title: 'Scrypted address (reachable from camera)',
@@ -155,10 +172,18 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
                 value: this.storage.getItem('scryptedAddress') || '',
                 type: 'string',
             },
+            {
+                key: 'fileLog',
+                title: 'Debug file log',
+                description: 'Mirror diagnostic events to /tmp/unifi-direct.log on the Scrypted host (rotated at 5 MB). Useful for headless debugging; turn off to stop writing to disk.',
+                value: this.storage.getItem('fileLog') !== 'false',
+                type: 'boolean',
+            },
         ];
     }
     async putSetting(key: string, value: SettingValue): Promise<void> {
         this.storage.setItem(key, String(value));
+        if (key === 'fileLog') setDbgEnabled(value === true || value === 'true');
         await this.onDeviceEvent(ScryptedInterface.Settings, undefined);
         this.repairAll();
     }
