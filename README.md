@@ -26,6 +26,7 @@ and the settings surface adapts accordingly.
 | **Detection zones** — smart-detect, exclude, line-crossing, loiter, motion, and privacy masks, applied over the management channel | ✅ |
 | **Camera settings** — image (ISP), video (bitrate/fps/keyframe), audio, overlay (OSD), status light, name — with per-model capability gating | ✅ |
 | **Secondary stream** — optional concurrent 720p/360p stream per camera; select it in the HomeKit plugin so HomeKit **copies** the video instead of transcoding the 4MP stream down to its 1080p cap | ✅ |
+| **Audio-only RTSP endpoint** — stable ~16 kbps AAC URL per camera (`rtsp://host:17553/<MAC>`) for soundscape analyzers like **BirdNET-Go**, no video bytes on the wire | ✅ |
 | **HomeKit** — works through Scrypted's HomeKit plugin (snapshots are sized per request so previews render correctly) | ✅ |
 
 ## How it works
@@ -86,6 +87,10 @@ API of their own.
   that stream in the HomeKit plugin for live/recording: HomeKit copies it directly
   (no transcode), while Scrypted NVR keeps recording the full-resolution stream.
   Costs one extra continuous camera push (~1.5 Mbps).
+- **Audio RTSP endpoint** — enable *Audio RTSP endpoint* on a camera and point a
+  consumer (e.g. BirdNET-Go's `realtime.rtsp.urls`) at the displayed URL. Taps the
+  microphone track of the stream that's already running — no extra camera push.
+  Unauthenticated and LAN-scoped; open TCP `17553` if the consumer is remote.
 - **Zones** — add named zones; each gets a polygon editor plus only the fields its
   type uses. Applied live over the management channel and re-asserted on reconnect.
 - **Settings** — only controls the camera model actually supports are shown.

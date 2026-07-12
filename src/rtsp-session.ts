@@ -31,7 +31,25 @@ export interface RtspServeHandle {
      * undefined until the first keyframe has been muxed.
      */
     latestKeyframe(): { ts: number; annexb: Buffer } | undefined;
+    /** AAC parameters of the served audio track (undefined when video-only). */
+    audioParams(): { rate: number; channels: number; config: Buffer } | undefined;
+    /**
+     * Tap the served audio: `fn` receives every audio RTP packet at egress
+     * (post-pacer, realtime cadence, the muxer's own SSRC/seq — packets are
+     * shared, not copied). `onEnd` fires when this serve is destroyed (stream
+     * rebuild) so the consumer can drop its sessions and let clients reconnect.
+     * Returns an unsubscribe function.
+     */
+    subscribeAudio(fn: (pkt: Buffer) => void, onEnd?: () => void): () => void;
 }
+
+/**
+ * Lazily resolves the SDP for a session from its DESCRIBE request URL — used by
+ * servers whose content depends on the requested path (the audio-only endpoint
+ * serves many cameras from one port). Returning undefined → 404. A rejection →
+ * 503 (e.g. the camera stream could not be started).
+ */
+export type SdpResolver = (requestUrl: string) => Promise<SdpInfo | undefined>;
 
 const RTSP_MAGIC = 0x24; // '$'
 /** Drop an RTSP client whose unsent TCP backlog exceeds this (slow/stalled reader). */
@@ -62,7 +80,7 @@ export class RtspSession {
     readonly id = ++RtspSession.counter;
     constructor(
         readonly socket: net.Socket,
-        private sdpInfo: SdpInfo,
+        private sdpInfo: SdpInfo | SdpResolver,
         private baseUrl: string,
         private onClose: () => void,
         /** Invoked right after PLAY is acknowledged — the muxer uses this to
@@ -117,15 +135,9 @@ export class RtspSession {
             case 'OPTIONS':
                 this.reply(cseq, ['Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER']);
                 break;
-            case 'DESCRIBE': {
-                const body = this.sdpInfo.sdp;
-                this.reply(cseq, [
-                    `Content-Base: ${this.baseUrl}/`,
-                    'Content-Type: application/sdp',
-                    `Content-Length: ${Buffer.byteLength(body)}`,
-                ], body);
+            case 'DESCRIBE':
+                this.describe(url, cseq);   // async when the SDP is resolver-based
                 break;
-            }
             case 'SETUP': {
                 const transport = headers['transport'] || '';
                 const m = transport.match(/interleaved=(\d+)-(\d+)/);
@@ -158,9 +170,32 @@ export class RtspSession {
         }
     }
 
-    private reply(cseq: string, headers: string[], body?: string) {
+    /** The resolved SDP (fixed at construction, or produced by the resolver on
+     *  the first DESCRIBE — the resolver may spin the camera stream up, so this
+     *  can take seconds; clients wait for the DESCRIBE response by protocol). */
+    private resolved: SdpInfo | undefined;
+
+    private async describe(url: string, cseq: string) {
+        try {
+            if (!this.resolved)
+                this.resolved = typeof this.sdpInfo === 'function' ? await this.sdpInfo(url) : this.sdpInfo;
+        } catch (e) {
+            dbg('rtsp describe resolver failed', this.id, (e as Error)?.message);
+            this.reply(cseq, [], undefined, '503 Service Unavailable');
+            return;
+        }
+        if (!this.resolved) { this.reply(cseq, [], undefined, '404 Not Found'); return; }
+        const body = this.resolved.sdp;
+        this.reply(cseq, [
+            ...(this.baseUrl ? [`Content-Base: ${this.baseUrl}/`] : []),
+            'Content-Type: application/sdp',
+            `Content-Length: ${Buffer.byteLength(body)}`,
+        ], body);
+    }
+
+    private reply(cseq: string, headers: string[], body?: string, status = '200 OK') {
         if (this.socket.destroyed) return;
-        const head = ['RTSP/1.0 200 OK', `CSeq: ${cseq}`, ...headers, '', body || ''].join('\r\n');
+        const head = [`RTSP/1.0 ${status}`, `CSeq: ${cseq}`, ...headers, '', body || ''].join('\r\n');
         this.socket.write(head);
     }
 

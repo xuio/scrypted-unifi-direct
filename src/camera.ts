@@ -25,6 +25,7 @@ import {
 } from './zones';
 import { DetectionEngine } from './detections';
 import { SnapshotManager } from './snapshots';
+import { AUDIO_RTSP_PORT } from './audio-rtsp';
 import { dbg } from './debug';
 import type { UnifiDirectProvider } from './provider';
 
@@ -635,6 +636,25 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         }
     }
 
+    // ---- audio-only endpoint (BirdNET-Go etc.) ----
+    get audioEndpointEnabled(): boolean { return this.storage.getItem('audioRtsp') === 'true'; }
+
+    /** Ensure the configured-channel stream is live and return its serve handle
+     *  — the audio endpoint taps its paced AAC packets. Same stream the
+     *  prebuffer keeps warm, so enabling audio adds no camera-side cost. */
+    async audioSource() {
+        const emulator = this.provider.emulator;
+        if (!emulator) throw new Error('controller emulator not started');
+        await this.ensurePaired();
+        await this.waitOnline(emulator, 25000);
+        if (!emulator.isOnline(this.mac))
+            throw new Error(`camera ${this.mac} is not connected`);
+        const stream = await this.getOrCreateStream(this.channel.track, emulator);
+        const handle = stream.serveHandle;
+        if (!handle) throw new Error('stream has no serve handle');
+        return handle;
+    }
+
     private waitOnline(emulator: ControllerEmulator, ms: number): Promise<void> {
         return new Promise(resolve => {
             if (emulator.isOnline(this.mac)) return resolve();
@@ -714,6 +734,16 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 choices: ['none', 'medium', 'low'],
                 description: 'Advertise an additional lower-resolution stream (its own concurrent camera push). Set to "medium" (1280×720) and select it in the HomeKit plugin for live/recording so HomeKit can COPY the video instead of transcoding the full-resolution stream down to its 1080p cap.',
             },
+            {
+                key: 'audioRtsp', title: 'Audio RTSP endpoint', group: 'Stream', type: 'boolean',
+                value: this.audioEndpointEnabled,
+                description: 'Serve this camera\'s microphone as a stable audio-only RTSP URL (~16 kbps AAC) for external consumers like BirdNET-Go. Unauthenticated, LAN-scoped — same trust model as the camera push ports.',
+            },
+            ...(this.audioEndpointEnabled ? [{
+                key: 'audioRtspUrl', title: 'Audio RTSP URL', group: 'Stream', readonly: true, type: 'string',
+                value: `rtsp://${this.provider.getPushAddress() || '<scrypted-ip>'}:${AUDIO_RTSP_PORT}/${this.mac}`,
+                description: 'Configure this URL in the consumer (e.g. BirdNET-Go realtime.rtsp.urls). The URL is stable across stream rebuilds and plugin restarts.',
+            } as Setting] : []),
             {
                 key: 'codec', title: 'Video Codec', group: 'Stream', value: 'h264', type: 'string',
                 choices: ['h264'], readonly: true,
@@ -862,6 +892,16 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 // the advertised stream set changed — tell consumers that cache
                 // getVideoStreamOptions (prebuffer) to refresh promptly.
                 await this.onDeviceEvent(ScryptedInterface.VideoCamera, undefined);
+                return;
+            }
+            case 'audioRtsp': {
+                const on = value === true || value === 'true';
+                this.storage.setItem('audioRtsp', String(on));
+                if (on)
+                    await this.provider.ensureAudioRtspServer()
+                        .catch(e => this.console.warn('audio rtsp endpoint failed to start:', (e as Error)?.message));
+                // disabling only gates NEW sessions (the resolver checks the
+                // flag); live sessions end with their stream or client.
                 return;
             }
             case 'rebootCamera':

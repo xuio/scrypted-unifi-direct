@@ -14,6 +14,7 @@ import sdk, {
 import { CameraApiClient } from './client';
 import { ControllerEmulator } from './controller-emulator';
 import { PushPortRegistry } from './push-registry';
+import { AudioRtspServer, AUDIO_RTSP_PORT } from './audio-rtsp';
 import { UnifiCamera } from './camera';
 import { dbg, setDbgEnabled } from './debug';
 
@@ -27,6 +28,8 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
     // Shared listeners for the fixed per-track push ports (17550-17552): the
     // port identifies the track, the source IP the camera — no allocation.
     readonly pushRegistry = new PushPortRegistry();
+    // Stable audio-only RTSP endpoints (17553), started lazily on first enable.
+    private audioServer: AudioRtspServer | undefined;
     private pairTimer: any;
     private healthTimer: any;
     private initAttempt = 0;
@@ -72,6 +75,9 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
             for (const nativeId of deviceManager.getNativeIds()) {
                 if (nativeId && nativeId.startsWith('cam:')) await this.getDevice(nativeId);
             }
+            // bring the audio endpoint up if any camera has it enabled
+            if ([...this.cameras.values()].some(c => c.audioEndpointEnabled))
+                this.ensureAudioRtspServer().catch(e => this.console.warn('audio rtsp endpoint failed to start:', (e as Error)?.message));
             // periodically (re)pair cameras that aren't connected (handles reboots/backoff)
             this.pairTimer = setInterval(() => this.repairAll(), 30000);
             setTimeout(() => this.repairAll(), 3000);
@@ -108,6 +114,23 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
 
     getPushAddress(): string | undefined {
         return this.storage.getItem('scryptedAddress') || undefined;
+    }
+
+    /** Start the shared audio-only RTSP listener (idempotent). */
+    ensureAudioRtspServer(): Promise<void> {
+        if (!this.audioServer)
+            this.audioServer = new AudioRtspServer(AUDIO_RTSP_PORT, key => this.resolveAudioSource(key));
+        return this.audioServer.start();
+    }
+
+    /** URL path key (normalized MAC) → live serve handle of that camera's
+     *  configured stream. Only cameras with the endpoint enabled resolve. */
+    private async resolveAudioSource(key: string) {
+        for (const cam of this.cameras.values()) {
+            if (cam.mac !== key || !cam.audioEndpointEnabled) continue;
+            return cam.audioSource();
+        }
+        return undefined;
     }
 
     async getSettings(): Promise<Setting[]> {

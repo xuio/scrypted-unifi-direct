@@ -196,6 +196,9 @@ export class DirectStream {
     /** Freshest keyframe (Annex-B H.264) for instant snapshots, if any. */
     latestKeyframe() { return this.serve?.latestKeyframe(); }
 
+    /** The underlying RTSP serve (audio-tap access for the audio endpoint). */
+    get serveHandle() { return this.serve; }
+
     async start(): Promise<void> {
         const ips = await this.resolveAllowedSources();
         this.route = { ips, onConnection: s => this.onCamera(s) };

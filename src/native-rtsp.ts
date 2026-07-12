@@ -297,6 +297,22 @@ export function buildSdp(v: VideoParams, a?: AudioParams): SdpInfo {
     return info;
 }
 
+/** Audio-only SDP for the stable audio endpoint (single AAC track, trackID=0). */
+export function buildAudioSdp(a: AudioParams): SdpInfo {
+    const lines = [
+        'v=0',
+        'o=- 0 0 IN IP4 0.0.0.0',
+        's=UniFi Direct Audio',
+        'c=IN IP4 0.0.0.0',
+        't=0 0',
+        `m=audio 0 RTP/AVP ${PT_AUDIO}`,
+        `a=rtpmap:${PT_AUDIO} MPEG4-GENERIC/${a.rate}/${a.channels}`,
+        `a=fmtp:${PT_AUDIO} profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=${a.config.toString('hex')}`,
+        'a=control:trackID=0',
+    ];
+    return { sdp: lines.join('\r\n') + '\r\n', audioTrack: 'trackID=0' };
+}
+
 // ---------------------------------------------------------------------------
 // Serve
 // ---------------------------------------------------------------------------
@@ -362,6 +378,11 @@ export async function startNativeServe(opts: {
     const videoTrack = new RtpTrack(PT_VIDEO);
     const audioTrack = new RtpTrack(PT_AUDIO);
 
+    // Audio tap (the stable audio-only endpoint): subscribers receive every
+    // audio RTP packet at EGRESS — post-pacer, so the tap sees the same clean
+    // realtime cadence as RTSP clients — and an end signal when this serve dies.
+    const audioSubs = new Set<{ fn: (pkt: Buffer) => void; onEnd?: () => void }>();
+
     // ---- egress pacer -----------------------------------------------------
     // The camera pauses ~150 ms to emit each large keyframe, then bursts to
     // catch up; forwarding that starve-then-flood verbatim into a low-latency
@@ -409,15 +430,20 @@ export async function startNativeServe(opts: {
         // than dump the whole backlog in one flood.
         if (now - (epoch + egress[0].due) > MAX_LATE_MS) epoch = now - egress[0].due + EGRESS_DELAY_MS;
         const batch: { control: string; packet: Buffer }[] = [];
+        const audioOut: Buffer[] = [];
         let lastVideoTs: number | undefined, lastAudioTs: number | undefined;
         while (egress.length && epoch + egress[0].due <= now) {
             const it = egress.shift()!;
             if (it.kf) { gop = []; gopBytes = 0; gopOverflow = false; }   // GOP history resets at the keyframe boundary, at send time
             if (it.control !== 'trackID=1' || gop.length) gopAppend(it.control, [it.packet]);
-            if (it.control === 'trackID=1') lastAudioTs = it.packet.readUInt32BE(4);
+            if (it.control === 'trackID=1') { lastAudioTs = it.packet.readUInt32BE(4); audioOut.push(it.packet); }
             else lastVideoTs = it.packet.readUInt32BE(4);
             batch.push({ control: it.control, packet: it.packet });
         }
+        // audio tap: deliver at egress time, isolated from the media path.
+        if (audioOut.length && audioSubs.size)
+            for (const sub of audioSubs)
+                for (const p of audioOut) { try { sub.fn(p); } catch { } }
         if (batch.length) {
             for (const s of sessions) s.sendMixedBatch(batch);
             // stamp the RTCP RTP↔wall mapping at actual send time (post-pacer)
@@ -559,6 +585,8 @@ export async function startNativeServe(opts: {
         try { server?.close(); } catch { }
         for (const s of sessions) s.close();
         sessions.clear();
+        for (const sub of audioSubs) { try { sub.onEnd?.(); } catch { } }
+        audioSubs.clear();
         try { flv.destroy(); } catch { }
     };
     flv.once('close', destroy);
@@ -637,5 +665,12 @@ export async function startNativeServe(opts: {
         get clientCount() { return sessions.size; },
         get alive() { return !dead && (Date.now() - lastVideoRtp) < RTP_STALL_MS; },
         latestKeyframe: () => latestKeyframe,
+        audioParams: () => useAudio,
+        subscribeAudio: (fn, onEnd) => {
+            const sub = { fn, onEnd };
+            if (dead) { try { onEnd?.(); } catch { } return () => { }; }
+            audioSubs.add(sub);
+            return () => audioSubs.delete(sub);
+        },
     };
 }
