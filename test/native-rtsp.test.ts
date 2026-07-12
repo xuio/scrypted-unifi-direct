@@ -1,8 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import net from 'net';
+import { once } from 'events';
+import { PassThrough } from 'stream';
 import {
     FlvTagParser, parseAvcC, parseAsc, splitNals, toAnnexB,
-    RtpTrack, packetizeH264, packetizeAac, buildSdp,
+    RtpTrack, packetizeH264, packetizeAac, buildSdp, startNativeServe,
 } from '../src/native-rtsp';
 import { rng, randBytes, flvTag, flvHeader } from './helpers';
 
@@ -180,6 +183,84 @@ test('RtpTrack.senderReport maps RTP time to NTP and counts correctly', () => {
     assert.equal(sr.readUInt32BE(24), 150);            // payload octets
     const ntpSec = sr.readUInt32BE(8) - 2208988800;    // 1900 → 1970 epoch
     assert.ok(Math.abs(ntpSec - before / 1000) < 5);
+});
+
+// ---- end-to-end: GOP replay on join ----
+
+/** AVC video FLV tag data: [frameType<<4|7, pktType, cts24, payload]. */
+function avcTagData(frameType: number, pktType: number, payload: Buffer): Buffer {
+    return Buffer.concat([Buffer.from([(frameType << 4) | 7, pktType, 0, 0, 0]), payload]);
+}
+const lenPrefixed = (nal: Buffer) => {
+    const p = Buffer.alloc(4 + nal.length);
+    p.writeUInt32BE(nal.length, 0); nal.copy(p, 4);
+    return p;
+};
+
+test('a client joining mid-GOP receives the buffered GOP instantly', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({ flv, hasAudio: false });
+
+    const idr = Buffer.concat([Buffer.from([0x65]), randBytes(rng(11), 3000)]);
+    const p1 = Buffer.concat([Buffer.from([0x41]), randBytes(rng(12), 800)]);
+    const p2 = Buffer.concat([Buffer.from([0x41]), randBytes(rng(13), 900)]);
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),        // sequence header
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(idr))),          // keyframe
+        flvTag(9, 33, avcTagData(2, 1, lenPrefixed(p1))),          // P-frames
+        flvTag(9, 66, avcTagData(2, 1, lenPrefixed(p2))),
+    ]));
+
+    const serve = await servePromise;
+    try {
+        // connect AFTER the whole GOP was muxed — no further video will arrive,
+        // so anything we receive must come from the replay buffer.
+        const port = parseInt(new URL(serve.url).port);
+        const client = net.connect(port, '127.0.0.1');
+        await once(client, 'connect');
+        const received: Buffer[] = [];
+        client.on('data', d => received.push(d));
+        client.write('SETUP rtsp://x/trackID=0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n');
+        client.write('PLAY rtsp://x/ RTSP/1.0\r\nCSeq: 2\r\n\r\n');
+        const deadline = Date.now() + 2000;
+        // reassemble NAL payloads from the interleaved RTP stream
+        const wanted = [SPS, PPS, idr, p1, p2];
+        for (;;) {
+            const all = Buffer.concat(received);
+            // strip the two RTSP responses, then parse interleaved frames
+            let off = 0, headerEnds = 0;
+            while (headerEnds < 2) {
+                const e = all.indexOf('\r\n\r\n', off);
+                if (e < 0) break;
+                off = e + 4; headerEnds++;
+            }
+            const payloads: Buffer[] = [];
+            if (headerEnds === 2) {
+                let frags: Buffer[] = [];
+                while (off + 4 <= all.length) {
+                    const len = all.readUInt16BE(off + 2);
+                    if (off + 4 + len > all.length) break;
+                    const rtp = all.subarray(off + 4, off + 4 + len);
+                    off += 4 + len;
+                    const pl = rtp.subarray(12);
+                    if ((pl[0] & 0x1f) === 28) {   // FU-A — reassemble
+                        if (pl[1] & 0x80) frags = [Buffer.from([(pl[0] & 0x60) | (pl[1] & 0x1f)])];
+                        frags.push(pl.subarray(2));
+                        if (pl[1] & 0x40) payloads.push(Buffer.concat(frags));
+                    } else {
+                        payloads.push(pl);
+                    }
+                }
+            }
+            if (wanted.every(w => payloads.some(p => p.equals(w)))) break;   // got the whole GOP
+            assert.ok(Date.now() < deadline, `timed out; got ${payloads.length} NALs`);
+            await new Promise(r => setTimeout(r, 10));
+        }
+        client.destroy();
+    } finally {
+        serve.destroy();
+    }
 });
 
 // ---- SDP ----

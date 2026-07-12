@@ -82,7 +82,7 @@ export const PARITY_FIELDS: FieldDef[] = [
     {
         key: 'video.keyframeInterval', title: 'Keyframe interval (s)', group: 'Video', type: 'integer',
         paths: ['av.video.<track>.nMultiplier'], range: [1, 10],
-        description: 'Seconds between keyframes. Lower = faster stream start / lower latency in Scrypted and HomeKit, at the cost of somewhat larger recordings. 1s recommended for instant playback.',
+        description: 'Seconds between keyframes. Streams start instantly regardless — the plugin replays the current GOP to every new viewer — so longer intervals cost nothing on startup, and fewer keyframes mean less visible quality pulsing and better quality per bit. 4s recommended (also aligns with HomeKit Secure Video’s 4-second fragments). The tradeoff: live view runs up to this many seconds behind real time.',
     },
 
     // ---- Audio (microphone) — gated on the camera having a mic ----

@@ -321,6 +321,29 @@ export async function startNativeServe(opts: {
     let onVideoParams: (() => void) | undefined;
     let onAudioParams: (() => void) | undefined;
 
+    // GOP replay buffer: every RTP packet since the last keyframe (video, and
+    // audio once video is present), in send order. A client that connects
+    // mid-GOP gets the whole buffer on PLAY, so it renders INSTANTLY (at most
+    // one GOP behind live) instead of showing nothing until the next IDR —
+    // which makes long keyframe intervals (less quality pulsing, better quality
+    // per bit) free for stream-start latency. Because the buffered packets
+    // carry the shared track's historical sequence numbers, a replayed client's
+    // seq stream is continuous into live packets, and existing clients are
+    // untouched. Maintained even with zero clients — the FIRST client is
+    // exactly who needs it.
+    const MAX_GOP_BYTES = 16 * 1024 * 1024;   // ~10s GOP at 12 Mbps; overflow disables replay until the next IDR
+    let gop: { control: string; packet: Buffer }[] = [];
+    let gopBytes = 0;
+    let gopOverflow = false;
+    const gopAppend = (control: string, pkts: Buffer[]) => {
+        if (gopOverflow) return;
+        for (const packet of pkts) { gop.push({ control, packet }); gopBytes += packet.length; }
+        if (gopBytes > MAX_GOP_BYTES) {
+            dbg('native-rtsp gop buffer overflow; replay disabled until next keyframe');
+            gop = []; gopBytes = 0; gopOverflow = true;
+        }
+    };
+
     const videoTrack = new RtpTrack(PT_VIDEO);
     const audioTrack = new RtpTrack(PT_AUDIO);
 
@@ -351,10 +374,14 @@ export async function startNativeServe(opts: {
         // Cache the freshest keyframe (decodable Annex-B AU) for instant snapshots,
         // regardless of whether anyone is streaming.
         if (frameType === 1) latestKeyframe = { ts: lastVideoRtp, annexb: toAnnexB(videoParams, nals) };
-        if (!sessions.size) return;
         const ts = Math.max(0, tsMs + cts) * (VIDEO_CLOCK / 1000);
         const pkts: Buffer[] = [];
         packetizeH264(videoTrack, videoParams, nals, ts, frameType === 1, pkts);
+        // maintain the GOP replay buffer (reset at each keyframe) even with no
+        // clients connected — the first client to connect is who needs it.
+        if (frameType === 1) { gop = []; gopBytes = 0; gopOverflow = false; }
+        gopAppend('trackID=0', pkts);
+        if (!sessions.size) return;
         // one corked burst per session: a keyframe AU is hundreds of packets, and
         // per-packet writes on a noDelay socket would be 2 syscalls each.
         for (const s of sessions) s.sendRtpBatch('trackID=0', pkts);
@@ -377,10 +404,14 @@ export async function startNativeServe(opts: {
             }
             return;
         }
-        if (pktType !== 1 || !audioParams || !audioServed || !sessions.size) return;
+        if (pktType !== 1 || !audioParams || !audioServed) return;
         const ts = Math.round(tsMs * audioParams.rate / 1000);
         const pkt = packetizeAac(audioTrack, d.subarray(2), ts);
         if (!pkt) return;
+        // buffer audio for GOP replay only once video is present in the buffer
+        // (audio-before-the-keyframe is useless to a joining decoder).
+        if (gop.length) gopAppend('trackID=1', [pkt]);
+        if (!sessions.size) return;
         for (const s of sessions) s.sendRtpBatch('trackID=1', [pkt]);
     };
 
@@ -460,10 +491,22 @@ export async function startNativeServe(opts: {
     audioServed = !!info.audioTrack;
     dbg('native-rtsp sdp ready; video', info.videoTrack, 'audio', info.audioTrack ?? '(none)');
 
+    // Replay the buffered GOP to a client the moment it PLAYs, so it renders
+    // instantly instead of waiting for the next keyframe.
+    const replayGop = (s: RtspSession) => {
+        if (!gop.length) return;
+        try {
+            s.sendMixedBatch(gop);
+            dbg('native-rtsp gop replay:', gop.length, 'packets,', gopBytes, 'bytes');
+        } catch (e) {
+            dbg('native-rtsp gop replay failed:', (e as Error)?.message);
+        }
+    };
+
     const pathToken = '/' + randomBytes(8).toString('hex');
     let url = '';
     server = net.createServer(socket => {
-        const s = new RtspSession(socket, info, url, () => sessions.delete(s));
+        const s = new RtspSession(socket, info, url, () => sessions.delete(s), replayGop);
         sessions.add(s);
     });
     await new Promise<void>(res => server!.listen(0, '127.0.0.1', () => res()));

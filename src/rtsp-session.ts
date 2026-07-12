@@ -65,6 +65,9 @@ export class RtspSession {
         private sdpInfo: SdpInfo,
         private baseUrl: string,
         private onClose: () => void,
+        /** Invoked right after PLAY is acknowledged — the muxer uses this to
+         *  replay the buffered GOP so the client renders instantly. */
+        private onPlay?: (s: RtspSession) => void,
     ) {
         socket.setNoDelay(true);
         socket.on('data', d => this.onData(d));
@@ -140,6 +143,7 @@ export class RtspSession {
                 // frame can jump ahead of the response and desync the client.
                 this.reply(cseq, [`Session: ${this.session}`, 'Range: npt=0.000-']);
                 this.playing = true;
+                this.onPlay?.(this);
                 break;
             case 'GET_PARAMETER':
                 this.reply(cseq, [`Session: ${this.session}`]);
@@ -173,6 +177,21 @@ export class RtspSession {
             for (const p of packets) {
                 this.sendRtp(control, p);
                 if (this.closed) break;   // backpressure guard closed us mid-burst
+            }
+        } finally {
+            if (!this.socket.destroyed) this.socket.uncork();
+        }
+    }
+
+    /** Relay a corked burst of packets spanning BOTH tracks in original order
+     *  (used for GOP replay, where video and audio interleave). */
+    sendMixedBatch(items: readonly { control: string; packet: Buffer }[]) {
+        if (!items.length || this.socket.destroyed) return;
+        this.socket.cork();
+        try {
+            for (const it of items) {
+                this.sendRtp(it.control, it.packet);
+                if (this.closed) break;
             }
         } finally {
             if (!this.socket.destroyed) this.socket.uncork();
