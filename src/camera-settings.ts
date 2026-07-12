@@ -18,6 +18,8 @@ export interface FieldDef {
     /** camera stores this boolean as 0/1 rather than true/false */
     bool01?: boolean;
     description?: string;
+    /** Show the value but don't let the user change it (the camera ignores writes). */
+    readonly?: boolean;
     /**
      * Capability gate: only expose this field when the camera's `features` flags
      * say the model supports it. Return true to show. If omitted, the field is
@@ -77,13 +79,25 @@ export const PARITY_FIELDS: FieldDef[] = [
 
     // ---- Video (applies to the active channel track) ----
     { key: 'video.fps', title: 'Frame rate (fps)', group: 'Video', type: 'integer', paths: ['av.video.<track>.fps', 'av.video.<track>.maxFps'], range: [1, 30] },
-    { key: 'video.isCbr', title: 'Constant bitrate (CBR)', group: 'Video', type: 'boolean', paths: ['av.video.<track>.isCbr'] },
+    // Read-only: verified firmware-locked to VBR on these cameras (writes are
+    // silently ignored on both the HTTP API and the mgmt channel), and UniFi
+    // Protect itself hard-codes isCbr=false — so we surface the state but don't
+    // pretend it's settable.
+    { key: 'video.isCbr', title: 'Constant bitrate (CBR)', group: 'Video', type: 'boolean', paths: ['av.video.<track>.isCbr'], readonly: true, description: 'Firmware-locked to variable bitrate (VBR) on UniFi Protect cameras — shown for reference; not changeable.' },
     { key: 'video.bitrate', title: 'Max bitrate (bps)', group: 'Video', type: 'integer', paths: ['av.video.<track>.bitRateVbrMax', 'av.video.<track>.bitRateCbrAvg'], range: [32000, 12000000] },
     {
         key: 'video.keyframeInterval', title: 'Keyframe interval (s)', group: 'Video', type: 'integer',
         paths: ['av.video.<track>.nMultiplier'], range: [1, 10],
-        description: 'Seconds between keyframes. Streams start instantly regardless — the plugin replays the current GOP to every new viewer — so longer intervals cost nothing on startup, and fewer keyframes mean less visible quality pulsing and better quality per bit. 4s recommended (also aligns with HomeKit Secure Video’s 4-second fragments). The tradeoff: live view runs up to this many seconds behind real time.',
+        description: 'Seconds between keyframes. Streams start instantly regardless — the plugin replays the current GOP to every new viewer — so longer intervals cost nothing on startup, and a LONGER interval measurably reduces the periodic keyframe "flash"/quality-pulse on detailed/moving scenes (each intra frame is a small quality reset; fewer resets = smoother). 8s is best for image smoothness; use 4s if you rely on HomeKit Secure Video recording (its 4-second fragments each need a keyframe). The tradeoff: live view runs up to this many seconds behind real time.',
     },
+    // Adaptive-bitrate floors. The camera's autoBitrate silently throttles a
+    // low-"motion" scene (e.g. rippling water the detector ignores) down toward
+    // minMotionAdaptiveBitRate, starving P-frames and widening the keyframe
+    // quality-reset. Raising the floors pins the encoder near its ceiling so the
+    // picture stays sharp between keyframes. (Firmware clamps these a little below
+    // the max.) HTTP-applied; the camera ignores them on the mgmt channel.
+    { key: 'video.minMotionBitrate', title: 'Min bitrate, low motion (bps)', group: 'Video', type: 'integer', paths: ['av.video.<track>.minMotionAdaptiveBitRate'], range: [0, 10000000], description: 'Floor the adaptive encoder won’t drop below when it sees little motion. Raise toward the max to stop quality sagging on scenes the motion detector underrates (water, foliage).' },
+    { key: 'video.minClientBitrate', title: 'Min bitrate, per viewer (bps)', group: 'Video', type: 'integer', paths: ['av.video.<track>.minClientAdaptiveBitRate'], range: [0, 10000000], description: 'Per-client adaptive floor. Raise toward the max to keep full quality for live viewers.' },
 
     // ---- Audio (microphone) — gated on the camera having a mic ----
     { key: 'audio.enabled', title: 'Microphone enabled', group: 'Audio', type: 'boolean', paths: ['av.audio.enabled'], cap: hasMic },
@@ -215,6 +229,7 @@ const MGMT_HTTP_ONLY = new Set([
     // (Protect resends the FULL per-channel object); HTTP applies them reliably,
     // so keep video on HTTP rather than risk disrupting the live encoder.
     'video.fps', 'video.isCbr', 'video.bitrate', 'video.keyframeInterval',
+    'video.minMotionBitrate', 'video.minClientBitrate',
 ]);
 
 /**
@@ -274,6 +289,7 @@ export function toSetting(field: FieldDef, value: any): Setting {
         choices: field.choices,
         range: field.range,
         description: field.description,
+        readonly: field.readonly,
         value,
     };
 }

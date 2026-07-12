@@ -2,6 +2,7 @@ import net, { AddressInfo } from 'net';
 import { randomBytes } from 'crypto';
 import type { Readable } from 'stream';
 import { RtspSession, RtspServeHandle, SdpInfo } from './rtsp-session';
+import { ByteQueue } from './byte-queue';
 import { dbg } from './debug';
 
 type Logger = { log?: (...a: any[]) => void; warn?: (...a: any[]) => void };
@@ -26,34 +27,39 @@ type FlvTagHandler = (type: number, timestampMs: number, data: Buffer) => void;
 // NOTE: FlvTagParser and the parse/packetize helpers below are exported only for
 // tests — they are not part of the plugin's API surface.
 export class FlvTagParser {
-    private buf: Buffer = Buffer.alloc(0);
+    // A 500 KB keyframe arriving in small socket chunks would re-copy the pending
+    // bytes on every read with a Buffer.concat accumulator (O(tag²/chunk)); the
+    // ByteQueue appends at a write offset and consumes from a read offset instead.
+    private q = new ByteQueue();
     private headerDone = false;
     constructor(private onTag: FlvTagHandler) { }
 
     push(chunk: Buffer) {
-        this.buf = this.buf.length ? Buffer.concat([this.buf, chunk]) : chunk;
+        this.q.push(chunk);
         for (; ;) {
+            const buf = this.q.view();
             if (!this.headerDone) {
-                if (this.buf.length < 9) return;
+                if (buf.length < 9) return;
                 // header is dataOffset bytes (9), followed by PreviousTagSize0.
-                const dataOffset = this.buf.readUInt32BE(5);
+                const dataOffset = buf.readUInt32BE(5);
                 const skip = (dataOffset >= 9 ? dataOffset : 9) + 4;
-                if (this.buf.length < skip) return;
-                this.buf = this.buf.subarray(skip);
+                if (buf.length < skip) return;
+                this.q.consume(skip);
                 this.headerDone = true;
                 continue;
             }
-            if (this.buf.length < 11) return;
-            const dataSize = (this.buf[1] << 16) | (this.buf[2] << 8) | this.buf[3];
+            if (buf.length < 11) return;
+            const dataSize = (buf[1] << 16) | (buf[2] << 8) | buf[3];
             const total = 11 + dataSize + 4;   // header + data + PreviousTagSize
-            if (this.buf.length < total) return;
-            const type = this.buf[0] & 0x1f;
+            if (buf.length < total) return;
+            const type = buf[0] & 0x1f;
             // timestamp: 3 bytes + 1 extension byte (bits 31..24).
-            const ts = ((this.buf[7] << 24) | (this.buf[4] << 16) | (this.buf[5] << 8) | this.buf[6]) >>> 0;
-            const data = this.buf.subarray(11, 11 + dataSize);
-            this.buf = this.buf.subarray(total);
-            // data is a view into the shared buffer; consumers copy what they keep.
+            const ts = ((buf[7] << 24) | (buf[4] << 16) | (buf[5] << 8) | buf[6]) >>> 0;
+            const data = buf.subarray(11, 11 + dataSize);
+            // `data` is a view into the queue store; the handler runs synchronously
+            // and copies what it keeps before we consume (which invalidates it).
             this.onTag(type, ts, data);
+            this.q.consume(total);
         }
     }
 }
@@ -179,10 +185,18 @@ export class RtpTrack {
         payload.copy(buf, o, start, end);
         this.packets++;
         this.octets = (this.octets + (o - 12) + plen) >>> 0;   // payload octets (RFC 3550)
+        return buf;
+    }
+
+    /** Record the RTP timestamp and wall-clock of the most recently SENT packet,
+     *  so the Sender Report maps the RTP clock to when media actually went on the
+     *  wire — not when it was packetized. With the egress pacer those differ by
+     *  the smoothing delay; stamping at send keeps both tracks' RTP↔NTP mapping
+     *  honest (and, being equal on both, preserves lip-sync). */
+    stamp(ts: number) {
         this.lastTs = ts % 0x100000000;
         this.lastWall = Date.now();
         this.sent = true;
-        return buf;
     }
 
     /** RTCP Sender Report (28 bytes) mapping this track's RTP clock to wall time,
@@ -317,6 +331,7 @@ export async function startNativeServe(opts: {
     let audioParams: AudioParams | undefined;
     let audioBroken = false;      // audio is best-effort; once broken, video-only
     let audioServed = false;      // audio made it into the SDP
+    let audioTs: number | undefined;   // synthesized AAC RTP clock (exact 1024/frame)
     let latestKeyframe: { ts: number; annexb: Buffer } | undefined;   // for snapshots
     let onVideoParams: (() => void) | undefined;
     let onAudioParams: (() => void) | undefined;
@@ -347,6 +362,88 @@ export async function startNativeServe(opts: {
     const videoTrack = new RtpTrack(PT_VIDEO);
     const audioTrack = new RtpTrack(PT_AUDIO);
 
+    // ---- egress pacer -----------------------------------------------------
+    // The camera pauses ~150 ms to emit each large keyframe, then bursts to
+    // catch up; forwarding that starve-then-flood verbatim into a low-latency
+    // WebRTC jitter buffer (tuned for tens of ms) causes a periodic hitch every
+    // keyframe interval — worst where keyframes are biggest. Instead of firing
+    // each access unit the instant it arrives, release packets on a wall-clock
+    // schedule anchored to their media timestamps: a small smoothing buffer (as
+    // every production RTP relay has) that absorbs the camera's bursty wire
+    // timing and re-paces the egress to the encoder's clean ~33 ms cadence. The
+    // GOP replay buffer is maintained at SEND time so a joiner's instant history
+    // splices seamlessly into the paced live stream.
+    // Budget must exceed a 4 MP (2688×1512) IDR's own arrival time on the wire:
+    // measured at ~250 ms (the camera bursts the keyframe second at ~16 Mbps), so
+    // a 250 ms budget leaves nothing to smooth with — the IDR is already overdue
+    // when it lands. 450 ms gives real headroom; the +latency is behind the prebuffer.
+    const EGRESS_DELAY_MS = 450;
+    const BURST_SLICE = 120;        // access units larger than this get their packets spread…
+    const MAX_SPREAD_MS = 150;      // …proportionally across up to this window (≈ n/6 ms) so a ~400-packet
+                                    // IDR trickles instead of a single ~80 Mbps microburst (punishing on a
+                                    // client's Wi-Fi). Capped so it can't head-of-line block the frames
+                                    // queued behind it (the egress is FIFO, not due-sorted).
+    const MAX_LATE_MS = 2000;       // event-loop stall / clock jump: re-anchor instead of dumping a backlog
+    const MAX_QUEUE = 8000;         // runaway backstop on a tight host: collapse the buffer
+    type Paced = { control: string; packet: Buffer; due: number; kf: boolean };
+    let egress: Paced[] = [];
+    let epoch = 0;                  // wall-clock ms of media-time 0; sendWall = epoch + due
+    let drainTimer: any;
+    let pendingJoinSr = false;      // a client PLAYed before any packet was sent (cold start); send its SR once draining starts
+
+    const enqueue = (control: string, pkts: Buffer[], mediaMs: number, keyframe: boolean) => {
+        const n = pkts.length;
+        const spread = n > BURST_SLICE ? Math.min(MAX_SPREAD_MS, Math.ceil(n / 6)) : 0;
+        for (let i = 0; i < n; i++)
+            egress.push({ control, packet: pkts[i], due: mediaMs + (spread ? spread * i / n : 0), kf: keyframe && i === 0 });
+        if (egress.length > MAX_QUEUE && egress.length) epoch = Date.now() - egress[0].due;   // flush: drop smoothing rather than grow
+        scheduleDrain();
+    };
+
+    const drain = () => {
+        drainTimer = undefined;
+        if (!egress.length) return;
+        const now = Date.now();
+        if (!epoch) epoch = now - egress[0].due + EGRESS_DELAY_MS;
+        // fell badly behind (stall or camera/host clock jump): re-anchor rather
+        // than dump the whole backlog in one flood.
+        if (now - (epoch + egress[0].due) > MAX_LATE_MS) epoch = now - egress[0].due + EGRESS_DELAY_MS;
+        const batch: { control: string; packet: Buffer }[] = [];
+        let lastVideoTs: number | undefined, lastAudioTs: number | undefined;
+        while (egress.length && epoch + egress[0].due <= now) {
+            const it = egress.shift()!;
+            if (it.kf) { gop = []; gopBytes = 0; gopOverflow = false; }   // GOP history resets at the keyframe boundary, at send time
+            if (it.control !== 'trackID=1' || gop.length) gopAppend(it.control, [it.packet]);
+            if (it.control === 'trackID=1') lastAudioTs = it.packet.readUInt32BE(4);
+            else lastVideoTs = it.packet.readUInt32BE(4);
+            batch.push({ control: it.control, packet: it.packet });
+        }
+        if (batch.length) {
+            for (const s of sessions) s.sendMixedBatch(batch);
+            // stamp the RTCP RTP↔wall mapping at actual send time (post-pacer)
+            if (lastVideoTs !== undefined) videoTrack.stamp(lastVideoTs);
+            if (lastAudioTs !== undefined) audioTrack.stamp(lastAudioTs);
+            // a client that PLAYed before any packet had been sent has no lip-sync
+            // mapping yet; now that one exists, send it the Sender Report it was owed.
+            if (pendingJoinSr) {
+                const vsr = videoTrack.senderReport();
+                if (vsr) {
+                    const asr = audioServed ? audioTrack.senderReport() : undefined;
+                    for (const s of sessions) { s.sendRtcp('trackID=0', vsr); if (asr) s.sendRtcp('trackID=1', asr); }
+                    pendingJoinSr = false;
+                }
+            }
+        }
+        scheduleDrain();
+    };
+
+    const scheduleDrain = () => {
+        if (drainTimer || !egress.length) return;
+        const now = Date.now();
+        if (!epoch) epoch = now - egress[0].due + EGRESS_DELAY_MS;
+        drainTimer = setTimeout(drain, Math.max(0, Math.min((epoch + egress[0].due) - now, 1000)));
+    };
+
     const handleVideoTag = (tsMs: number, d: Buffer) => {
         if (d.length < 5) return;
         const frameType = d[0] >> 4;
@@ -374,17 +471,14 @@ export async function startNativeServe(opts: {
         // Cache the freshest keyframe (decodable Annex-B AU) for instant snapshots,
         // regardless of whether anyone is streaming.
         if (frameType === 1) latestKeyframe = { ts: lastVideoRtp, annexb: toAnnexB(videoParams, nals) };
-        const ts = Math.max(0, tsMs + cts) * (VIDEO_CLOCK / 1000);
+        const mediaMs = Math.max(0, tsMs + cts);
+        const ts = mediaMs * (VIDEO_CLOCK / 1000);
         const pkts: Buffer[] = [];
         packetizeH264(videoTrack, videoParams, nals, ts, frameType === 1, pkts);
-        // maintain the GOP replay buffer (reset at each keyframe) even with no
-        // clients connected — the first client to connect is who needs it.
-        if (frameType === 1) { gop = []; gopBytes = 0; gopOverflow = false; }
-        gopAppend('trackID=0', pkts);
-        if (!sessions.size) return;
-        // one corked burst per session: a keyframe AU is hundreds of packets, and
-        // per-packet writes on a noDelay socket would be 2 syscalls each.
-        for (const s of sessions) s.sendRtpBatch('trackID=0', pkts);
+        // Hand off to the egress pacer, which schedules the send by media time
+        // and maintains the GOP replay buffer at send time (reset at the keyframe
+        // boundary). Runs even with no clients — the buffer the first joiner needs.
+        enqueue('trackID=0', pkts, mediaMs, frameType === 1);
     };
 
     const handleAudioTag = (tsMs: number, d: Buffer) => {
@@ -405,14 +499,22 @@ export async function startNativeServe(opts: {
             return;
         }
         if (pktType !== 1 || !audioParams || !audioServed) return;
-        const ts = Math.round(tsMs * audioParams.rate / 1000);
+        // Synthesize the AAC RTP clock at exactly 1024 samples/frame. The FLV ms
+        // timestamps quantize to ±1 sample, which makes a receiver's NetEq
+        // continually micro-time-stretch the audio; a monotonic +1024 clock is
+        // clean. Re-anchor to the camera clock only on a real discontinuity (a
+        // gap/reset of more than one frame), never the ±ms wobble.
+        const expected = Math.round(tsMs * audioParams.rate / 1000);
+        if (audioTs === undefined || Math.abs(expected - audioTs) > 1024) audioTs = expected;
+        const ts = audioTs;
+        audioTs += 1024;
         const pkt = packetizeAac(audioTrack, d.subarray(2), ts);
         if (!pkt) return;
-        // buffer audio for GOP replay only once video is present in the buffer
-        // (audio-before-the-keyframe is useless to a joining decoder).
-        if (gop.length) gopAppend('trackID=1', [pkt]);
-        if (!sessions.size) return;
-        for (const s of sessions) s.sendRtpBatch('trackID=1', [pkt]);
+        // Paced by the same egress schedule as video (so the fixed smoothing
+        // delay applies equally and A/V lip-sync is preserved). The pacer only
+        // buffers audio into the GOP once video is present — audio before the
+        // first keyframe is useless to a joining decoder.
+        enqueue('trackID=1', [pkt], tsMs, false);
     };
 
     const parser = new FlvTagParser((type, tsMs, data) => {
@@ -451,6 +553,8 @@ export async function startNativeServe(opts: {
         if (dead) return;
         dead = true;
         clearInterval(rtcpTimer);
+        clearTimeout(drainTimer);
+        egress = [];
         flv.removeListener('data', feed);
         try { server?.close(); } catch { }
         for (const s of sessions) s.close();
@@ -504,8 +608,8 @@ export async function startNativeServe(opts: {
             }
             const vsr = videoTrack.senderReport();
             const asr = audioServed ? audioTrack.senderReport() : undefined;
-            if (vsr) s.sendRtcp('trackID=0', vsr);
-            if (asr) s.sendRtcp('trackID=1', asr);
+            if (vsr) { s.sendRtcp('trackID=0', vsr); if (asr) s.sendRtcp('trackID=1', asr); }
+            else pendingJoinSr = true;   // cold start: no packet sent yet — the pacer sends the SR on first drain
         } catch (e) {
             dbg('native-rtsp gop replay failed:', (e as Error)?.message);
         }

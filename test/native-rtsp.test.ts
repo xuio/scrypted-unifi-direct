@@ -171,9 +171,12 @@ test('packetizeAac: AU header section is correct; oversize frames are dropped', 
 test('RtpTrack.senderReport maps RTP time to NTP and counts correctly', () => {
     const track = new RtpTrack(96);
     assert.equal(track.senderReport(), undefined, 'no SR before any packet');
-    const before = Date.now();
     track.build(90_000, true, undefined, randBytes(rng(6), 100));
     track.build(180_000, true, undefined, randBytes(rng(7), 50));
+    assert.equal(track.senderReport(), undefined, 'no SR until a packet is stamped as sent');
+    // the egress pacer stamps the RTP↔wall mapping when a packet actually goes out
+    const before = Date.now();
+    track.stamp(180_000);
     const sr = track.senderReport()!;
     assert.equal(sr.length, 28);
     assert.equal(sr[1], 200);                          // PT=SR
@@ -268,6 +271,90 @@ test('a client joining mid-GOP receives the buffered GOP instantly', async () =>
             assert.ok(Date.now() < deadline, `timed out; got ${payloads.length} NALs`);
             await new Promise(r => setTimeout(r, 10));
         }
+        client.destroy();
+    } finally {
+        serve.destroy();
+    }
+});
+
+test('the egress pacer spreads live frames over wall-clock by media timestamp', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({ flv, hasAudio: false });
+
+    // Establish the stream + a GOP so a joiner can PLAY, then hold the feed open.
+    const idr = Buffer.concat([Buffer.from([0x65]), randBytes(rng(21), 1500)]);
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),   // sequence header
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(idr))),     // keyframe @ ts 0
+    ]));
+
+    const serve = await servePromise;
+    try {
+        const port = parseInt(new URL(serve.url).port);
+        const client = net.connect(port, '127.0.0.1');
+        await once(client, 'connect');
+        const arrivals = new Map<number, number>();   // live-frame index → wall-clock ms of arrival
+        let frags: Buffer[] = [];
+        const parseInterleaved = (all: Buffer, from: number) => {
+            let off = from;
+            while (off + 4 <= all.length) {
+                const channel = all[off + 1];
+                const len = all.readUInt16BE(off + 2);
+                if (off + 4 + len > all.length) break;
+                const rtp = all.subarray(off + 4, off + 4 + len);
+                off += 4 + len;
+                if (channel !== 0) continue;   // ignore RTCP
+                const pl = rtp.subarray(12);
+                let nal: Buffer | undefined;
+                if ((pl[0] & 0x1f) === 28) {   // FU-A
+                    if (pl[1] & 0x80) frags = [Buffer.from([(pl[0] & 0x60) | (pl[1] & 0x1f)])];
+                    frags.push(pl.subarray(2));
+                    if (pl[1] & 0x40) nal = Buffer.concat(frags);
+                } else nal = pl;
+                // live P-frames are tagged [0x41, 0xA0, index, …]
+                if (nal && nal.length >= 3 && nal[0] === 0x41 && nal[1] === 0xA0 && !arrivals.has(nal[2]))
+                    arrivals.set(nal[2], Date.now());
+            }
+            return off;
+        };
+        let recv = Buffer.alloc(0), scanned = 0;
+        client.on('data', d => {
+            recv = Buffer.concat([recv, d]);
+            // skip the two RTSP text responses, then parse binary frames incrementally
+            if (scanned === 0) {
+                let e = 0, ends = 0;
+                while (ends < 2) { const i = recv.indexOf('\r\n\r\n', e); if (i < 0) return; e = i + 4; ends++; }
+                scanned = e;
+            }
+            scanned = parseInterleaved(recv, scanned);
+        });
+        client.write('SETUP rtsp://x/trackID=0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n');
+        client.write('PLAY rtsp://x/ RTSP/1.0\r\nCSeq: 2\r\n\r\n');
+        await new Promise(r => setTimeout(r, 100));   // let PLAY + GOP replay settle
+
+        // Write 12 live P-frames, media timestamps 40 ms apart, ALL synchronously
+        // (one tick). A non-paced egress would flush them to the client instantly;
+        // the pacer must instead release them ~40 ms apart on the wall clock.
+        const N = 12, STEP = 40, T0 = 200;
+        const writeWall = Date.now();
+        for (let i = 0; i < N; i++) {
+            const p = Buffer.concat([Buffer.from([0x41, 0xA0, i]), randBytes(rng(30 + i), 40)]);
+            flv.write(flvTag(9, T0 + i * STEP, avcTagData(2, 1, lenPrefixed(p))));
+        }
+
+        const deadline = Date.now() + 3000;
+        while (arrivals.size < N && Date.now() < deadline) await new Promise(r => setTimeout(r, 15));
+        assert.equal(arrivals.size, N, `expected all ${N} live frames, got ${arrivals.size}`);
+
+        const times = [...arrivals.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
+        const firstDelay = times[0] - writeWall;
+        const span = times[N - 1] - times[0];
+        // Paced, not burst: the first frame waits out the smoothing delay, and the
+        // batch is spread across roughly its (N-1)*STEP media span — an unpaced
+        // egress would deliver the whole synchronous write in a few ms.
+        assert.ok(firstDelay > 120, `first live frame arrived too soon (${firstDelay}ms) — not paced`);
+        assert.ok(span > 200, `live frames arrived in a ${span}ms burst — not spread by timestamp`);
         client.destroy();
     } finally {
         serve.destroy();

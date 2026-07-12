@@ -5,7 +5,10 @@ import type { ControllerEmulator } from './controller-emulator';
 import { PushPortRegistry, PushRoute } from './push-registry';
 import { RtspServeHandle } from './rtsp-session';
 import { startNativeServe } from './native-rtsp';
+import { ByteQueue } from './byte-queue';
 import { dbg } from './debug';
+
+export { ByteQueue };   // re-exported for the detrailer test's existing import path
 
 type Logger = { log: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
@@ -18,57 +21,6 @@ const SETTLE_MS = 1500;
 
 const MAX_TAG = 4 * 1024 * 1024;   // sanity bound on a single FLV tag's data size
 const MAX_TRAILER_SCAN = 1 << 16;  // how far to look for the next tag past a trailer
-
-/**
- * FIFO byte accumulator backed by one reusable buffer. The detrailer must hold a
- * whole tag (up to a ~500 KB keyframe) until the NEXT tag is confirmed, and a
- * `Buffer.concat([buf, chunk])` accumulator re-copies everything pending on every
- * socket read — O(tag² / chunk) per keyframe, continuously, even with no viewers.
- * Here appends land at the write offset and the front is consumed by moving a
- * read offset; data moves only when the buffer wraps (compact) or grows.
- * view() returns a window into the shared store — it is only valid until the
- * next push(), so consumers must copy anything they keep (they already do).
- * Exported only for tests.
- */
-export class ByteQueue {
-    private store = Buffer.allocUnsafe(1 << 20);
-    private head = 0;
-    private tail = 0;
-
-    get length() { return this.tail - this.head; }
-
-    push(chunk: Buffer) {
-        if (this.tail + chunk.length > this.store.length) {
-            const len = this.length;
-            if (len + chunk.length > this.store.length) {
-                let size = this.store.length * 2;
-                while (size < len + chunk.length) size *= 2;
-                const ns = Buffer.allocUnsafe(size);
-                this.store.copy(ns, 0, this.head, this.tail);
-                this.store = ns;
-            } else {
-                this.store.copy(this.store, 0, this.head, this.tail);   // compact in place
-            }
-            this.head = 0;
-            this.tail = len;
-        }
-        chunk.copy(this.store, this.tail);
-        this.tail += chunk.length;
-    }
-
-    /** Window over the buffered bytes; valid only until the next push(). */
-    view(): Buffer { return this.store.subarray(this.head, this.tail); }
-
-    consume(n: number) {
-        this.head = Math.min(this.head + n, this.tail);
-        if (this.head === this.tail) {
-            this.head = this.tail = 0;
-            // shed an oversized store once drained, so one giant tag can't pin
-            // memory for the stream's lifetime.
-            if (this.store.length > (4 << 20)) this.store = Buffer.allocUnsafe(1 << 20);
-        }
-    }
-}
 
 /**
  * Convert UniFi "extendedFlv" to standard FLV for ffmpeg.

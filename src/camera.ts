@@ -656,8 +656,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         if (live) {
             const clients = [...this.streams.values()].reduce((n, s) => n + s.clients, 0);
             const kf = this.streams.get(this.channel.track)?.latestKeyframe();
+            // age of the most recently cached keyframe (sampled 0..GOP), NOT the
+            // configured interval — don't read this as the keyframe period.
             const kfAge = kf ? `${((Date.now() - kf.ts) / 1000).toFixed(1)}s` : 'none';
-            streamState += ` (${clients} client${clients === 1 ? '' : 's'}, keyframe ${kfAge})`;
+            streamState += ` (${clients} client${clients === 1 ? '' : 's'}, keyframe age ${kfAge})`;
         }
         if (this.streamRebuilds)
             streamState += ` · rebuilds=${this.streamRebuilds} (last ${Math.round((Date.now() - this.lastRebuild!) / 60000)}m ago)`;
