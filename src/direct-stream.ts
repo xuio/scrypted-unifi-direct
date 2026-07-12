@@ -2,6 +2,7 @@ import dns from 'dns';
 import net from 'net';
 import { PassThrough } from 'stream';
 import type { ControllerEmulator } from './controller-emulator';
+import { PushPortRegistry, PushRoute } from './push-registry';
 import { RtspServeHandle } from './rtsp-session';
 import { startNativeServe } from './native-rtsp';
 import { dbg } from './debug';
@@ -158,7 +159,8 @@ function isFlvHeader(d: Buffer) {
  * whole DirectStream is torn down and the provider rebuilds a clean one.
  */
 export class DirectStream {
-    private cameraServer: net.Server | undefined;
+    private route: PushRoute | undefined;
+    private registered = false;
     private cameraSocket: net.Socket | undefined;
     private cameraSockets = new Set<net.Socket>();   // all inbound conns, for teardown
     private flv: PassThrough | undefined;
@@ -178,45 +180,48 @@ export class DirectStream {
         private codec: string,
         private selfIp: string,
         private cameraPort: number,
-        /** The camera's configured host — only its pushes are accepted (see
-         *  resolveAllowedSources). Empty disables the check. */
+        /** The camera's configured host — the registry routes only its pushes
+         *  here (see resolveAllowedSources). Empty registers fail-open. */
         private expectedHost: string,
         private logger: Logger,
+        private registry: PushPortRegistry,
     ) { }
 
-    // IPs allowed to push FLV to our port; undefined = accept any (no host
-    // configured, or the hostname was unresolvable — fail open, see below).
-    private allowedSources: Set<string> | undefined;
+    private resolveTimer: any;
 
     /**
-     * Cameras keep pushing to their previously commanded destination across
-     * plugin restarts (the serializer config persists on-camera, reconnecting
-     * every second). Port assignments can shift across restarts, so without a
-     * sender check camera A's stray push could be adopted as camera B's stream —
-     * serving the wrong camera's video silently. Resolve the configured host to
-     * the set of acceptable source IPs up front.
+     * The port identifies the TRACK; the source IP identifies the CAMERA (the
+     * push ports are shared across cameras). Resolve the configured host to the
+     * set of source IPs the registry should route to this stream. NEVER fail
+     * open — on a shared port that could adopt another camera's stray push
+     * (wrong camera's video). If the hostname is unresolvable right now (e.g. a
+     * DNS blip at boot), keep retrying in the background, mutating the same set
+     * the registry dispatches against; the camera's own push retries every
+     * second, so the stream recovers as soon as DNS does.
      */
-    private async resolveAllowedSources(): Promise<void> {
-        if (!this.expectedHost) return;
-        const allowed = new Set<string>([this.expectedHost]);
-        if (!net.isIP(this.expectedHost)) {
+    private async resolveAllowedSources(): Promise<Set<string>> {
+        const allowed = new Set<string>();
+        if (!this.expectedHost) return allowed;   // no host configured → match nothing
+        allowed.add(this.expectedHost);           // IP-literal config matches directly
+        if (net.isIP(this.expectedHost)) return allowed;
+        const tryResolve = async () => {
             try {
                 const addrs = await dns.promises.lookup(this.expectedHost, { all: true });
                 for (const a of addrs) allowed.add(a.address);
-            } catch {
-                // hostname unresolvable right now: fail open rather than reject
-                // the camera's push and break the stream entirely.
-                dbg('DS', this.mac, 'cannot resolve', this.expectedHost, '— source check disabled');
-                return;
-            }
+                return true;
+            } catch { return false; }
+        };
+        if (!await tryResolve()) {
+            dbg('DS', this.mac, 'cannot resolve', this.expectedHost, '— retrying in background');
+            this.resolveTimer = setInterval(async () => {
+                if (this.stopped) { clearInterval(this.resolveTimer); return; }
+                if (await tryResolve()) {
+                    clearInterval(this.resolveTimer);
+                    dbg('DS', this.mac, 'late-resolved', this.expectedHost);
+                }
+            }, 5000);
         }
-        this.allowedSources = allowed;
-    }
-
-    private isAllowedSource(sock: net.Socket): boolean {
-        if (!this.allowedSources) return true;
-        const ip = (sock.remoteAddress || '').replace(/^::ffff:/, '');
-        return this.allowedSources.has(ip);
+        return allowed;
     }
 
     get alive() {
@@ -226,7 +231,7 @@ export class DirectStream {
         // pipeline is what left viewers stuck receiving zero RTP.
         return !this.stopped
             && !!this.serve && this.serve.alive
-            && !!this.cameraServer?.listening
+            && this.registered
             && !!this.cameraSocket && !this.cameraSocket.destroyed;
     }
 
@@ -240,9 +245,10 @@ export class DirectStream {
     latestKeyframe() { return this.serve?.latestKeyframe(); }
 
     async start(): Promise<void> {
-        await this.resolveAllowedSources();
-        this.cameraServer = net.createServer(s => this.onCamera(s));
-        await listen(this.cameraServer, this.cameraPort, '0.0.0.0');
+        const ips = await this.resolveAllowedSources();
+        this.route = { ips, onConnection: s => this.onCamera(s) };
+        await this.registry.register(this.cameraPort, this.route);
+        this.registered = true;
         this.commandCameraStream();
 
         // Resolve once a stable connection has been promoted and its RTSP serve is
@@ -271,11 +277,6 @@ export class DirectStream {
     }
 
     private onCamera(sock: net.Socket) {
-        if (!this.isAllowedSource(sock)) {
-            dbg('DS', this.mac, 'rejecting push from unexpected source', sock.remoteAddress || '?');
-            sock.destroy();
-            return;
-        }
         this.cameraSockets.add(sock);
         sock.on('close', () => this.cameraSockets.delete(sock));
         if (this.stopped) { sock.destroy(); return; }   // race: connection after stop
@@ -352,6 +353,7 @@ export class DirectStream {
     stop() {
         this.stopped = true;
         clearTimeout(this.settleTimer);
+        clearInterval(this.resolveTimer);
         try { this.emulator.stopStream(this.mac, this.channel); } catch { }
         this.streaming = false;
         for (const s of this.cameraSockets) { try { s.destroy(); } catch { } }   // incl. non-adopted strays
@@ -359,18 +361,9 @@ export class DirectStream {
         this.cameraSocket = undefined;
         this.serve?.destroy();
         try { this.flv?.destroy(); } catch { }
-        this.cameraServer?.close();
+        if (this.route) { this.registry.unregister(this.cameraPort, this.route); this.route = undefined; }
+        this.registered = false;
         // unblock a start() still waiting on us.
         this.onServeFail?.(new Error('stopped'));
     }
-}
-
-function listen(server: net.Server, port: number, host: string): Promise<number> {
-    return new Promise((resolve, reject) => {
-        server.once('error', reject);
-        server.listen(port, host, () => {
-            const addr = server.address();
-            resolve(typeof addr === 'object' && addr ? addr.port : port);
-        });
-    });
 }

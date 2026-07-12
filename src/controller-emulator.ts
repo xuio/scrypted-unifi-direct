@@ -241,22 +241,38 @@ export class ControllerEmulator extends EventEmitter {
         } catch (e) { dbg('enableDetections failed', s.mac, (e as Error)?.message); }
     }
 
+    // Tracks we currently command each camera to push (mac -> track -> dest).
+    // Needed so starting/quiescing one track never overwrites another that is
+    // actively streaming: ChangeVideoSettings payloads are partials merged by
+    // key, so we simply OMIT live tracks from any command that isn't theirs.
+    private activeStreams = new Map<string, Map<string, string>>();
+
+    private activeTracks(mac: string): Map<string, string> {
+        let m = this.activeStreams.get(mac);
+        if (!m) { m = new Map(); this.activeStreams.set(mac, m); }
+        return m;
+    }
+
     /**
-     * On adoption, stop the low-res substreams (video2/video3) that a previous
-     * NVR may have left pushing to an external host at a different audio rate.
-     * That contention forces the camera's shared audio encoder into a
-     * scalable/SSR AAC that decodes as garbage on the stream we consume. Pointing
+     * On adoption, stop any substreams a previous NVR may have left pushing to
+     * an external host at a different audio rate. That rate mismatch forces the
+     * camera's shared audio encoder into a scalable/SSR AAC that decodes as
+     * garbage on the streams we consume (verified: SAME-rate concurrent
+     * serializers are clean — the failure is specifically mixed rates). Pointing
      * them at /dev/null with audio off up front means the encoder comes up clean
-     * (no per-camera reboot needed) and the camera stops wasting uplink to a dead
-     * relay. The active stream re-asserts this in startStream.
+     * (no per-camera reboot needed) and the camera stops wasting uplink to a
+     * dead relay. Tracks WE are actively streaming are left untouched.
      */
     private quiesceSubstreams(s: CameraSession) {
         try {
+            const active = this.activeTracks(s.mac);
             const video: Record<string, any> = {};
             for (const t of ['video2', 'video3'])
-                video[t] = { avSerializer: { type: 'extendedFlv', parameters: { withOpus: false }, destinations: ['file:///dev/null'] } };
+                if (!active.has(t))
+                    video[t] = { avSerializer: { type: 'extendedFlv', parameters: { withOpus: false }, destinations: ['file:///dev/null'] } };
+            if (!Object.keys(video).length) return;
             s.send('ChangeVideoSettings', { video }, true);
-            dbg('emulator quiesceSubstreams', s.mac);
+            dbg('emulator quiesceSubstreams', s.mac, Object.keys(video).join(','));
         } catch (e) { dbg('quiesceSubstreams failed', s.mac, (e as Error)?.message); }
     }
 
@@ -299,18 +315,23 @@ export class ControllerEmulator extends EventEmitter {
     /** Is a camera currently connected to the emulator? */
     hasSession(mac: string): boolean { return this.sessions.has(mac); }
 
-    /** Command a camera to push the given channel's video to destHost:destPort. */
+    /**
+     * Command a camera to push the given channel's video to destHost:destPort.
+     * Concurrent tracks are supported (verified on-hardware: the camera
+     * sustains simultaneous per-track pushes with clean audio), with ONE hard
+     * rule inherited from the shared audio encoder: every serializer that
+     * carries audio must request the SAME sample rate — mixed rates force the
+     * encoder into scalable/SSR AAC that decodes as garbage. All our active
+     * tracks use AUDIO_SAMPLE_RATE, and leftover serializers from a previous
+     * NVR (unknown rates) are pointed at /dev/null with audio off. Tracks we
+     * are actively streaming are OMITTED from the payload (partials merge by
+     * key), so starting one track never restarts another.
+     */
     startStream(mac: string, channel: string, destHost: string, destPort: number, videoCodec = 'h264') {
         const s = this.sessions.get(mac);
         if (!s) throw new Error(`camera ${mac} is not connected to the emulator`);
+        const active = this.activeTracks(mac);
         const streamName = crypto.randomBytes(8).toString('hex');
-        // The camera has ONE shared audio encoder. If the substreams we don't
-        // consume (video2/video3) have leftover serializers requesting a different
-        // audio rate, the encoder switches to a scalable/multi-config AAC (SSR,
-        // multi-channel) that decodes as garbage on our video1 stream. The HTTP
-        // settings API can't clear those substream params, but this management
-        // command can — so we explicitly disable audio on every other track,
-        // leaving video1 as the sole audio consumer → clean AAC-LC mono.
         const video: Record<string, any> = {
             [channel]: {
                 avSerializer: {
@@ -322,12 +343,7 @@ export class ControllerEmulator extends EventEmitter {
             },
         };
         for (const other of ['video1', 'video2', 'video3']) {
-            if (other === channel) continue;
-            // Point the unused substreams at /dev/null AND disable their audio.
-            // Several cameras still actively push a substream to the old NVR
-            // (e.g. tcp://<old-nvr-host>:7550) at a different audio rate, which
-            // is what forces the shared encoder into scalable/SSR AAC. Only the
-            // controller (us) can override an active serializer, so we stop them.
+            if (other === channel || active.has(other)) continue;
             video[other] = {
                 avSerializer: {
                     type: 'extendedFlv',
@@ -336,17 +352,20 @@ export class ControllerEmulator extends EventEmitter {
                 },
             };
         }
+        active.set(channel, `tcp://${destHost}:${destPort}`);
         s.send('ChangeVideoSettings', { video }, true);
-        dbg('emulator startStream', mac, channel, `-> ${destHost}:${destPort}`, videoCodec, 'streamName', streamName);
+        dbg('emulator startStream', mac, channel, `-> ${destHost}:${destPort}`, videoCodec, 'streamName', streamName,
+            'active', [...active.keys()].join(','));
         this.log(`commanded ${mac} ${channel} -> ${destHost}:${destPort} (${videoCodec})`);
     }
 
     /** Tell a camera to stop pushing the given channel. */
     stopStream(mac: string, channel: string) {
+        this.activeStreams.get(mac)?.delete(channel);
         const s = this.sessions.get(mac);
         if (!s) return;
         s.send('ChangeVideoSettings', {
-            video: { [channel]: { avSerializer: { type: 'extendedFlv', destinations: ['file:///dev/null'] } } },
+            video: { [channel]: { avSerializer: { type: 'extendedFlv', parameters: { withOpus: false }, destinations: ['file:///dev/null'] } } },
         }, true);
     }
 }

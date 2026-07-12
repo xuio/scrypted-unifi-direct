@@ -13,72 +13,31 @@ import sdk, {
 } from '@scrypted/sdk';
 import { CameraApiClient } from './client';
 import { ControllerEmulator } from './controller-emulator';
+import { PushPortRegistry } from './push-registry';
 import { UnifiCamera } from './camera';
 import { dbg, setDbgEnabled } from './debug';
 
 const { deviceManager } = sdk;
 
 const MGMT_PORT = 7442;
-const CAMERA_PORT_BASE = 17550; // firewall range 17550-17560
-const CAMERA_PORT_COUNT = 11;   // ports 17550..17560
 
 export class UnifiDirectProvider extends ScryptedDeviceBase implements DeviceProvider, DeviceCreator, Settings {
     private cameras = new Map<string, UnifiCamera>();
     public emulator: ControllerEmulator | undefined;
+    // Shared listeners for the fixed per-track push ports (17550-17552): the
+    // port identifies the track, the source IP the camera — no allocation.
+    readonly pushRegistry = new PushPortRegistry();
     private pairTimer: any;
     private healthTimer: any;
     private initAttempt = 0;
-    private cameraPorts = new Map<string, number>();   // nativeId -> assigned push port
 
     private initError: string | undefined;
 
     constructor(nativeId?: string) {
         super(nativeId);
-        this.loadCameraPorts();
+        this.storage.removeItem('cameraPorts');   // legacy per-camera port map
         setDbgEnabled(this.storage.getItem('fileLog') !== 'false');
         this.init();
-    }
-
-    // Port assignments are persisted: cameras keep pushing FLV to their last
-    // commanded port across plugin restarts (the serializer config lives on the
-    // camera), so a restart must hand every camera the same port it had — a
-    // shifted assignment would deliver camera A's stray push to camera B's
-    // ingest. (DirectStream also validates the sender address as a second line
-    // of defense.)
-    private loadCameraPorts() {
-        try {
-            const raw = JSON.parse(this.storage.getItem('cameraPorts') || '{}');
-            const used = new Set<number>();
-            for (const [k, v] of Object.entries(raw)) {
-                if (typeof v === 'number' && v >= CAMERA_PORT_BASE && v < CAMERA_PORT_BASE + CAMERA_PORT_COUNT && !used.has(v)) {
-                    this.cameraPorts.set(k, v);
-                    used.add(v);
-                }
-            }
-        } catch { }
-    }
-
-    private saveCameraPorts() {
-        this.storage.setItem('cameraPorts', JSON.stringify(Object.fromEntries(this.cameraPorts)));
-    }
-
-    /** Assign a distinct, stable push port per camera from the firewalled range. */
-    allocateCameraPort(nativeId: string, host: string): number {
-        const existing = this.cameraPorts.get(nativeId);
-        if (existing) return existing;
-        const used = new Set(this.cameraPorts.values());
-        const preferred = CAMERA_PORT_BASE + ((parseInt(host.split('.').pop() || '0') || 0) % CAMERA_PORT_COUNT);
-        let port = used.has(preferred) ? -1 : preferred;
-        if (port < 0) {
-            for (let i = 0; i < CAMERA_PORT_COUNT; i++) {
-                const p = CAMERA_PORT_BASE + i;
-                if (!used.has(p)) { port = p; break; }
-            }
-        }
-        if (port < 0) throw new Error(`no free camera push port in ${CAMERA_PORT_BASE}-${CAMERA_PORT_BASE + CAMERA_PORT_COUNT - 1}`);
-        this.cameraPorts.set(nativeId, port);
-        this.saveCameraPorts();
-        return port;
     }
 
     private async init() {
@@ -167,7 +126,7 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
             {
                 key: 'scryptedAddress',
                 title: 'Scrypted address (reachable from camera)',
-                description: 'IP of this Scrypted server as the cameras reach it. Cameras are paired to this address and stream directly here. Requires firewall access on TCP 7442 and 17550-17560.',
+                description: 'IP of this Scrypted server as the cameras reach it. Cameras are paired to this address and stream directly here. Requires firewall access on TCP 7442 and 17550-17552.',
                 placeholder: '192.168.1.100',
                 value: this.storage.getItem('scryptedAddress') || '',
                 type: 'string',
@@ -246,6 +205,5 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
         const key = nativeId || '';
         const cam = this.cameras.get(key);
         if (cam) { await cam.release(); this.cameras.delete(key); }
-        if (this.cameraPorts.delete(key)) this.saveCameraPorts();
     }
 }

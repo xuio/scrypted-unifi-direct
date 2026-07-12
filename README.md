@@ -25,6 +25,7 @@ and the settings surface adapts accordingly.
 | **On-camera detections** — person / vehicle / animal / package + motion, as `ObjectDetector` / `MotionSensor` events | ✅ |
 | **Detection zones** — smart-detect, exclude, line-crossing, loiter, motion, and privacy masks, applied over the management channel | ✅ |
 | **Camera settings** — image (ISP), video (bitrate/fps/keyframe), audio, overlay (OSD), status light, name — with per-model capability gating | ✅ |
+| **Secondary stream** — optional concurrent 720p/360p stream per camera; select it in the HomeKit plugin so HomeKit **copies** the video instead of transcoding the 4MP stream down to its 1080p cap | ✅ |
 | **HomeKit** — works through Scrypted's HomeKit plugin (snapshots are sized per request so previews render correctly) | ✅ |
 
 ## How it works
@@ -55,8 +56,9 @@ API of their own.
 
 - **Network path camera → Scrypted host.** Each camera must be able to open TCP
   connections back to the Scrypted host on the management port (`7442`) and the
-  video push ports (`17550`–`17560`). If your cameras are on a separate VLAN,
-  allow that inbound traffic to the Scrypted host.
+  video push ports (`17550`–`17552`, one fixed port per stream track, shared by
+  all cameras). If your cameras are on a separate VLAN, allow that inbound
+  traffic to the Scrypted host.
 - Camera **local credentials** (username/password for the camera's own
   `/api/1.1/` API).
 - The camera must be **un-adopted** from any other Protect controller (or you must
@@ -80,6 +82,10 @@ API of their own.
 - **Detections** — choose which object classes the camera detects; leave empty to
   disable smart detection. Detection events surface via Scrypted's `ObjectDetector`
   and `MotionSensor`.
+- **Secondary stream** — set *Secondary Stream* to `medium` (1280×720) and select
+  that stream in the HomeKit plugin for live/recording: HomeKit copies it directly
+  (no transcode), while Scrypted NVR keeps recording the full-resolution stream.
+  Costs one extra continuous camera push (~1.5 Mbps).
 - **Zones** — add named zones; each gets a polygon editor plus only the fields its
   type uses. Applied live over the management channel and re-asserted on reconnect.
 - **Settings** — only controls the camera model actually supports are shown.

@@ -42,6 +42,12 @@ export const CHANNELS: Record<string, { track: string; label: string; w: number;
     low: { track: 'video3', label: 'Low', w: 640, h: 360 },
 };
 
+/** Fixed per-track push ports, shared across cameras: the port identifies the
+ *  TRACK and the source IP identifies the CAMERA (routed by PushPortRegistry),
+ *  so nothing needs to be allocated or persisted. Verified on-hardware that a
+ *  camera sustains concurrent per-track pushes. */
+const TRACK_PORTS: Record<string, number> = { video1: 17550, video2: 17551, video3: 17552 };
+
 export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings, MotionSensor, ObjectDetector {
     private client: CameraApiClient | undefined;
     private streams = new Map<string, DirectStream>();
@@ -148,17 +154,32 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     }
 
     get mac() { return this.storage.getItem('mac') || ''; }
-    private get channelKey() { return this.storage.getItem('channel') || 'high'; }
-    private get channel() { return CHANNELS[this.channelKey] || CHANNELS.high; }
+    // validated at the source so a corrupt/legacy stored value degrades to
+    // 'high' everywhere instead of throwing on CHANNELS[...] lookups.
+    private get channelKey() {
+        const v = this.storage.getItem('channel') || 'high';
+        return CHANNELS[v] ? v : 'high';
+    }
+    private get channel() { return CHANNELS[this.channelKey]; }
     // H.264 only — the muxer passes the stream through untranscoded and HomeKit
     // requires H.264, so we never request H.265 from the camera (see the codec
     // setting). Hardcoded so a stale stored value can't command an h265 push.
     private get codec() { return 'h264'; }
-    // distinct per-camera push port in the firewalled range, assigned by the
-    // provider so two cameras can never collide (an IP-octet hash alone would
-    // clash for hosts 11 apart → EADDRINUSE and a dead stream).
-    private get cameraPort() {
-        return this.provider.allocateCameraPort(this.nativeId || '', this.storage.getItem('host') || '');
+
+    /** Optional second advertised channel (e.g. 720p for HomeKit copy-without-
+     *  transcode). 'none' disables it. */
+    private get substream(): string {
+        const v = this.storage.getItem('substream') || 'none';
+        return CHANNELS[v] ? v : 'none';
+    }
+
+    /** The channels offered to consumers: the configured channel, plus the
+     *  substream when set. Each streams on its own fixed per-track port, so
+     *  they can run concurrently. */
+    private advertisedChannels(): string[] {
+        const out = [this.channelKey];
+        if (this.substream !== 'none' && this.substream !== this.channelKey) out.push(this.substream);
+        return out;
     }
 
     // ---- pairing ----
@@ -490,24 +511,22 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
-        // Offer only the configured channel: the camera pushes one track to one
-        // destination port, so advertising multiple would collide on the port.
-        return [this.mediaStreamOptions(this.channelKey)];
+        return this.advertisedChannels().map(k => this.mediaStreamOptions(k));
     }
 
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
         const emulator = this.provider.emulator;
         if (!emulator) throw new Error('controller emulator not started');
 
-        // All channels share the camera's single push port and only the configured
-        // channel is ever advertised — honoring a stale requested id (a consumer
-        // that cached a previous channel setting) would EADDRINUSE against the
-        // live stream on every retry, forever. Coerce every request to the
-        // configured channel.
-        if (options?.id && options.id !== this.channelKey)
-            dbg('getVideoStream', this.mac, 'coercing requested channel', options.id, '->', this.channelKey);
-        const channelKey = this.channelKey;
-        const chan = this.channel;
+        // Serve any ADVERTISED channel (each runs on its own fixed per-track
+        // port, so they can't collide). A stale requested id — a consumer that
+        // cached a since-removed channel setting — is coerced to the configured
+        // channel rather than honored.
+        const advertised = this.advertisedChannels();
+        const channelKey = options?.id && advertised.includes(options.id) ? options.id : this.channelKey;
+        if (options?.id && options.id !== channelKey)
+            dbg('getVideoStream', this.mac, 'coercing requested channel', options.id, '->', channelKey);
+        const chan = CHANNELS[channelKey] || CHANNELS.high;
         dbg('getVideoStream', this.mac, 'channel', channelKey, 'online', emulator.isOnline(this.mac));
 
         await this.ensurePaired();
@@ -545,14 +564,16 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             creating = (async () => {
                 const gen = this.streamGen;
                 const selfIp = this.provider.getPushAddress()!;
-                const s = new DirectStream(emulator, this.mac, track, this.codec, selfIp, this.cameraPort,
-                    this.storage.getItem('host') || '', this.console);
+                const s = new DirectStream(emulator, this.mac, track, this.codec, selfIp, TRACK_PORTS[track],
+                    this.storage.getItem('host') || '', this.console, this.provider.pushRegistry);
                 await s.start();
-                // If the channel/codec changed (or we were released) while this was
-                // building, discard it — otherwise it would re-insert a live stream
-                // for the old track and hold the single per-camera push port,
-                // deadlocking the new channel with EADDRINUSE.
-                if (gen !== this.streamGen) { s.stop(); throw new Error('stream creation superseded'); }
+                // If the channel/codec changed, the track was un-advertised (the
+                // substream setting changed mid-creation), or we were released
+                // while this was building, discard it — otherwise it would insert
+                // a live stream nobody will ever consume or reap, leaving the
+                // camera pushing that track forever.
+                const stillWanted = this.advertisedChannels().some(k => CHANNELS[k].track === track);
+                if (gen !== this.streamGen || !stillWanted) { s.stop(); throw new Error('stream creation superseded'); }
                 this.streams.set(track, s);
                 return s;
             })();
@@ -664,6 +685,11 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 key: 'channel', title: 'Stream Channel', group: 'Stream', value: this.channelKey, type: 'string',
                 choices: ['high', 'medium', 'low'],
                 description: 'high=video1 2688x1512 (full res), medium=video2 720p, low=video3 360p.',
+            },
+            {
+                key: 'substream', title: 'Secondary Stream', group: 'Stream', value: this.substream, type: 'string',
+                choices: ['none', 'medium', 'low'],
+                description: 'Advertise an additional lower-resolution stream (its own concurrent camera push). Set to "medium" (1280×720) and select it in the HomeKit plugin for live/recording so HomeKit can COPY the video instead of transcoding the full-resolution stream down to its 1080p cap.',
             },
             {
                 key: 'codec', title: 'Video Codec', group: 'Stream', value: 'h264', type: 'string',
@@ -790,6 +816,22 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             return;
         }
         switch (key) {
+            case 'substream': {
+                const v = String(value);
+                this.storage.setItem('substream', (v === 'medium' || v === 'low') ? v : 'none');
+                // Stop any stream whose channel is no longer advertised — its
+                // stop() also commands the camera-side push to /dev/null.
+                const tracks = new Set(this.advertisedChannels().map(k => CHANNELS[k].track));
+                for (const [track, s] of [...this.streams]) {
+                    if (tracks.has(track)) continue;
+                    try { s.stop(); } catch { }
+                    this.streams.delete(track);
+                }
+                // the advertised stream set changed — tell consumers that cache
+                // getVideoStreamOptions (prebuffer) to refresh promptly.
+                await this.onDeviceEvent(ScryptedInterface.VideoCamera, undefined);
+                return;
+            }
             case 'rebootCamera':
                 this.console.log(`[unifi-direct] rebooting camera ${this.mac}`);
                 await this.getClient().reboot();
