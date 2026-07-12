@@ -58,6 +58,7 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
                             cam.importCameraZones()
                                 .then(() => cam.applyZones())
                                 .then(() => cam.applyAudioTuning())
+                                .then(() => cam.applySsh())
                                 .catch(e => dbg('online import/apply failed', mac, (e as Error)?.message));
                         }
                 } catch (e) { dbg('online handler failed', mac, (e as Error)?.message); }

@@ -267,6 +267,16 @@ export function buildMgmtSetting(field: FieldDef, value: any, track: string): { 
     return undefined;
 }
 
+/**
+ * SSH service toggle → the exact avclient command Protect's cameras.enableSsh /
+ * cameras.disableSsh handlers send (service.js: `StartService` / `StopService`
+ * with `{service: 'ssh'}`). Credentials are not part of the command — the camera
+ * keeps the SSH login it received at adoption, this only starts/stops the daemon.
+ */
+export function buildSshCommand(enabled: boolean): { fn: string; payload: any } {
+    return { fn: enabled ? 'StartService' : 'StopService', payload: { service: 'ssh' } };
+}
+
 /** Deep-merge b into a (objects only). */
 export function deepMerge(a: any, b: any): any {
     for (const k of Object.keys(b)) {

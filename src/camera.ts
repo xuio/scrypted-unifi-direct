@@ -18,7 +18,7 @@ import sdk, {
 import { CameraApiClient } from './client';
 import { ControllerEmulator } from './controller-emulator';
 import { DirectStream } from './direct-stream';
-import { PARITY_FIELDS, readField, writeField, toSetting, isFieldSupported, buildMgmtSetting } from './camera-settings';
+import { PARITY_FIELDS, readField, writeField, toSetting, isFieldSupported, buildMgmtSetting, buildSshCommand } from './camera-settings';
 import {
     ZoneDef, ZoneType, ZONE_TYPES, ZONE_TYPE_LABEL_TO_KEY, ZONE_DEFAULTS,
     OBJECT_TYPES, LINE_DIRECTIONS, buildZonePayloads, polyCoord,
@@ -177,6 +177,9 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     /** Opt-in camera audio DSP profile (e.g. 'nature' for bioacoustics). Empty /
      *  'default' means leave the camera's own setting untouched. */
     private get audioTuning(): string { return this.storage.getItem('audio.tuning') || ''; }
+
+    /** SSH toggle state: '' (never set — don't command), 'true' or 'false'. */
+    private get sshEnabled(): string { return this.storage.getItem('sshEnabled') || ''; }
 
     /** The channels offered to consumers: the configured channel, plus the
      *  substream when set. Each streams on its own fixed per-track port, so
@@ -446,6 +449,25 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             emulator.sendCommand(this.mac, 'AudioAgentChangeTuning', { tuningStyle: style }, true);
             dbg('applyAudioTuning', this.mac, style);
         } catch (e) { dbg('applyAudioTuning failed', this.mac, (e as Error)?.message); }
+    }
+
+    /** Assert the camera's SSH daemon state over the mgmt channel (the same
+     *  StartService/StopService {service:'ssh'} command Protect sends on every
+     *  camera connect). Runs when the user flips the toggle and on reconnect,
+     *  since the camera does not reliably keep the service running across
+     *  reboots. No-op until the user has ever set the toggle, so we never stomp
+     *  a state we don't own. Login uses the SSH credentials already on the
+     *  camera from adoption; no reboot or re-adoption involved. */
+    applySsh(): void {
+        const want = this.sshEnabled;
+        if (!want) return;
+        const emulator = this.provider.emulator;
+        if (!emulator || !this.mac || !emulator.hasSession(this.mac)) return;
+        const cmd = buildSshCommand(want === 'true');
+        try {
+            emulator.sendCommand(this.mac, cmd.fn, cmd.payload, true);
+            dbg('applySsh', this.mac, want);
+        } catch (e) { dbg('applySsh failed', this.mac, (e as Error)?.message); }
     }
 
     private async doApplyZones(): Promise<void> {
@@ -721,6 +743,11 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             { key: 'username', title: 'Username', group: 'Connection', value: this.storage.getItem('username') || '', type: 'string' },
             { key: 'password', title: 'Password', group: 'Connection', value: this.storage.getItem('password') || '', type: 'password' },
             {
+                key: 'sshEnabled', title: 'Enable SSH', group: 'Connection', type: 'boolean',
+                value: this.sshEnabled === 'true',
+                description: 'Start the camera\'s SSH service (the same StartService {service:\'ssh\'} mgmt command Protect sends). Login uses the SSH credentials already stored on the camera from adoption. Re-asserted on every reconnect; no reboot involved.',
+            },
+            {
                 key: 'rebootCamera', title: 'Reboot Camera', group: 'Connection', type: 'button',
                 description: 'Reboot the camera via its local API. The camera reconnects and re-adopts automatically (~1 minute).',
             },
@@ -920,6 +947,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             case 'audio.tuning':
                 this.storage.setItem('audio.tuning', String(value));
                 this.applyAudioTuning();
+                return;
+            case 'sshEnabled':
+                this.storage.setItem('sshEnabled', String(value === true || value === 'true'));
+                this.applySsh();
                 return;
             case 'detectObjectTypes': {
                 const types = (Array.isArray(value) ? value : (value != null && value !== '' ? [value] : [])).map(String);

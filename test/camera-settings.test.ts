@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
     PARITY_FIELDS, coerceValue, readField, writeField, buildMgmtSetting,
     isFieldSupported, irLedToCamera, getByPath, setByPath, deepMerge,
+    buildSshCommand,
 } from '../src/camera-settings';
 
 const field = (key: string) => PARITY_FIELDS.find(f => f.key === key)!;
@@ -58,6 +59,11 @@ test('buildMgmtSetting routes fields to the right Change*Settings command', () =
     assert.equal(osd.fn, 'ChangeOsdSettings');
     assert.deepEqual(osd.payload._1, { enableDate: 1 });
     assert.deepEqual(osd.payload._4, { enableDate: 1 });
+});
+
+test('buildSshCommand maps the toggle to StartService/StopService {service: ssh}', () => {
+    assert.deepEqual(buildSshCommand(true), { fn: 'StartService', payload: { service: 'ssh' } });
+    assert.deepEqual(buildSshCommand(false), { fn: 'StopService', payload: { service: 'ssh' } });
 });
 
 test('HTTP-only fields never map to a mgmt command', () => {
