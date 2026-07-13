@@ -241,8 +241,14 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     async getPictureOptions(): Promise<ResponsePictureOptions[]> {
         const c = this.channel;
         return this.fullResSnapshots
-            ? [{ id: this.channelKey, name: `Stream keyframe ${c.w}x${c.h}` }]
-            : [{ id: 'snap', name: 'Snapshot (/snap.jpeg)' }];
+            ? [{
+                id: this.channelKey,
+                name: `Stream keyframe ${c.w}x${c.h}`,
+                picture: { width: c.w, height: c.h },
+                canResize: true,
+                staleDuration: this.snapshotCacheTtlMs,
+            }]
+            : [{ id: 'snap', name: 'Snapshot (/snap.jpeg)', canResize: true, staleDuration: this.snapshotCacheTtlMs }];
     }
 
     // ---- Zones (native UniFi zone config over the mgmt channel) ----
@@ -542,20 +548,24 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     }
 
     // ---- VideoCamera (direct live) ----
-    private mediaStreamOptions(channelKey: string): ResponseMediaStreamOptions {
+    private mediaStreamOptions(channelKey: string, hasAudio = true): ResponseMediaStreamOptions {
         const c = CHANNELS[channelKey] || CHANNELS.high;
         return {
             id: channelKey,
             name: `${c.label} ${c.w}x${c.h} (direct)`,
             container: 'rtsp',
             tool: 'scrypted',
+            source: 'local',
             video: { codec: this.codec, width: c.w, height: c.h },
-            audio: { codec: 'aac' },
+            ...(hasAudio ? { audio: { codec: 'aac' } } : {}),
         };
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
-        return this.advertisedChannels().map(k => this.mediaStreamOptions(k));
+        return this.advertisedChannels().map(k => {
+            const live = this.streams.get(CHANNELS[k].track);
+            return this.mediaStreamOptions(k, live ? live.hasAudio : true);
+        });
     }
 
     async getVideoStream(options?: RequestMediaStreamOptions): Promise<MediaObject> {
@@ -593,7 +603,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             url,
             container: 'rtsp',
             inputArguments: ['-rtsp_transport', 'tcp', '-i', url],
-            mediaStreamOptions: this.mediaStreamOptions(channelKey),
+            mediaStreamOptions: this.mediaStreamOptions(channelKey, stream.hasAudio),
         };
         return mediaManager.createFFmpegMediaObject(ffmpegInput, { sourceId: this.id });
     }
@@ -764,7 +774,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             {
                 key: 'audioRtsp', title: 'Audio RTSP endpoint', group: 'Stream', type: 'boolean',
                 value: this.audioEndpointEnabled,
-                description: 'Serve this camera\'s microphone as a stable audio-only RTSP URL (~16 kbps AAC) for external consumers like BirdNET-Go. Unauthenticated, LAN-scoped — same trust model as the camera push ports.',
+                description: 'Serve this camera\'s native AAC microphone track as a stable audio-only RTSP URL for external consumers like BirdNET-Go. Supports both legacy profiles and patched mono 32 kHz / 128 kbps AAC. Unauthenticated, LAN-scoped — same trust model as the camera push ports.',
             },
             ...(this.audioEndpointEnabled ? [{
                 key: 'audioRtspUrl', title: 'Audio RTSP URL', group: 'Stream', readonly: true, type: 'string',
@@ -793,7 +803,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 key: 'audio.tuning', title: 'Audio tuning', group: 'Audio', type: 'string',
                 value: this.audioTuning || 'default',
                 choices: ['default', ...cameraFeatures.audioStyle],
-                description: 'Camera audio DSP profile (a processing stage before the encoder). "nature" leaves the sound open — measured ~+5 dB more content across the 1–6 kHz bird band vs "noiseReduced", which suppresses that range for speech — so "nature" is better for bioacoustics / BirdNET. "default" sends no command (the camera keeps its current profile) and does NOT undo a previously-applied style until the camera reboots. Audio stays mono 16 kHz / 8 kHz regardless.',
+                description: 'Camera audio DSP profile (a processing stage before the encoder). "nature" leaves the sound open — measured ~+5 dB more content across the 1–6 kHz bird band vs "noiseReduced", which suppresses that range for speech — so "nature" is better for bioacoustics / BirdNET. "default" sends no command (the camera keeps its current profile) and does NOT undo a previously-applied style until the camera reboots. Sample rate, channel count, and bitrate come from the separate native AAC encoder settings when the firmware exposes them.',
             });
         }
         const parity: Setting[] = [];
@@ -802,7 +812,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 // Only expose settings the camera model actually supports (capability
                 // flag + presence in its settings), so this adapts to other models.
                 if (!isFieldSupported(f, cameraSettings, cameraFeatures, this.channel.track)) continue;
-                try { parity.push(toSetting(f, readField(f, cameraSettings, this.channel.track))); } catch { }
+                try { parity.push(toSetting(f, readField(f, cameraSettings, this.channel.track), cameraFeatures)); } catch { }
             }
         }
         return [...base, ...this.getDetectionSettings(cameraFeatures), ...this.getZoneSettings(), ...parity];
@@ -902,6 +912,14 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             } else {
                 await this.getClient().putSettings(writeField(field, value, this.channel.track));
             }
+            // Audio presence and encoder configuration are part of RTSP SDP/RTP
+            // framing and cannot be changed in-place. Rebuild every advertised
+            // track so the camera's one shared encoder is restarted once and all
+            // consumers re-DESCRIBE the new AAC contract together.
+            if (field.key === 'audio.enabled' || field.key === 'audio.sampleRate' || field.key === 'audio.bitrate') {
+                this.resetStreams();
+                await this.onDeviceEvent(ScryptedInterface.VideoCamera, undefined);
+            }
             return;
         }
         switch (key) {
@@ -996,6 +1014,8 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         }
         this.storage.setItem(key, String(value));
         if (key === 'host' || key === 'username' || key === 'password') {
+            // stopStream must run while the old MAC is still available.
+            this.resetStreams();
             this.client?.destroy();
             this.client = undefined;
             // Point at a different camera → drop everything cached from the old one
@@ -1005,6 +1025,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             // The mask fingerprint describes what was applied to the OLD camera;
             // keeping it would skip pushing masks to the new one forever.
             this.storage.removeItem('privacyMasksFp');
+            // A host change may identify a completely different camera. Force
+            // the next pairing pass to read its real MAC instead of accepting an
+            // old emulator session as proof that this device is already online.
+            if (key === 'host') this.storage.removeItem('mac');
         }
         if (key === 'channel' || key === 'codec') { this.resetStreams(); this.snapshots.reset(); }
     }

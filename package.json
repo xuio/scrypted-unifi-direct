@@ -49,6 +49,9 @@
       "DeviceProvider",
       "DeviceCreator",
       "Settings"
+    ],
+    "pluginDependencies": [
+      "@scrypted/prebuffer-mixin"
     ]
   }
 }

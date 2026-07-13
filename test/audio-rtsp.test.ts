@@ -96,7 +96,7 @@ test('serves audio-only SDP and relays tapped packets after PLAY', async t => {
 
 test('unknown camera path gets 404; resolver failure gets 503', async t => {
     const server = await makeServer(t, async key => {
-        if (key === 'DEAD') throw new Error('camera offline');
+        if (key === 'DEADBEEF0000') throw new Error('camera offline');
         return undefined;
     });
     const c = makeClient(server.boundPort!);
@@ -108,8 +108,20 @@ test('unknown camera path gets 404; resolver failure gets 503', async t => {
     const c2 = makeClient(server.boundPort!);
     await once(c2.sock, 'connect');
     t.after(() => c2.sock.destroy());
-    const failed = await c2.request('DESCRIBE rtsp://127.0.0.1/dead RTSP/1.0\r\nCSeq: 1\r\n\r\n');
+    const failed = await c2.request('DESCRIBE rtsp://127.0.0.1/DEADBEEF0000 RTSP/1.0\r\nCSeq: 1\r\n\r\n');
     assert.match(failed, /RTSP\/1\.0 503 Service Unavailable/);
+});
+
+test('audio endpoint requires one exact MAC path segment', async t => {
+    let resolved = 0;
+    const server = await makeServer(t, async () => { resolved++; return undefined; });
+    const c = makeClient(server.boundPort!);
+    await once(c.sock, 'connect');
+    t.after(() => c.sock.destroy());
+
+    const malformed = await c.request('DESCRIBE rtsp://127.0.0.1/AABBCCDDEEFFad RTSP/1.0\r\nCSeq: 1\r\n\r\n');
+    assert.match(malformed, /404 Not Found/);
+    assert.equal(resolved, 0, 'malformed suffix was folded into a camera key');
 });
 
 test('muxer generation death closes the session; client can reconnect', async t => {

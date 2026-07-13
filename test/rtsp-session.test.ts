@@ -11,10 +11,12 @@ const SDP: SdpInfo = {
 
 /** Spin up a server wrapping each connection in an RtspSession; return a
  *  connected client socket plus a request/response helper. */
-async function setup() {
+async function setup(onPlay?: (session: RtspSession) => void) {
     const sessions = new Set<RtspSession>();
     const server = net.createServer(socket => {
-        const s: RtspSession = new RtspSession(socket, SDP, 'rtsp://127.0.0.1/test', () => sessions.delete(s));
+        const s: RtspSession = new RtspSession(
+            socket, SDP, 'rtsp://127.0.0.1/test', () => sessions.delete(s), onPlay,
+        );
         sessions.add(s);
     });
     await new Promise<void>(res => server.listen(0, '127.0.0.1', res));
@@ -112,6 +114,75 @@ test('interleaved client frames and unknown methods do not desync the parser', a
         // malformed request line (no URL) must not kill the session
         const res2 = await request('TEARDOWN\r\nCSeq: 3\r\n\r\n');
         assert.match(res2, /CSeq: 3/);
+    } finally {
+        await teardown();
+    }
+});
+
+test('request bodies are consumed according to Content-Length before the next request', async () => {
+    const { sessions, request, teardown } = await setup();
+    try {
+        const keepalive = await request(
+            'GET_PARAMETER rtsp://127.0.0.1/test RTSP/1.0\r\n' +
+            'CSeq: 1\r\nContent-Length: 4\r\n\r\nping');
+        assert.match(keepalive, /CSeq: 1/);
+
+        // Without body framing, "ping" prefixes TEARDOWN and turns it into an
+        // unknown method that receives 200 but leaves the session alive.
+        const tornDown = await request('TEARDOWN rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 2\r\n\r\n');
+        assert.match(tornDown, /CSeq: 2/);
+        for (let i = 0; i < 20 && sessions.size; i++) await new Promise(r => setTimeout(r, 5));
+        assert.equal(sessions.size, 0, 'TEARDOWN after a request body must close the session');
+    } finally {
+        await teardown();
+    }
+});
+
+test('SETUP rejects UDP transport instead of claiming an unusable TCP channel', async () => {
+    const { request, teardown } = await setup();
+    try {
+        const res = await request(
+            'SETUP rtsp://127.0.0.1/test/trackID=0 RTSP/1.0\r\n' +
+            'CSeq: 1\r\nTransport: RTP/AVP;unicast;client_port=5000-5001\r\n\r\n');
+        assert.match(res, /RTSP\/1\.0 461 Unsupported Transport/);
+    } finally {
+        await teardown();
+    }
+});
+
+test('PAUSE stops RTP until a subsequent PLAY', async () => {
+    const { sessions, request, teardown, readBuf } = await setup();
+    try {
+        await request('SETUP rtsp://127.0.0.1/test/trackID=0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n');
+        await request('PLAY rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 2\r\n\r\n');
+        const session = [...sessions][0];
+        assert.equal(session.playing, true);
+
+        const paused = await request('PAUSE rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 3\r\n\r\n');
+        assert.match(paused, /200 OK/);
+        assert.equal(session.playing, false);
+        session.sendRtp('trackID=0', Buffer.from([1, 2, 3]));
+        await new Promise(r => setTimeout(r, 30));
+        assert.equal(readBuf().length, 0, 'RTP leaked while the RTSP session was paused');
+
+        await request('PLAY rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 4\r\n\r\n');
+        assert.equal(session.playing, true);
+    } finally {
+        await teardown();
+    }
+});
+
+test('PLAY after PAUSE resumes without invoking the join bootstrap twice', async () => {
+    let joins = 0;
+    const { request, teardown } = await setup(() => joins++);
+    try {
+        await request('SETUP rtsp://127.0.0.1/test/trackID=0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n');
+        await request('PLAY rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 2\r\n\r\n');
+        assert.equal(joins, 1, 'initial PLAY must invoke the GOP join bootstrap');
+
+        await request('PAUSE rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 3\r\n\r\n');
+        await request('PLAY rtsp://127.0.0.1/test RTSP/1.0\r\nCSeq: 4\r\n\r\n');
+        assert.equal(joins, 1, 'resume must not replay historical RTP sequence numbers');
     } finally {
         await teardown();
     }

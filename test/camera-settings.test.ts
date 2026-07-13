@@ -4,6 +4,7 @@ import {
     PARITY_FIELDS, coerceValue, readField, writeField, buildMgmtSetting,
     isFieldSupported, irLedToCamera, getByPath, setByPath, deepMerge,
     buildSshCommand,
+    toSetting,
 } from '../src/camera-settings';
 
 const field = (key: string) => PARITY_FIELDS.find(f => f.key === key)!;
@@ -50,6 +51,38 @@ test('capability gating: WDR hidden on HDR models, speaker needs the flag', () =
     assert.equal(isFieldSupported(field('soundled.speakerVolume'), settings, { adjustableSpeakerVolume: true }, 'video1'), true);
 });
 
+test('AAC encoder options are gated by mic capability and reported fields', () => {
+    const settings = { av: { audio: { sampleRate: 32000, bitRate: 128000, channels: 1, type: 'aac' } } };
+    for (const key of ['audio.sampleRate', 'audio.bitrate', 'audio.channels', 'audio.codec']) {
+        assert.equal(isFieldSupported(field(key), settings, {}, 'video1'), false, `${key} shown without mic capability`);
+        assert.equal(isFieldSupported(field(key), settings, { mic: true }, 'video1'), true, `${key} hidden despite reported support`);
+    }
+    for (const key of ['audio.sampleRate', 'audio.bitrate', 'audio.channels'])
+        assert.equal(isFieldSupported(field(key), settings, { mic: true, audioCodecs: ['opus'] }, 'video1'), false,
+            `${key} shown despite an authoritative codec list without AAC`);
+    assert.equal(isFieldSupported(field('audio.sampleRate'), { av: { audio: { bitRate: 128000 } } }, { mic: true }, 'video1'), false,
+        'a guessed sample-rate field must not be exposed on older firmware');
+});
+
+test('AAC encoder writes preserve legacy and patched numeric profiles', () => {
+    assert.deepEqual(writeField(field('audio.sampleRate'), 16000, 'video1'), { av: { audio: { sampleRate: 16000 } } });
+    assert.deepEqual(writeField(field('audio.sampleRate'), 32000, 'video1'), { av: { audio: { sampleRate: 32000 } } });
+    assert.deepEqual(writeField(field('audio.bitrate'), 128000, 'video1'), { av: { audio: { bitRate: 128000 } } });
+});
+
+test('AAC sample-rate choices follow the camera capability list', () => {
+    const f = field('audio.sampleRate');
+    const selectable = toSetting(f, 32000, { audioSampleRates: [32000, 16000, 32000, 'bad'] });
+    assert.equal(selectable.type, 'string');
+    assert.deepEqual(selectable.choices, ['16000', '32000']);
+    assert.equal(selectable.value, '32000');
+
+    const legacy = toSetting(f, 16000, {});
+    assert.equal(legacy.type, 'integer');
+    assert.equal(legacy.choices, undefined);
+    assert.equal(legacy.value, 16000, 'older path-present firmware keeps a numeric setting');
+});
+
 test('buildMgmtSetting routes fields to the right Change*Settings command', () => {
     assert.deepEqual(buildMgmtSetting(field('isp.brightness'), 70, 'video1'),
         { fn: 'ChangeIspSettings', payload: { brightness: 70 } });
@@ -67,7 +100,7 @@ test('buildSshCommand maps the toggle to StartService/StopService {service: ssh}
 });
 
 test('HTTP-only fields never map to a mgmt command', () => {
-    for (const key of ['audio.volume', 'httpd.anonSnapshot', 'video.fps', 'video.bitrate', 'isp.aeTargetPercent'])
+    for (const key of ['audio.volume', 'audio.sampleRate', 'audio.bitrate', 'httpd.anonSnapshot', 'video.fps', 'video.bitrate', 'isp.aeTargetPercent'])
         assert.equal(buildMgmtSetting(field(key), 1, 'video1'), undefined, key);
 });
 

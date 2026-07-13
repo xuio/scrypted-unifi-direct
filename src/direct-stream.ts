@@ -13,11 +13,12 @@ export { ByteQueue };   // re-exported for the detrailer test's existing import 
 type Logger = { log: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
 // The camera cycles a few short-lived TCP connections while a push is being set
-// up before settling on the one that carries the continuous stream. Only after a
-// connection has stayed open this long (still delivering FLV) do we start serving,
-// so a transient setup connection can never poison the pipeline. Prebuffer keeps
-// streams warm, so this one-time settle delay is invisible to viewers.
-const SETTLE_MS = 1500;
+// up before settling on the one that carries the continuous stream. Live telemetry
+// found doomed candidates lasting as long as 624 ms, while healthy high and medium
+// feeds publish their codec configuration within 0-5 ms after promotion. 800 ms
+// retains a useful safety margin without making the first on-demand viewer pay the
+// old 1.5 second delay.
+const SETTLE_MS = 800;
 
 const MAX_TAG = 4 * 1024 * 1024;   // sanity bound on a single FLV tag's data size
 const MAX_TRAILER_SCAN = 1 << 16;  // how far to look for the next tag past a trailer
@@ -92,9 +93,13 @@ export function makeDetrailer() {
     };
 }
 
-function isFlvHeader(d: Buffer) {
-    return d.length >= 3 && d[0] === 0x46 && d[1] === 0x4c && d[2] === 0x56; // "FLV"
-}
+const FLV_MAGIC = Buffer.from('FLV');
+const PROBE_TIMEOUT_MS = 5000;
+const CANDIDATE_IDLE_MS = 500;
+// ASC normally arrives beside avcC and was already buffered on every observed
+// high/medium stream. A short grace still covers split chunks/event-loop jitter,
+// while a camera with its microphone disabled no longer delays video by 3 seconds.
+const AUDIO_GRACE_MS = 250;
 
 /**
  * One live direct stream for a camera+channel.
@@ -117,6 +122,7 @@ export class DirectStream {
     private cameraSockets = new Set<net.Socket>();   // all inbound conns, for teardown
     private flv: PassThrough | undefined;
     private detrailer: ((c: Buffer) => Buffer) | undefined;
+    private lastCandidateDataAt = 0;
     private settleTimer: any;
     private serve: RtspServeHandle | undefined;
     private serveStarted = false;
@@ -199,17 +205,30 @@ export class DirectStream {
     /** The underlying RTSP serve (audio-tap access for the audio endpoint). */
     get serveHandle() { return this.serve; }
 
-    async start(): Promise<void> {
-        const ips = await this.resolveAllowedSources();
-        this.route = { ips, onConnection: s => this.onCamera(s) };
-        await this.registry.register(this.cameraPort, this.route);
-        this.registered = true;
-        this.commandCameraStream();
+    /** True only when AAC was actually discovered and published in this
+     *  generation's SDP. Cameras with a disabled microphone serve video-only. */
+    get hasAudio() { return !!this.serve?.audioParams(); }
 
-        // Resolve once a stable connection has been promoted and its RTSP serve is
-        // up; reject if that doesn't happen in time (no camera push, or endless
-        // connection churn) so the provider can retry from scratch.
+    async start(): Promise<void> {
         try {
+            const ips = await this.resolveAllowedSources();
+            if (this.stopped) throw new Error('stopped');
+            const route: PushRoute = { ips, onConnection: s => this.onCamera(s) };
+            this.route = route;
+            await this.registry.register(this.cameraPort, route);
+            // stop() may have run while the shared listener was being created.
+            // Never resurrect the route or command a camera after that race.
+            if (this.stopped) {
+                this.registry.unregister(this.cameraPort, route);
+                if (this.route === route) this.route = undefined;
+                throw new Error('stopped');
+            }
+            this.registered = true;
+            this.commandCameraStream();
+
+            // Resolve once a stable connection has been promoted and its RTSP serve is
+            // up; reject if that doesn't happen in time (no camera push, or endless
+            // connection churn) so the provider can retry from scratch.
             await new Promise<void>((resolve, reject) => {
                 let timer: any = setTimeout(() => reject(new Error('timed out waiting for a stable camera connection')), 25000);
                 // clear both callbacks once settled so a later stop() can't invoke
@@ -227,29 +246,100 @@ export class DirectStream {
 
     private commandCameraStream() {
         if (this.streaming) return;
-        try { this.emulator.startStream(this.mac, this.channel, this.selfIp, this.cameraPort, this.codec); this.streaming = true; }
-        catch (e) { dbg('DS', this.mac, 'startStream failed', (e as Error)?.message); }
+        // Propagate a lost-management-session race immediately. Swallowing it
+        // leaves start() waiting the full 25 seconds for a push that was never
+        // commanded, while Scrypted could already be retrying a clean creation.
+        this.emulator.startStream(this.mac, this.channel, this.selfIp, this.cameraPort, this.codec);
+        this.streaming = true;
     }
 
     private onCamera(sock: net.Socket) {
-        this.cameraSockets.add(sock);
-        sock.on('close', () => this.cameraSockets.delete(sock));
+        try { sock.setKeepAlive(true, 10_000); } catch { }
         if (this.stopped) { sock.destroy(); return; }   // race: connection after stop
-        sock.on('data', d => {
-            if (!this.cameraSocket) {
-                // Adopt the connection that actually carries the FLV stream (starts
-                // with the "FLV" signature); ignore probe/keepalive connections.
-                if (!isFlvHeader(d)) return;
+        this.cameraSockets.add(sock);
+
+        // TCP may split the three-byte FLV signature at either byte boundary.
+        // Keep a tiny per-socket prefix until it is a definite match/mismatch;
+        // forwarding the reconstructed buffer also ensures no header byte is lost.
+        let probe = Buffer.alloc(0);
+        let classified = false;
+        const probeTimer = setTimeout(() => {
+            if (!classified && !sock.destroyed) {
+                dbg('DS', this.mac, 'stream probe timed out from', sock.remoteAddress || '?');
+                sock.destroy();
+            }
+        }, PROBE_TIMEOUT_MS);
+
+        sock.on('data', chunk => {
+            let d = chunk;
+            if (!classified) {
+                probe = probe.length ? Buffer.concat([probe, d]) : Buffer.from(d);
+                const checked = Math.min(probe.length, FLV_MAGIC.length);
+                if (!probe.subarray(0, checked).equals(FLV_MAGIC.subarray(0, checked))) {
+                    classified = true;
+                    clearTimeout(probeTimer);
+                    dbg('DS', this.mac, 'rejecting non-FLV stream connection from', sock.remoteAddress || '?');
+                    sock.destroy();
+                    return;
+                }
+                if (probe.length < FLV_MAGIC.length) return;
+                classified = true;
+                clearTimeout(probeTimer);
+                d = probe;
+                probe = Buffer.alloc(0);
+
+                if (this.cameraSocket && this.cameraSocket !== sock) {
+                    if (this.serveStarted) {
+                        // An established generation owns the track. Reject a stale
+                        // retry rather than retaining a duplicate full-rate push.
+                        dbg('DS', this.mac, 'rejecting duplicate FLV connection');
+                        sock.destroy();
+                        return;
+                    }
+                    // Setup connections can overlap briefly. Prefer the newest
+                    // validated FLV connection; otherwise its one-time header is
+                    // consumed while the older candidate later dies, losing both.
+                    this.discardCandidate('superseded by newer FLV connection');
+                }
                 this.adopt(sock);
             }
             if (this.cameraSocket !== sock || !this.flv || !this.detrailer) return;
+            this.lastCandidateDataAt = Date.now();
             const clean = this.detrailer(d);
-            // write unconditionally (dropping a chunk when writable momentarily
-            // reports false would corrupt the FLV mid-tag for the readers).
-            if (clean.length && !this.flv.destroyed) this.flv.write(clean);
+            if (clean.length && !this.flv.destroyed) {
+                // write(false) accepted the bytes; pause ingress until the parser
+                // drains them. Dropping would corrupt FLV, while ignoring pressure
+                // lets latency/memory grow without bound on an overloaded host.
+                if (!this.flv.write(clean)) {
+                    sock.pause();
+                    this.flv.once('drain', () => {
+                        if (!this.stopped && this.cameraSocket === sock && !sock.destroyed) sock.resume();
+                    });
+                }
+            }
         });
         sock.on('error', e => dbg('DS', this.mac, 'camera stream error', (e as Error)?.message));
-        sock.on('close', () => this.onSocketClose(sock));
+        sock.on('close', () => {
+            clearTimeout(probeTimer);
+            this.cameraSockets.delete(sock);
+            this.onSocketClose(sock);
+        });
+    }
+
+    /** Dispose only the unpromoted candidate, leaving the DirectStream registered
+     *  so the camera's next retry can be adopted. */
+    private discardCandidate(reason: string) {
+        if (this.serveStarted) return;
+        const oldSocket = this.cameraSocket;
+        const oldFlv = this.flv;
+        this.cameraSocket = undefined;
+        this.flv = undefined;
+        this.detrailer = undefined;
+        this.lastCandidateDataAt = 0;
+        clearTimeout(this.settleTimer);
+        dbg('DS', this.mac, reason);
+        try { oldFlv?.destroy(); } catch { }
+        try { oldSocket?.destroy(); } catch { }
     }
 
     /** Lock onto a candidate FLV connection with a fresh pipeline and settle timer. */
@@ -257,6 +347,7 @@ export class DirectStream {
         this.cameraSocket = sock;
         this.flv = new PassThrough({ highWaterMark: 8 * 1024 * 1024 });
         this.detrailer = makeDetrailer();
+        this.lastCandidateDataAt = Date.now();
         dbg('DS', this.mac, 'candidate connection from', sock.remoteAddress || '?');
         clearTimeout(this.settleTimer);
         this.settleTimer = setTimeout(() => this.promote(), SETTLE_MS);
@@ -265,14 +356,28 @@ export class DirectStream {
     /** The candidate connection stayed up — start serving. */
     private async promote() {
         if (this.stopped || this.serveStarted || !this.cameraSocket || !this.flv) return;
+        if (Date.now() - this.lastCandidateDataAt > CANDIDATE_IDLE_MS) {
+            // "Open" is not the same as healthy: a half-open setup socket can
+            // deliver its FLV header and then go silent forever. Reject it here
+            // so the camera retries instead of spending the SDP timeout on a
+            // candidate that was already dead during the settle window.
+            this.discardCandidate('candidate went idle while settling');
+            return;
+        }
         this.serveStarted = true;
         dbg('DS', this.mac, 'connection stable; starting native rtsp serve');
         // if this settled connection later collapses, mark dead for rebuild.
-        this.flv.once('close', () => { if (this.serveStarted && !this.stopped) this.stopped = true; });
+        this.flv.once('close', () => {
+            if (this.serveStarted && !this.stopped) {
+                dbg('DS', this.mac, 'native media pipeline closed; cleaning up generation');
+                this.stop();
+            }
+        });
         try {
             const serve = await startNativeServe({
                 flv: this.flv,
                 hasAudio: true,
+                audioGraceMs: AUDIO_GRACE_MS,
                 logger: this.logger,
             });
             // stop() may have run during the (multi-second) SDP wait; it destroyed a
@@ -289,6 +394,7 @@ export class DirectStream {
     private onSocketClose(sock: net.Socket) {
         if (this.cameraSocket !== sock) return;
         this.cameraSocket = undefined;
+        this.lastCandidateDataAt = 0;
         clearTimeout(this.settleTimer);
         if (this.serveStarted) {
             // an established stream lost its feed → tear down for a clean rebuild.

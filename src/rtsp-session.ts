@@ -53,7 +53,11 @@ export type SdpResolver = (requestUrl: string) => Promise<SdpInfo | undefined>;
 
 const RTSP_MAGIC = 0x24; // '$'
 /** Drop an RTSP client whose unsent TCP backlog exceeds this (slow/stalled reader). */
-const MAX_RTP_BACKLOG = 16 * 1024 * 1024;
+// GOP history itself is capped at 16 MiB, but TCP interleaving adds four bytes to
+// every packet. Leave enough headroom for a legitimate near-cap instant replay so
+// a fast local client is not mistaken for a stalled reader while the socket is
+// corked. The cap still bounds a genuinely slow client's memory use.
+const MAX_RTP_BACKLOG = 20 * 1024 * 1024;
 /** A legitimate RTSP request is well under 1 KB, but a partial interleaved
  *  frame can legitimately hold up to 4+65535 bytes unconsumed — the cap must
  *  clear that, so 128 KB. Bounds memory and the repeated indexOf scan against
@@ -72,6 +76,10 @@ export class RtspSession {
     private session = randomBytes(4).toString('hex');
     /** control (trackID=N) -> interleaved RTP channel the client requested. */
     private channels = new Map<string, number>();
+    /** Preserve RTSP response ordering when a resolver-backed DESCRIBE is slow
+     *  and the client pipelines another request behind it. */
+    private requestChain: Promise<void> = Promise.resolve();
+    private hasPlayed = false;
     playing = false;
 
     sent = 0;
@@ -113,12 +121,28 @@ export class RtspSession {
             const end = this.buf.indexOf('\r\n\r\n');
             if (end < 0) return;
             const reqText = this.buf.subarray(0, end).toString('utf8');
-            this.buf = this.buf.subarray(end + 4);
-            this.handleRequest(reqText);
+            const lengthHeader = reqText.match(/^content-length\s*:\s*([^\r\n]+)$/im)?.[1]?.trim();
+            const bodyLength = lengthHeader === undefined ? 0 : Number(lengthHeader);
+            if (!Number.isSafeInteger(bodyLength) || bodyLength < 0 || bodyLength > MAX_REQUEST_BUF) {
+                dbg('invalid rtsp content-length, dropping session', this.id, lengthHeader);
+                this.close();
+                return;
+            }
+            const requestLength = end + 4 + bodyLength;
+            if (this.buf.length < requestLength) return;
+            // The methods implemented here do not use request bodies, but they
+            // must still be consumed so the next request starts on a boundary.
+            this.buf = this.buf.subarray(requestLength);
+            this.requestChain = this.requestChain
+                .then(() => this.handleRequest(reqText))
+                .catch(e => {
+                    dbg('rtsp request failed', this.id, (e as Error)?.message);
+                    this.close();
+                });
         }
     }
 
-    private handleRequest(text: string) {
+    private async handleRequest(text: string) {
         const lines = text.split('\r\n');
         // default url to '' so a malformed request line (no URL) can't throw from
         // inside the socket 'data' handler — that would be an uncaught exception.
@@ -133,13 +157,17 @@ export class RtspSession {
 
         switch ((method || '').toUpperCase()) {
             case 'OPTIONS':
-                this.reply(cseq, ['Public: OPTIONS, DESCRIBE, SETUP, PLAY, TEARDOWN, GET_PARAMETER']);
+                this.reply(cseq, ['Public: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER']);
                 break;
             case 'DESCRIBE':
-                this.describe(url, cseq);   // async when the SDP is resolver-based
+                await this.describe(url, cseq);
                 break;
             case 'SETUP': {
                 const transport = headers['transport'] || '';
+                if (!/(?:^|[;,\s])RTP\/AVP\/TCP(?:[;,\s]|$)/i.test(transport)) {
+                    this.reply(cseq, [], undefined, '461 Unsupported Transport');
+                    break;
+                }
                 const m = transport.match(/interleaved=(\d+)-(\d+)/);
                 const rtpChannel = m ? parseInt(m[1]) : this.channels.size * 2;
                 const control = (url.match(/trackID=\d+/) || [])[0] || `trackID=${this.channels.size}`;
@@ -155,7 +183,17 @@ export class RtspSession {
                 // frame can jump ahead of the response and desync the client.
                 this.reply(cseq, [`Session: ${this.session}`, 'Range: npt=0.000-']);
                 this.playing = true;
-                this.onPlay?.(this);
+                // GOP replay is a join bootstrap, not a seek operation. Replaying
+                // it again after PAUSE would inject already-consumed RTP sequence
+                // numbers into the same session and make decoders jump backward.
+                if (!this.hasPlayed) {
+                    this.hasPlayed = true;
+                    this.onPlay?.(this);
+                }
+                break;
+            case 'PAUSE':
+                this.playing = false;
+                this.reply(cseq, [`Session: ${this.session}`]);
                 break;
             case 'GET_PARAMETER':
                 this.reply(cseq, [`Session: ${this.session}`]);
@@ -165,7 +203,7 @@ export class RtspSession {
                 this.close();
                 break;
             default:
-                this.reply(cseq, []); // 200 OK for anything else (PAUSE, etc.)
+                this.reply(cseq, ['Allow: OPTIONS, DESCRIBE, SETUP, PLAY, PAUSE, TEARDOWN, GET_PARAMETER'], undefined, '405 Method Not Allowed');
                 break;
         }
     }

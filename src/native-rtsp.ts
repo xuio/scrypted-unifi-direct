@@ -1,5 +1,6 @@
 import net, { AddressInfo } from 'net';
 import { randomBytes } from 'crypto';
+import { performance } from 'perf_hooks';
 import type { Readable } from 'stream';
 import { RtspSession, RtspServeHandle, SdpInfo } from './rtsp-session';
 import { ByteQueue } from './byte-queue';
@@ -79,18 +80,27 @@ export interface VideoParams {
 export function parseAvcC(d: Buffer): VideoParams | undefined {
     try {
         if (d.length < 7 || d[0] !== 1) return;
-        const nalLen = (d[4] & 0x03) + 1;
+        const lengthSizeMinusOne = d[4] & 0x03;
+        // ISO/IEC 14496-15 reserves lengthSizeMinusOne=2 (three-byte lengths).
+        // Accept only the interoperable 1/2/4-byte forms.
+        if (lengthSizeMinusOne === 2) return;
+        const nalLen = lengthSizeMinusOne + 1;
         const sps: Buffer[] = [];
         const pps: Buffer[] = [];
         let off = 5;
         const nSps = d[off++] & 0x1f;
         for (let i = 0; i < nSps; i++) {
+            if (off + 2 > d.length) return;
             const l = d.readUInt16BE(off); off += 2;
+            if (!l || off + l > d.length) return;
             sps.push(Buffer.from(d.subarray(off, off + l))); off += l;
         }
+        if (off >= d.length) return;
         const nPps = d[off++];
         for (let i = 0; i < nPps; i++) {
+            if (off + 2 > d.length) return;
             const l = d.readUInt16BE(off); off += 2;
+            if (!l || off + l > d.length) return;
             pps.push(Buffer.from(d.subarray(off, off + l))); off += l;
         }
         if (!sps.length || !sps[0].length || !pps.length || !pps[0].length) return;
@@ -101,6 +111,9 @@ export function parseAvcC(d: Buffer): VideoParams | undefined {
 export interface AudioParams {
     rate: number;
     channels: number;
+    /** Samples represented by one AAC access unit (normally 1024; AAC-LC may
+     *  explicitly signal the 960-sample variant in GASpecificConfig). */
+    frameSamples?: number;
     /** Raw AudioSpecificConfig bytes (for the SDP `config=` fmtp param). */
     config: Buffer;
 }
@@ -114,19 +127,35 @@ export function parseAsc(d: Buffer): AudioParams | undefined {
         const freqIdx = ((d[0] & 0x07) << 1) | (d[1] >> 7);
         let rate: number | undefined;
         let channels: number;
+        let frameLengthFlag: number;
         if (freqIdx === 15) {
             if (d.length < 5) return;
             rate = ((d[1] & 0x7f) << 17) | (d[2] << 9) | (d[3] << 1) | (d[4] >> 7);
             channels = (d[4] >> 3) & 0x0f;
+            frameLengthFlag = (d[4] >> 2) & 1;
         } else {
             rate = AAC_RATES[freqIdx];
             channels = (d[1] >> 3) & 0x0f;
+            frameLengthFlag = (d[1] >> 2) & 1;
         }
         // channels=0 means "defined in a PCE" — bail to video-only rather than
         // advertise a wrong SDP (audio is best-effort).
         if (!rate || !channels) return;
-        return { rate, channels, config: Buffer.from(d) };
+        return { rate, channels, frameSamples: frameLengthFlag ? 960 : 1024, config: Buffer.from(d) };
     } catch { return; }
+}
+
+function sameBuffers(a: Buffer[], b: Buffer[]) {
+    return a.length === b.length && a.every((v, i) => v.equals(b[i]));
+}
+
+function sameVideoParams(a: VideoParams, b: VideoParams) {
+    return a.nalLen === b.nalLen && sameBuffers(a.sps, b.sps) && sameBuffers(a.pps, b.pps);
+}
+
+function sameAudioParams(a: AudioParams, b: AudioParams) {
+    return a.rate === b.rate && a.channels === b.channels
+        && (a.frameSamples ?? 1024) === (b.frameSamples ?? 1024) && a.config.equals(b.config);
 }
 
 const ANNEXB_SC = Buffer.from([0, 0, 0, 1]);
@@ -255,14 +284,25 @@ export function packetizeH264(track: RtpTrack, params: VideoParams, nals: Buffer
     }
 }
 
-/** Packetize one raw AAC frame (RFC 3640 AAC-hbr): 4-byte AU-header-section
- *  (16-bit headers-length + 13-bit size / 3-bit index) then the frame. */
-export function packetizeAac(track: RtpTrack, frame: Buffer, ts: number): Buffer | undefined {
-    if (!frame.length || frame.length >= (1 << 13)) return;   // size must fit 13 bits
+/** Packetize one raw AAC frame (RFC 3640 AAC-hbr): every RTP packet carries a
+ *  4-byte AU-header section (16-bit headers-length + 13-bit size / 3-bit
+ *  index). Large AUs are fragmented below the RTP payload MTU; every fragment
+ *  repeats the size of the complete AU, keeps the same timestamp, and only the
+ *  final fragment sets M. The patched 32 kHz / 128 kbps mono profile normally
+ *  fits one packet, while this also keeps VBR spikes and any higher-channel
+ *  camera profile below the transport MTU. */
+export function packetizeAac(track: RtpTrack, frame: Buffer, ts: number): Buffer[] {
+    if (!frame.length || frame.length >= (1 << 13)) return [];   // size must fit 13 bits
     const au = Buffer.allocUnsafe(4);
     au.writeUInt16BE(16, 0);                  // AU-headers-length (bits)
     au.writeUInt16BE(frame.length << 3, 2);   // size<<3 | index(0)
-    return track.build(ts, true, au, frame);
+    const out: Buffer[] = [];
+    const fragmentPayload = MAX_PAYLOAD - au.length;
+    for (let off = 0; off < frame.length; off += fragmentPayload) {
+        const end = Math.min(off + fragmentPayload, frame.length);
+        out.push(track.build(ts, end === frame.length, au, frame, off, end));
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -339,15 +379,18 @@ export async function startNativeServe(opts: {
     const { flv, hasAudio } = opts;
 
     let dead = false;
-    let lastVideoRtp = Date.now();
+    // Monotonic egress liveness. Wall-clock jumps must not make a healthy stream
+    // look stalled (or a frozen one look healthy).
+    let lastVideoRtp = performance.now();
     const sessions = new Set<RtspSession>();
     let server: net.Server | undefined;
+    let destroy: (() => void) | undefined;
 
     let videoParams: VideoParams | undefined;
     let audioParams: AudioParams | undefined;
     let audioBroken = false;      // audio is best-effort; once broken, video-only
     let audioServed = false;      // audio made it into the SDP
-    let audioTs: number | undefined;   // synthesized AAC RTP clock (exact 1024/frame)
+    let audioTs: number | undefined;   // synthesized AAC RTP clock (exact frameSamples/frame)
     let latestKeyframe: { ts: number; annexb: Buffer } | undefined;   // for snapshots
     let onVideoParams: (() => void) | undefined;
     let onAudioParams: (() => void) | undefined;
@@ -399,41 +442,141 @@ export async function startNativeServe(opts: {
     // a 250 ms budget leaves nothing to smooth with — the IDR is already overdue
     // when it lands. 450 ms gives real headroom; the +latency is behind the prebuffer.
     const EGRESS_DELAY_MS = 450;
-    const BURST_SLICE = 120;        // access units larger than this get their packets spread…
-    const MAX_SPREAD_MS = 150;      // …proportionally across up to this window (≈ n/6 ms) so a ~400-packet
-                                    // IDR trickles instead of a single ~80 Mbps microburst (punishing on a
-                                    // client's Wi-Fi). Capped so it can't head-of-line block the frames
-                                    // queued behind it (the egress is FIFO, not due-sorted).
-    const MAX_LATE_MS = 2000;       // event-loop stall / clock jump: re-anchor instead of dumping a backlog
-    const MAX_QUEUE = 8000;         // runaway backstop on a tight host: collapse the buffer
-    type Paced = { control: string; packet: Buffer; due: number; kf: boolean };
-    let egress: Paced[] = [];
-    let epoch = 0;                  // wall-clock ms of media-time 0; sendWall = epoch + due
+    const BURST_SLICE = 120;
+    const MAX_SPREAD_MS = 50;
+    const SPREAD_MARGIN_MS = 5;
+    const MAX_LATE_MS = 2000;
+    const MAX_FUTURE_MS = 2000;
+    const MAX_QUEUE = 8000;
+    type Paced = {
+        control: string;
+        packet: Buffer;
+        due: number;
+        kf: boolean;             // first packet of a keyframe: reset GOP history
+        marker: boolean;         // last packet of a complete access unit
+        keyframeMarker: boolean; // last packet of a complete keyframe
+    };
+    // Keep one due-ordered FIFO per RTP clock. FLV tags from the two tracks can
+    // arrive in either order at the same timestamp; a single append-only queue
+    // lets an AAC packet at T block video packets intentionally spread over
+    // T-frameInterval..T, collapsing the IDR back into a microburst.
+    let videoEgress: Paced[] = [];
+    let audioEgress: Paced[] = [];
+    let videoHead = 0;
+    let audioHead = 0;
+    let epoch = 0;                  // monotonic ms of media-time 0; sendMono = epoch + due
     let drainTimer: any;
     let pendingJoinSr = false;      // a client PLAYed before any packet was sent (cold start); send its SR once draining starts
+    let restartRequested = false;
+    let previousVideoMediaMs: number | undefined;
+    let videoFrameIntervalMs = 1000 / 30;
+
+    const queued = () => (videoEgress.length - videoHead) + (audioEgress.length - audioHead);
+    const queueFront = () => {
+        const v = videoEgress[videoHead];
+        const a = audioEgress[audioHead];
+        // Video wins a tie so a keyframe resets GOP history before same-time AAC.
+        return !a || (v && v.due <= a.due) ? v : a;
+    };
+    const queueShift = () => {
+        const front = queueFront();
+        if (front.control === 'trackID=0') {
+            videoHead++;
+            if (videoHead >= 2048 && videoHead * 2 >= videoEgress.length) {
+                videoEgress = videoEgress.slice(videoHead);
+                videoHead = 0;
+            }
+        } else {
+            audioHead++;
+            if (audioHead >= 2048 && audioHead * 2 >= audioEgress.length) {
+                audioEgress = audioEgress.slice(audioHead);
+                audioHead = 0;
+            }
+        }
+        return front;
+    };
+    const clearEgress = () => {
+        videoEgress = [];
+        audioEgress = [];
+        videoHead = 0;
+        audioHead = 0;
+    };
+    const requestRestart = (reason: string) => {
+        if (dead || restartRequested) return;
+        restartRequested = true;
+        dbg('native-rtsp restarting media pipeline:', reason);
+        clearTimeout(drainTimer);
+        drainTimer = undefined;
+        clearEgress();
+        // This can be requested while attaching the FLV data listener, before the
+        // cleanup closure below is assigned. Defer one microtask so startup has
+        // completed its synchronous declarations.
+        queueMicrotask(() => destroy?.());
+    };
 
     const enqueue = (control: string, pkts: Buffer[], mediaMs: number, keyframe: boolean) => {
+        const previousFrontDue = queued() ? queueFront().due : undefined;
         const n = pkts.length;
-        const spread = n > BURST_SLICE ? Math.min(MAX_SPREAD_MS, Math.ceil(n / 6)) : 0;
+        // Spread a large AU *before* its media deadline and finish its marker at
+        // mediaMs. Crucially, cap the window below the observed frame interval:
+        // the old 150 ms post-deadline spread deterministically blocked 3-5 P
+        // frames behind every IDR, then released them as a visible catch-up burst.
+        const spreadBudget = Math.max(0, videoFrameIntervalMs - SPREAD_MARGIN_MS);
+        const spread = control === 'trackID=0' && n > BURST_SLICE
+            ? Math.min(MAX_SPREAD_MS, spreadBudget, Math.ceil(n / 6))
+            : 0;
+        const firstDue = mediaMs - spread;
+        const target = control === 'trackID=0' ? videoEgress : audioEgress;
         for (let i = 0; i < n; i++)
-            egress.push({ control, packet: pkts[i], due: mediaMs + (spread ? spread * i / n : 0), kf: keyframe && i === 0 });
-        if (egress.length > MAX_QUEUE && egress.length) epoch = Date.now() - egress[0].due;   // flush: drop smoothing rather than grow
+            target.push({
+                control,
+                packet: pkts[i],
+                due: firstDue + (spread && n > 1 ? spread * i / (n - 1) : 0),
+                kf: keyframe && i === 0,
+                marker: i === n - 1,
+                keyframeMarker: keyframe && i === n - 1,
+            });
+        if (queued() > MAX_QUEUE) {
+            // Continuing after arbitrary packet drops would leave every decoder
+            // corrupt until the next IDR. A clean generation rebuild is bounded,
+            // self-healing, and actually releases the queued memory.
+            requestRestart(`egress queue overflow (${queued()} packets)`);
+            return;
+        }
+        // The other track may append an earlier deadline after a timer was armed
+        // (most notably AAC@T followed by an IDR spread over T-28..T). Re-arm to
+        // the new cross-track minimum or the earlier packets still wake at T and
+        // collapse into the very burst this pacer is meant to prevent.
+        if (drainTimer && previousFrontDue !== undefined && queueFront().due < previousFrontDue) {
+            clearTimeout(drainTimer);
+            drainTimer = undefined;
+        }
         scheduleDrain();
     };
 
     const drain = () => {
         drainTimer = undefined;
-        if (!egress.length) return;
-        const now = Date.now();
-        if (!epoch) epoch = now - egress[0].due + EGRESS_DELAY_MS;
-        // fell badly behind (stall or camera/host clock jump): re-anchor rather
-        // than dump the whole backlog in one flood.
-        if (now - (epoch + egress[0].due) > MAX_LATE_MS) epoch = now - egress[0].due + EGRESS_DELAY_MS;
+        if (!queued() || restartRequested) return;
+        const now = performance.now();
+        const front = queueFront();
+        if (!epoch) epoch = now - front.due + EGRESS_DELAY_MS;
+        const drift = (epoch + front.due) - now;
+        if (drift > MAX_FUTURE_MS) {
+            // Encoder timestamp reset/jump. Waiting seconds while valid packets
+            // arrive is a frozen live view; re-anchor this generation promptly.
+            dbg('native-rtsp forward timestamp discontinuity:', Math.round(drift), 'ms');
+            epoch = now - front.due + EGRESS_DELAY_MS;
+        } else if (drift < -MAX_LATE_MS) {
+            // A multi-second event-loop/host stall cannot be caught up at realtime
+            // without making that delay permanent. Rebuild from a fresh keyframe.
+            requestRestart(`egress fell ${Math.round(-drift)} ms behind`);
+            return;
+        }
         const batch: { control: string; packet: Buffer }[] = [];
         const audioOut: Buffer[] = [];
         let lastVideoTs: number | undefined, lastAudioTs: number | undefined;
-        while (egress.length && epoch + egress[0].due <= now) {
-            const it = egress.shift()!;
+        while (queued() && epoch + queueFront().due <= now) {
+            const it = queueShift();
             if (it.kf) { gop = []; gopBytes = 0; gopOverflow = false; }   // GOP history resets at the keyframe boundary, at send time
             if (it.control !== 'trackID=1' || gop.length) gopAppend(it.control, [it.packet]);
             if (it.control === 'trackID=1') { lastAudioTs = it.packet.readUInt32BE(4); audioOut.push(it.packet); }
@@ -447,7 +590,10 @@ export async function startNativeServe(opts: {
         if (batch.length) {
             for (const s of sessions) s.sendMixedBatch(batch);
             // stamp the RTCP RTP↔wall mapping at actual send time (post-pacer)
-            if (lastVideoTs !== undefined) videoTrack.stamp(lastVideoTs);
+            if (lastVideoTs !== undefined) {
+                videoTrack.stamp(lastVideoTs);
+                lastVideoRtp = performance.now();
+            }
             if (lastAudioTs !== undefined) audioTrack.stamp(lastAudioTs);
             // a client that PLAYed before any packet had been sent has no lip-sync
             // mapping yet; now that one exists, send it the Sender Report it was owed.
@@ -464,10 +610,15 @@ export async function startNativeServe(opts: {
     };
 
     const scheduleDrain = () => {
-        if (drainTimer || !egress.length) return;
-        const now = Date.now();
-        if (!epoch) epoch = now - egress[0].due + EGRESS_DELAY_MS;
-        drainTimer = setTimeout(drain, Math.max(0, Math.min((epoch + egress[0].due) - now, 1000)));
+        if (drainTimer || !queued() || restartRequested) return;
+        const now = performance.now();
+        const front = queueFront();
+        if (!epoch) epoch = now - front.due + EGRESS_DELAY_MS;
+        if ((epoch + front.due) - now > MAX_FUTURE_MS) {
+            dbg('native-rtsp forward timestamp discontinuity before drain');
+            epoch = now - front.due + EGRESS_DELAY_MS;
+        }
+        drainTimer = setTimeout(drain, Math.max(0, Math.min((epoch + front.due) - now, 1000)));
     };
 
     const handleVideoTag = (tsMs: number, d: Buffer) => {
@@ -477,13 +628,19 @@ export async function startNativeServe(opts: {
         if (codecId !== 7) return;   // not AVC (caller routes h265 to ffmpeg)
         const pktType = d[1];
         if (pktType === 0) {
-            // sequence header (avcC). Take the first one; the camera sends it once.
+            const next = parseAvcC(d.subarray(5));
+            if (!next) return;
             if (!videoParams) {
-                videoParams = parseAvcC(d.subarray(5));
+                videoParams = next;
                 if (videoParams) {
                     dbg('native-rtsp avcC: sps', videoParams.sps[0].length, 'pps', videoParams.pps[0].length, 'nalLen', videoParams.nalLen);
                     onVideoParams?.();
                 }
+            } else if (!sameVideoParams(videoParams, next)) {
+                // SDP and every cached GOP carry the old parameter sets. Serving
+                // slices under that stale contract looks alive but is undecodable;
+                // rebuild so clients re-DESCRIBE the new encoder configuration.
+                requestRestart('H.264 sequence header changed');
             }
             return;
         }
@@ -493,11 +650,16 @@ export async function startNativeServe(opts: {
         if (cts & 0x800000) cts -= 0x1000000;
         const nals = splitNals(d, 5, videoParams.nalLen);
         if (!nals.length) return;
-        lastVideoRtp = Date.now();   // liveness: video is flowing, clients or not
         // Cache the freshest keyframe (decodable Annex-B AU) for instant snapshots,
         // regardless of whether anyone is streaming.
-        if (frameType === 1) latestKeyframe = { ts: lastVideoRtp, annexb: toAnnexB(videoParams, nals) };
+        if (frameType === 1) latestKeyframe = { ts: Date.now(), annexb: toAnnexB(videoParams, nals) };
         const mediaMs = Math.max(0, tsMs + cts);
+        if (previousVideoMediaMs !== undefined) {
+            const delta = mediaMs - previousVideoMediaMs;
+            if (delta >= 5 && delta <= 250)
+                videoFrameIntervalMs = videoFrameIntervalMs * 0.8 + delta * 0.2;
+        }
+        previousVideoMediaMs = mediaMs;
         const ts = mediaMs * (VIDEO_CLOCK / 1000);
         const pkts: Buffer[] = [];
         packetizeH264(videoTrack, videoParams, nals, ts, frameType === 1, pkts);
@@ -512,35 +674,51 @@ export async function startNativeServe(opts: {
         if (d[0] >> 4 !== 10) return;   // not AAC — ignore (video must not regress)
         const pktType = d[1];
         if (pktType === 0) {
-            if (!audioParams) {
-                audioParams = parseAsc(d.subarray(2));
-                if (audioParams) {
-                    dbg('native-rtsp asc:', audioParams.rate, 'Hz,', audioParams.channels, 'ch');
-                    onAudioParams?.();
-                } else {
+            const next = parseAsc(d.subarray(2));
+            if (!next) {
+                if (!audioParams) {
                     audioBroken = true;
                     dbg('native-rtsp unparsable AudioSpecificConfig; serving video-only');
                 }
+                return;
+            }
+            if (!audioParams) {
+                audioParams = next;
+                if (audioParams) {
+                    dbg('native-rtsp asc:', audioParams.rate, 'Hz,', audioParams.channels, 'ch');
+                    onAudioParams?.();
+                }
+            } else if (!sameAudioParams(audioParams, next)) {
+                requestRestart('AAC sequence header changed');
             }
             return;
         }
         if (pktType !== 1 || !audioParams || !audioServed) return;
-        // Synthesize the AAC RTP clock at exactly 1024 samples/frame. The FLV ms
+        // Synthesize the AAC RTP clock at exactly the AudioSpecificConfig frame
+        // length (normally 1024 samples). The FLV ms
         // timestamps quantize to ±1 sample, which makes a receiver's NetEq
         // continually micro-time-stretch the audio; a monotonic +1024 clock is
-        // clean. Re-anchor to the camera clock only on a real discontinuity (a
-        // gap/reset of more than one frame), never the ±ms wobble.
+        // clean. Re-anchor to the camera clock only on a real discontinuity (at
+        // least one whole missing frame), never the ±ms wobble. A camera
+        // timestamp can also jump backward around an encoder hiccup; the RTP
+        // clock must never follow it backward or receivers see duplicate DTS and
+        // briefly reset their audio jitter buffer.
         const expected = Math.round(tsMs * audioParams.rate / 1000);
-        if (audioTs === undefined || Math.abs(expected - audioTs) > 1024) audioTs = expected;
+        const frameSamples = audioParams.frameSamples ?? 1024;
+        if (audioTs === undefined || expected - audioTs >= frameSamples) audioTs = expected;
         const ts = audioTs;
-        audioTs += 1024;
-        const pkt = packetizeAac(audioTrack, d.subarray(2), ts);
-        if (!pkt) return;
+        audioTs += frameSamples;
+        const pkts = packetizeAac(audioTrack, d.subarray(2), ts);
+        if (!pkts.length) return;
         // Paced by the same egress schedule as video (so the fixed smoothing
         // delay applies equally and A/V lip-sync is preserved). The pacer only
         // buffers audio into the GOP once video is present — audio before the
         // first keyframe is useless to a joining decoder.
-        enqueue('trackID=1', [pkt], tsMs, false);
+        // Pace from the normalized RTP clock too. If the camera's FLV timestamp
+        // jumps backward, using raw tsMs here makes multiple otherwise-correct
+        // AAC packets instantly overdue and emits an audible catch-up burst. The
+        // synthesized clock preserves one frame period between them.
+        enqueue('trackID=1', pkts, ts * 1000 / audioParams.rate, false);
     };
 
     const parser = new FlvTagParser((type, tsMs, data) => {
@@ -575,12 +753,14 @@ export async function startNativeServe(opts: {
         } catch { }
     }, 5000);
 
-    const destroy = () => {
+    let stallTimer: any;
+    destroy = () => {
         if (dead) return;
         dead = true;
         clearInterval(rtcpTimer);
+        clearInterval(stallTimer);
         clearTimeout(drainTimer);
-        egress = [];
+        clearEgress();
         flv.removeListener('data', feed);
         try { server?.close(); } catch { }
         for (const s of sessions) s.close();
@@ -589,7 +769,13 @@ export async function startNativeServe(opts: {
         audioSubs.clear();
         try { flv.destroy(); } catch { }
     };
-    flv.once('close', destroy);
+    flv.once('close', () => destroy?.());
+    // Close RTSP clients at the point of failure instead of waiting for the
+    // provider's coarse health poll. Their reconnect then creates a clean stream.
+    stallTimer = setInterval(() => {
+        if (!dead && performance.now() - lastVideoRtp >= RTP_STALL_MS)
+            requestRestart(`no video RTP egress for ${RTP_STALL_MS} ms`);
+    }, 1000);
 
     // The H.264 sequence header is required to build the SDP; it arrives in the
     // first few FLV tags, so this resolves near-instantly on a healthy feed.
@@ -603,7 +789,7 @@ export async function startNativeServe(opts: {
             flv.once('close', onclose);
         });
     } catch (e) {
-        destroy();
+        destroy?.();
         throw e;
     }
 
@@ -612,10 +798,58 @@ export async function startNativeServe(opts: {
     if (hasAudio && !audioParams && !audioBroken) {
         await new Promise<void>(resolve => {
             const done = () => { clearTimeout(t); flv.removeListener('close', done); onAudioParams = undefined; resolve(); };
-            const t = setTimeout(done, opts.audioGraceMs ?? 3000);
+            const t = setTimeout(done, opts.audioGraceMs ?? 250);
             onAudioParams = done;
             flv.once('close', done);
         });
+    }
+    if (dead || restartRequested)
+        throw new Error('native rtsp serve destroyed during media discovery');
+
+    // DirectStream deliberately waits for a stable camera TCP connection before
+    // publishing it, so PassThrough already contains a bootstrap backlog. Keep the
+    // newest EGRESS_DELAY_MS of that backlog queued: it is the smoothing reserve the
+    // live stream is meant to have. Fast-forward only the older portion into GOP
+    // history. Consuming the *entire* backlog made PLAY replay through camera-now,
+    // then freeze for ~450 ms while the first newly arriving frame traversed the
+    // pacer. Ending replay at the paced playhead lets retained frames continue at
+    // normal frame cadence without weakening the smoothing reserve.
+    clearTimeout(drainTimer);
+    drainTimer = undefined;
+    const queuedVideo = videoEgress.slice(videoHead);
+    const newestVideoMarkerDue = [...queuedVideo].reverse().find(it => it.marker)?.due;
+    // Choose only a complete access-unit boundary. A representative large IDR is
+    // spread from roughly T-28..T; using the first packet as the backlog boundary
+    // can split that IDR and replay an undecodable prefix to a new client.
+    let handoffDue: number | undefined;
+    if (newestVideoMarkerDue !== undefined) {
+        const target = newestVideoMarkerDue - EGRESS_DELAY_MS;
+        const completeKeyframe = queuedVideo.find(it => it.keyframeMarker && it.due <= target);
+        if (completeKeyframe) {
+            for (const it of queuedVideo) {
+                if (it.marker && it.due >= completeKeyframe.due && it.due <= target)
+                    handoffDue = it.due;
+            }
+        }
+    }
+    // If less than one reserve is available, retain and pace the entire partial
+    // backlog. Flushing 449 ms and then applying a fresh 450 ms delay recreates
+    // the exact join freeze this handoff is meant to remove. DirectStream's 800 ms
+    // settle normally supplies a full reserve; this fallback favors fast first
+    // video over adding up to another 450 ms to an already-cold camera start.
+    while (queued() && handoffDue !== undefined && queueFront().due <= handoffDue) {
+        const it = queueShift();
+        if (it.kf) { gop = []; gopBytes = 0; gopOverflow = false; }
+        if (it.control !== 'trackID=1' || gop.length) gopAppend(it.control, [it.packet]);
+    }
+    if (queued()) {
+        // The first retained packet is due now. Subsequent packets keep their
+        // media spacing and replenish GOP history before/while the listener comes
+        // up. With a partial backlog this starts with a proportionally smaller
+        // reserve, which is preferable to either delaying the first IDR or
+        // inserting a deterministic pause before the next live frame.
+        epoch = performance.now() - queueFront().due;
+        scheduleDrain();
     }
 
     const useAudio = (hasAudio && !audioBroken && audioParams) ? audioParams : undefined;
@@ -632,6 +866,21 @@ export async function startNativeServe(opts: {
         try {
             if (gop.length) {
                 s.sendMixedBatch(gop);
+                // Bootstrap history may have been fast-forwarded before the RTSP
+                // listener existed, so it has never had an egress wall-clock
+                // stamp. The replay itself is real egress: anchor each track to
+                // the last packet just sent before producing its immediate SR.
+                let replayVideoTs: number | undefined;
+                let replayAudioTs: number | undefined;
+                for (let i = gop.length - 1; i >= 0 && (replayVideoTs === undefined || replayAudioTs === undefined); i--) {
+                    const it = gop[i];
+                    if (it.control === 'trackID=0' && replayVideoTs === undefined)
+                        replayVideoTs = it.packet.readUInt32BE(4);
+                    else if (it.control === 'trackID=1' && replayAudioTs === undefined)
+                        replayAudioTs = it.packet.readUInt32BE(4);
+                }
+                if (replayVideoTs !== undefined) videoTrack.stamp(replayVideoTs);
+                if (replayAudioTs !== undefined) audioTrack.stamp(replayAudioTs);
                 dbg('native-rtsp gop replay:', gop.length, 'packets,', gopBytes, 'bytes');
             }
             const vsr = videoTrack.senderReport();
@@ -649,7 +898,23 @@ export async function startNativeServe(opts: {
         const s = new RtspSession(socket, info, url, () => sessions.delete(s), onSessionPlay);
         sessions.add(s);
     });
-    await new Promise<void>(res => server!.listen(0, '127.0.0.1', () => res()));
+    try {
+        await new Promise<void>((resolve, reject) => {
+            const onError = (e: Error) => reject(e);
+            server!.once('error', onError);
+            server!.listen(0, '127.0.0.1', () => {
+                server!.removeListener('error', onError);
+                resolve();
+            });
+        });
+    } catch (e) {
+        destroy?.();
+        throw e;
+    }
+    server.on('error', e => {
+        dbg('native-rtsp server error:', (e as Error)?.message);
+        destroy?.();
+    });
     url = `rtsp://127.0.0.1:${(server.address() as AddressInfo).port}${pathToken}`;
     // destroy() may have raced the listen (flv died mid-await): close and bail.
     if (dead) {
@@ -658,12 +923,12 @@ export async function startNativeServe(opts: {
     }
     dbg('native-rtsp listening', url);
 
-    lastVideoRtp = Date.now();
+    lastVideoRtp = performance.now();
     return {
         url,
-        destroy,
+        destroy: destroy!,
         get clientCount() { return sessions.size; },
-        get alive() { return !dead && (Date.now() - lastVideoRtp) < RTP_STALL_MS; },
+        get alive() { return !dead && (performance.now() - lastVideoRtp) < RTP_STALL_MS; },
         latestKeyframe: () => latestKeyframe,
         audioParams: () => useAudio,
         subscribeAudio: (fn, onEnd) => {

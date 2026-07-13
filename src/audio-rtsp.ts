@@ -9,7 +9,8 @@ export const AUDIO_RTSP_PORT = 17553;
 
 /**
  * Stable audio-only RTSP endpoints: `rtsp://<host>:17553/<MAC>` serves just the
- * camera's AAC track (~16 kbps) for external consumers like BirdNET-Go, which
+ * camera's native AAC track (legacy or patched high-quality profile) for
+ * external consumers like BirdNET-Go, which
  * ingests RTSP URLs configured once.
  *
  * Same pattern as PushPortRegistry, pointed outward: ONE long-lived listener
@@ -72,11 +73,13 @@ export class AudioRtspServer {
         const s: RtspSession = new RtspSession(
             sock,
             async requestUrl => {
-                // path → camera MAC; strip everything but hex so /aa:bb.../audio,
-                // /AABB.../ and trailing junk all normalize to the same key.
+                // path → exact first-segment camera MAC. Do not strip arbitrary
+                // suffixes: words such as "audio" contain hex letters and could
+                // otherwise turn a malformed path into a different camera key.
                 const path = (() => { try { return new URL(requestUrl).pathname; } catch { return requestUrl; } })();
-                const key = path.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
-                if (!key) return undefined;
+                const segment = path.split('/').filter(Boolean)[0] || '';
+                const key = segment.replace(/[:-]/g, '').toUpperCase();
+                if (!/^[0-9A-F]{12}$/.test(key)) return undefined;
                 handle = await this.resolveSource(key);
                 const params = handle?.audioParams();
                 if (!handle || !params) {

@@ -34,6 +34,10 @@ export interface FieldDef {
 // mirror how UniFi Protect derives its per-camera featureFlags (e.g.
 // hasInfrared=truedaynight, hasLdc=ldc), so gating adapts across models.
 const hasMic = (f: Record<string, any>) => !!f.mic;
+// Older firmware does not advertise audioCodecs; preserve its path-present AAC
+// controls. When a codec list is present it is authoritative.
+const hasAac = (f: Record<string, any>) => hasMic(f)
+    && (!Array.isArray(f.audioCodecs) || f.audioCodecs.includes('aac'));
 const hasSpeaker = (f: Record<string, any>) => !!(f.speaker || f.adjustableSpeakerVolume);
 const hasStatusLed = (f: Record<string, any>) => !!f.ledStatus;
 const hasInfrared = (f: Record<string, any>) => !!(f.truedaynight || f.ledIr);   // night vision / IR
@@ -88,7 +92,7 @@ export const PARITY_FIELDS: FieldDef[] = [
     {
         key: 'video.keyframeInterval', title: 'Keyframe interval (s)', group: 'Video', type: 'integer',
         paths: ['av.video.<track>.nMultiplier'], range: [1, 10],
-        description: 'Seconds between keyframes. Streams start instantly regardless — the plugin replays the current GOP to every new viewer — so longer intervals cost nothing on startup, and a LONGER interval measurably reduces the periodic keyframe "flash"/quality-pulse on detailed/moving scenes (each intra frame is a small quality reset; fewer resets = smoother). 8s is best for image smoothness; use 4s if you rely on HomeKit Secure Video recording (its 4-second fragments each need a keyframe). The tradeoff: live view runs up to this many seconds behind real time.',
+        description: 'Seconds between keyframes. Use 4s for Scrypted/native UniFi parity and recording compatibility. 8s can make the camera encoder’s keyframe quality pulse occur less often on detailed scenes, but increases recovery time after packet loss and can exceed normal prebuffer/sync windows. GOP replay keeps ordinary live-view starts quick; it does not add the interval as steady-state latency.',
     },
     // Adaptive-bitrate floors. The camera's autoBitrate silently throttles a
     // low-"motion" scene (e.g. rippling water the detector ignores) down toward
@@ -105,6 +109,25 @@ export const PARITY_FIELDS: FieldDef[] = [
     { key: 'audio.agc', title: 'Mic auto gain (AGC)', group: 'Audio', type: 'boolean', paths: ['av.audio.agc'], cap: hasMic },
     { key: 'audio.denoise', title: 'Mic noise reduction', group: 'Audio', type: 'boolean', paths: ['av.audio.denoise'], cap: hasMic },
     { key: 'audio.highpass', title: 'Mic high-pass filter', group: 'Audio', type: 'boolean', paths: ['av.audio.highpass'], cap: hasMic },
+    {
+        key: 'audio.sampleRate', title: 'AAC sample rate (Hz)', group: 'Audio', type: 'integer',
+        paths: ['av.audio.sampleRate'], range: [8000, 96000], cap: hasAac,
+        description: 'Native camera AAC sample rate. Patched firmware may support 32000 Hz; older firmware values such as 16000 Hz remain supported. The option is shown only when the camera reports this encoder field.',
+    },
+    {
+        key: 'audio.bitrate', title: 'AAC bitrate (bps)', group: 'Audio', type: 'integer',
+        paths: ['av.audio.bitRate'], range: [8000, 320000], cap: hasAac,
+        description: 'Native camera AAC target bitrate. Patched firmware may support 128000 bps. The option is shown only when the camera reports this encoder field.',
+    },
+    {
+        key: 'audio.channels', title: 'AAC channels', group: 'Audio', type: 'integer',
+        paths: ['av.audio.channels'], readonly: true, cap: hasAac,
+        description: 'Reported encoder channel count. HomeKit and the direct stream use the camera’s native value; the patched high-quality profile is mono (1).',
+    },
+    {
+        key: 'audio.codec', title: 'Audio codec', group: 'Audio', type: 'string',
+        paths: ['av.audio.type'], readonly: true, cap: hasMic,
+    },
 
     // ---- Speaker — gated on the camera having a (adjustable) speaker ----
     { key: 'soundled.speakerEnabled', title: 'Speaker', group: 'Speaker', type: 'boolean', paths: ['soundled.speakerEnabled'], bool01: true, cap: hasSpeaker },
@@ -224,6 +247,7 @@ export function writeField(field: FieldDef, value: any, track: string): any {
 const MGMT_HTTP_ONLY = new Set([
     'isp.aeTargetPercent',
     'audio.enabled', 'audio.volume', 'audio.agc', 'audio.denoise', 'audio.highpass',
+    'audio.sampleRate', 'audio.bitrate', 'audio.channels', 'audio.codec',
     'httpd.anonSnapshot',
     // Encoder params: the camera ignores partial ChangeVideoSettings for these
     // (Protect resends the FULL per-channel object); HTTP applies them reliably,
@@ -290,16 +314,38 @@ export function deepMerge(a: any, b: any): any {
     return a;
 }
 
-export function toSetting(field: FieldDef, value: any): Setting {
+/** Build the UI setting. Newer camera firmware advertises the AAC rates it can
+ * switch between; turn that field into a select when present. Older firmware
+ * often reports only av.audio.sampleRate, so it keeps the numeric input instead
+ * of losing a previously-working value or being hidden outright. */
+export function toSetting(field: FieldDef, value: any, features: Record<string, any> = {}): Setting {
+    let choices = field.choices;
+    let type = field.type;
+    let settingValue = value;
+    if (field.key === 'audio.sampleRate' && Array.isArray(features.audioSampleRates)) {
+        const rates = features.audioSampleRates
+            .map((v: any) => Number(v))
+            .filter((v: number) => Number.isInteger(v) && v >= 8000 && v <= 96000);
+        if (Number.isInteger(Number(value))) rates.push(Number(value));
+        const unique = [...new Set(rates)].sort((a, b) => a - b);
+        if (unique.length) {
+            choices = unique.map(String);
+            // Scrypted choices are string-valued. writeField still uses the
+            // FieldDef's integer type, so the selected value is parsed back to a
+            // number before it reaches the camera.
+            type = 'string';
+            settingValue = String(value);
+        }
+    }
     return {
         key: field.key,
         title: field.title,
         group: field.group,
-        type: field.type,
-        choices: field.choices,
-        range: field.range,
+        type,
+        choices,
+        range: type === 'string' && choices ? undefined : field.range,
         description: field.description,
         readonly: field.readonly,
-        value,
+        value: settingValue,
     };
 }

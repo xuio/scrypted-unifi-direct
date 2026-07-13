@@ -26,7 +26,7 @@ and the settings surface adapts accordingly.
 | **Detection zones** — smart-detect, exclude, line-crossing, loiter, motion, and privacy masks, applied over the management channel | ✅ |
 | **Camera settings** — image (ISP), video (bitrate/fps/keyframe), audio, overlay (OSD), status light, name — with per-model capability gating | ✅ |
 | **Secondary stream** — optional concurrent 720p/360p stream per camera; select it in the HomeKit plugin so HomeKit **copies** the video instead of transcoding the 4MP stream down to its 1080p cap | ✅ |
-| **Audio-only RTSP endpoint** — stable ~16 kbps AAC URL per camera (`rtsp://host:17553/<MAC>`) for soundscape analyzers like **BirdNET-Go**, no video bytes on the wire | ✅ |
+| **Audio-only RTSP endpoint** — stable native-AAC URL per camera (`rtsp://host:17553/<MAC>`) for soundscape analyzers like **BirdNET-Go**, no video bytes on the wire; legacy and mono 32 kHz / 128 kbps profiles supported | ✅ |
 | **HomeKit** — works through Scrypted's HomeKit plugin (snapshots are sized per request so previews render correctly) | ✅ |
 
 ## How it works
@@ -87,10 +87,24 @@ API of their own.
   that stream in the HomeKit plugin for live/recording: HomeKit copies it directly
   (no transcode), while Scrypted NVR keeps recording the full-resolution stream.
   Costs one extra continuous camera push (~1.5 Mbps).
+- **Keyframe interval** — use **4 seconds** for Scrypted/native UniFi parity. This
+  matches Scrypted's camera guidance and the official UniFi Protect plugin, keeps
+  keyframes within Scrypted's normal prebuffer window, and is the compatible choice
+  for HomeKit Secure Video recording. An **8-second** interval is an optional
+  image-smoothness tradeoff: on detailed or moving scenes it can make the encoder's
+  keyframe quality pulse occur less often, but viewers may take longer to acquire a
+  fresh sync frame and recording integrations may be less reliable. Use 8 seconds
+  only when that measured visual benefit matters more than startup latency and you
+  do not depend on HomeKit Secure Video.
 - **Audio RTSP endpoint** — enable *Audio RTSP endpoint* on a camera and point a
   consumer (e.g. BirdNET-Go's `realtime.rtsp.urls`) at the displayed URL. Taps the
   microphone track of the stream that's already running — no extra camera push.
   Unauthenticated and LAN-scoped; open TCP `17553` if the consumer is remote.
+- **AAC encoder** — supported cameras expose their native sample rate and bitrate.
+  Patched firmware can select mono **32 kHz / 128 kbps**; legacy 16 kHz and other
+  path-present firmware values remain supported. Available sample rates come from
+  the camera's capability list, and changing an encoder value rebuilds every track
+  so clients receive matching SDP/RTP parameters.
 - **Zones** — add named zones; each gets a polygon editor plus only the fields its
   type uses. Applied live over the management channel and re-asserted on reconnect.
 - **Settings** — only controls the camera model actually supports are shown.
@@ -102,6 +116,18 @@ API of their own.
   full-res snapshot API); the low-res mjpg endpoint remains available as a fallback.
 - Verified primarily on the G5 Turret Ultra. Other models rely on capability
   auto-detection; please report gaps.
+
+## Operational backlog
+
+4. Repeat image-quality and pulse validation in daylight, twilight, rain, wind,
+   and scenes with heavy foliage movement.
+5. Investigate downstream HomeKit/WebRTC latency only if real clients remain slow;
+   the camera/plugin source path is already fast.
+6. Retain the validated camera settings unless measurements support a change:
+   four-second GOPs and adaptive bitrate enabled; high stream capped at 10 Mbps
+   with 9 Mbps motion and 10 Mbps client floors; medium stream capped at 2 Mbps
+   with the firmware-clamped 1.5 Mbps motion and 2 Mbps client floors; AAC-LC mono
+   at 32 kHz / 128 kbps.
 
 ## Development
 

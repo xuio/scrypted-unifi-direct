@@ -17,11 +17,16 @@ const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 // whatever rate the encoder runs. This matters especially when the encoder is
 // not at 16 kHz: with a firmware patch that pins 32 kHz AAC, requesting
 // opusSampleRate=16000 corrupted ~2-3% of frames (audible glitch/level loss);
-// dropping the Opus request eliminates it (and the ~0.5% residual on 16 kHz cams).
-// AUDIO_SAMPLE_RATE stays only as the (now inert) opusSampleRate hint; the actual
-// AAC rate is the camera's own, and the muxer's parseAsc follows it.
-const AUDIO_SAMPLE_RATE = 16000;
-const AUDIO_WITH_OPUS = false;
+// disabling the Opus request eliminates it (and the ~0.5% residual on 16 kHz cams).
+// Do not add an inert-looking opusSampleRate alongside withOpus=false: patched
+// firmware may reinterpret serializer parameters. Older cameras can retain a
+// legacy value because ChangeVideoSettings merges parameter objects rather than
+// deleting omitted keys; withOpus=false is the authoritative switch and makes
+// that retained value inert. The AAC rate is the camera's own setting, and the
+// muxer's parseAsc follows the emitted AudioSpecificConfig.
+export function aacOnlySerializerParameters(streamName?: string): { withOpus: false; streamName?: string } {
+    return streamName ? { streamName, withOpus: false } : { withOpus: false };
+}
 
 function wsAccept(key: string) {
     return crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
@@ -259,12 +264,13 @@ export class ControllerEmulator extends EventEmitter {
     }
 
     /**
-     * On adoption, stop any substreams a previous NVR may have left pushing to
+     * On adoption, stop any serializer a previous controller/plugin generation
+     * may have left pushing to
      * an external host at a different audio rate. That rate mismatch forces the
      * camera's shared audio encoder into a scalable/SSR AAC that decodes as
      * garbage on the streams we consume (verified: SAME-rate concurrent
      * serializers are clean — the failure is specifically mixed rates). Pointing
-     * them at /dev/null with audio off up front means the encoder comes up clean
+     * them at /dev/null without requesting an Opus conversion means the encoder comes up clean
      * (no per-camera reboot needed) and the camera stops wasting uplink to a
      * dead relay. Tracks WE are actively streaming are left untouched.
      */
@@ -272,9 +278,14 @@ export class ControllerEmulator extends EventEmitter {
         try {
             const active = this.activeTracks(s.mac);
             const video: Record<string, any> = {};
-            for (const t of ['video2', 'video3'])
+            // Include video1. After a plugin process restart activeStreams is
+            // intentionally empty, but the camera retains the old destination and
+            // otherwise reconnect-storms the shared port before routes exist. On a
+            // normal management reconnect in the same process, genuinely active
+            // tracks remain in this map and are left untouched.
+            for (const t of ['video1', 'video2', 'video3'])
                 if (!active.has(t))
-                    video[t] = { avSerializer: { type: 'extendedFlv', parameters: { withOpus: false }, destinations: ['file:///dev/null'] } };
+                    video[t] = { avSerializer: { type: 'extendedFlv', parameters: aacOnlySerializerParameters(), destinations: ['file:///dev/null'] } };
             if (!Object.keys(video).length) return;
             s.send('ChangeVideoSettings', { video }, true);
             dbg('emulator quiesceSubstreams', s.mac, Object.keys(video).join(','));
@@ -326,9 +337,10 @@ export class ControllerEmulator extends EventEmitter {
      * sustains simultaneous per-track pushes with clean audio), with ONE hard
      * rule inherited from the shared audio encoder: every serializer that
      * carries audio must request the SAME sample rate — mixed rates force the
-     * encoder into scalable/SSR AAC that decodes as garbage. All our active
-     * tracks use AUDIO_SAMPLE_RATE, and leftover serializers from a previous
-     * NVR (unknown rates) are pointed at /dev/null with audio off. Tracks we
+     * encoder into scalable/SSR AAC that decodes as garbage. Our active tracks
+     * do not request Opus at all, so all consume the camera's one native AAC
+     * profile; leftover serializers from a previous NVR (unknown rates) are
+     * pointed at /dev/null without an Opus conversion request. Tracks we
      * are actively streaming are OMITTED from the payload (partials merge by
      * key), so starting one track never restarts another.
      */
@@ -341,7 +353,7 @@ export class ControllerEmulator extends EventEmitter {
             [channel]: {
                 avSerializer: {
                     type: 'extendedFlv',
-                    parameters: { streamName, withOpus: AUDIO_WITH_OPUS, opusSampleRate: AUDIO_SAMPLE_RATE },
+                    parameters: aacOnlySerializerParameters(streamName),
                     destinations: [`tcp://${destHost}:${destPort}?retryInterval=1&connectTimeout=5`],
                 },
                 type: videoCodec,
@@ -352,7 +364,7 @@ export class ControllerEmulator extends EventEmitter {
             video[other] = {
                 avSerializer: {
                     type: 'extendedFlv',
-                    parameters: { withOpus: false, opusSampleRate: AUDIO_SAMPLE_RATE },
+                    parameters: aacOnlySerializerParameters(),
                     destinations: ['file:///dev/null'],
                 },
             };
@@ -370,7 +382,7 @@ export class ControllerEmulator extends EventEmitter {
         const s = this.sessions.get(mac);
         if (!s) return;
         s.send('ChangeVideoSettings', {
-            video: { [channel]: { avSerializer: { type: 'extendedFlv', parameters: { withOpus: false }, destinations: ['file:///dev/null'] } } },
+            video: { [channel]: { avSerializer: { type: 'extendedFlv', parameters: aacOnlySerializerParameters(), destinations: ['file:///dev/null'] } } },
         }, true);
     }
 }

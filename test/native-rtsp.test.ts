@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'net';
 import { once } from 'events';
+import { performance } from 'perf_hooks';
 import { PassThrough } from 'stream';
 import {
     FlvTagParser, parseAvcC, parseAsc, splitNals, toAnnexB,
@@ -54,6 +55,14 @@ test('parseAvcC rejects malformed records', () => {
     assert.equal(parseAvcC(Buffer.from([2, 0, 0, 0, 0, 0, 0])), undefined);   // wrong version
     assert.equal(parseAvcC(Buffer.from([1, 0])), undefined);                  // truncated
     assert.equal(parseAvcC(makeAvcC(Buffer.alloc(0), PPS)), undefined);       // empty SPS
+    assert.equal(parseAvcC(makeAvcC(SPS, PPS, 2)), undefined);                // 3-byte NAL lengths are reserved
+
+    // A declared parameter-set length must fit in the record. Buffer.subarray()
+    // silently clamps an oversized end offset, so this guards against accepting a
+    // one-byte PPS whose length field claims another hundred bytes follow.
+    const truncatedPps = makeAvcC(SPS, PPS);
+    truncatedPps.writeUInt16BE(PPS.length + 100, truncatedPps.length - PPS.length - 2);
+    assert.equal(parseAvcC(truncatedPps), undefined);
 });
 
 test('parseAsc decodes the camera 16kHz mono AAC-LC config', () => {
@@ -62,6 +71,23 @@ test('parseAsc decodes the camera 16kHz mono AAC-LC config', () => {
     assert.ok(a);
     assert.equal(a.rate, 16000);
     assert.equal(a.channels, 1);
+    assert.equal(a.frameSamples, 1024);
+});
+
+test('parseAsc decodes patched-camera 32kHz mono AAC-LC config', () => {
+    // objectType=2 (AAC-LC), freqIdx=5 (32000), channels=1.
+    const a = parseAsc(Buffer.from([0x12, 0x88]));
+    assert.ok(a);
+    assert.equal(a.rate, 32000);
+    assert.equal(a.channels, 1);
+    assert.equal(a.frameSamples, 1024);
+});
+
+test('parseAsc honors the AAC-LC 960-sample frame flag', () => {
+    // Same 16 kHz mono config as above, with GASpecificConfig.frameLengthFlag=1.
+    const a = parseAsc(Buffer.from([0x14, 0x0c]));
+    assert.ok(a);
+    assert.equal(a.frameSamples, 960);
 });
 
 test('parseAsc handles explicit-rate and rejects PCE-deferred channels', () => {
@@ -156,16 +182,34 @@ test('packetizeH264: FU-A fragments reassemble to the original NAL', () => {
     assert.ok(Buffer.concat([Buffer.from([nalHeader]), body]).equals(nal));
 });
 
-test('packetizeAac: AU header section is correct; oversize frames are dropped', () => {
+test('packetizeAac: a legacy small AU uses one packet with the correct header', () => {
     const frame = randBytes(rng(5), 333);
-    const pkt = packetizeAac(new RtpTrack(97), frame, 4800)!;
+    const packets = packetizeAac(new RtpTrack(97), frame, 4800);
+    assert.equal(packets.length, 1);
+    const pkt = packets[0];
     const p = parseRtp(pkt);
     assert.equal(p.marker, true);
     assert.equal(p.payload.readUInt16BE(0), 16);                 // AU-headers-length in bits
     assert.equal(p.payload.readUInt16BE(2), frame.length << 3);  // size<<3 | index(0)
     assert.ok(p.payload.subarray(4).equals(frame));
-    assert.equal(packetizeAac(new RtpTrack(97), Buffer.alloc(1 << 13), 0), undefined);
-    assert.equal(packetizeAac(new RtpTrack(97), Buffer.alloc(0), 0), undefined);
+    assert.deepEqual(packetizeAac(new RtpTrack(97), Buffer.alloc(1 << 13), 0), []);
+    assert.deepEqual(packetizeAac(new RtpTrack(97), Buffer.alloc(0), 0), []);
+});
+
+test('packetizeAac: an oversized AAC AU is fragmented below the RTP MTU', () => {
+    const frame = randBytes(rng(51), 4096);
+    const packets = packetizeAac(new RtpTrack(97), frame, 32_000);
+    assert.ok(packets.length > 1);
+    const parsed = packets.map(parseRtp);
+    assert.ok(parsed.every(p => p.payload.length <= 1200), 'RTP payload exceeded the path-MTU budget');
+    assert.ok(parsed.every(p => p.ts === 32_000), 'fragments of one AU must share an RTP timestamp');
+    assert.ok(parsed.slice(0, -1).every(p => !p.marker), 'only the final fragment may carry M=1');
+    assert.equal(parsed.at(-1)!.marker, true);
+    assert.ok(parsed.slice(1).every((p, i) => p.seq === ((parsed[i].seq + 1) & 0xffff)));
+    assert.ok(parsed.every(p => p.payload.readUInt16BE(0) === 16));
+    assert.ok(parsed.every(p => p.payload.readUInt16BE(2) === frame.length << 3),
+        'each fragment must declare the complete AU size');
+    assert.ok(Buffer.concat(parsed.map(p => p.payload.subarray(4))).equals(frame));
 });
 
 test('RtpTrack.senderReport maps RTP time to NTP and counts correctly', () => {
@@ -199,6 +243,180 @@ const lenPrefixed = (nal: Buffer) => {
     p.writeUInt32BE(nal.length, 0); nal.copy(p, 4);
     return p;
 };
+const aacTagData = (packetType: number, payload: Buffer) =>
+    Buffer.concat([Buffer.from([0xaf, packetType]), payload]);
+
+/** Connect a minimal interleaved-TCP client and record wall time for each AU's
+ * marker packet, keyed by its RTP timestamp. No DESCRIBE is needed for these
+ * synthetic streams: the track/control IDs are fixed by startNativeServe. */
+async function connectMarkerClient(serve: { url: string }) {
+    const client = net.connect(parseInt(new URL(serve.url).port), '127.0.0.1');
+    await once(client, 'connect');
+    let buf = Buffer.alloc(0), responses = 0;
+    const markers = new Map<number, number>();
+    const packetTimes = new Map<number, number[]>();
+    let readyResolve!: () => void;
+    const ready = new Promise<void>(resolve => { readyResolve = resolve; });
+    client.on('data', d => {
+        buf = Buffer.concat([buf, d]);
+        for (;;) {
+            if (responses < 2) {
+                const end = buf.indexOf('\r\n\r\n');
+                if (end < 0) return;
+                buf = buf.subarray(end + 4);
+                if (++responses === 2) readyResolve();
+                continue;
+            }
+            if (buf.length < 4) return;
+            assert.equal(buf[0], 0x24, 'interleaved frame magic');
+            const len = buf.readUInt16BE(2);
+            if (buf.length < 4 + len) return;
+            const channel = buf[1];
+            const packet = buf.subarray(4, 4 + len);
+            buf = buf.subarray(4 + len);
+            if (channel === 0 && packet.length >= 12) {
+                const ts = packet.readUInt32BE(4);
+                const times = packetTimes.get(ts) ?? [];
+                times.push(performance.now());
+                packetTimes.set(ts, times);
+                if (packet[1] & 0x80) markers.set(ts, Date.now());
+            }
+        }
+    });
+    client.write('SETUP rtsp://x/trackID=0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n');
+    client.write('PLAY rtsp://x/ RTSP/1.0\r\nCSeq: 2\r\n\r\n');
+    await ready;
+    return { client, markers, packetTimes };
+}
+
+test('late AAC config leaves an established video-only serve alive', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({ flv, hasAudio: true, audioGraceMs: 10 });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+
+    const serve = await servePromise;
+    try {
+        assert.equal(serve.audioParams(), undefined, 'audio grace should publish a video-only SDP');
+        flv.write(flvTag(8, 100, aacTagData(0, Buffer.from([0x14, 0x08]))));
+        // A restart is requested on a microtask, so a short delay reliably exposes
+        // the old late-ASC rebuild loop without extending the suite materially.
+        await new Promise(r => setTimeout(r, 30));
+        assert.equal(flv.destroyed, false, 'late optional audio destroyed the video feed');
+        assert.equal(serve.alive, true, 'late optional audio killed the video-only serve');
+    } finally {
+        serve.destroy();
+    }
+});
+
+test('missing optional AAC does not hold video publication for seconds', async () => {
+    const flv = new PassThrough();
+    const started = Date.now();
+    const servePromise = startNativeServe({ flv, hasAudio: true });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+
+    const serve = await servePromise;
+    try {
+        const elapsed = Date.now() - started;
+        assert.ok(elapsed >= 150, `audio grace was skipped entirely (${elapsed}ms)`);
+        assert.ok(elapsed < 1000, `missing AAC delayed video publication ${elapsed}ms`);
+        assert.equal(serve.audioParams(), undefined);
+    } finally {
+        serve.destroy();
+    }
+});
+
+test('AAC RTP timestamps remain monotonic when FLV audio time jumps backward', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({ flv, hasAudio: true });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(8, 0, aacTagData(0, Buffer.from([0x14, 0x08]))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+
+    const serve = await servePromise;
+    const packets: Buffer[] = [];
+    const arrivals: number[] = [];
+    const unsubscribe = serve.subscribeAudio(packet => {
+        packets.push(Buffer.from(packet));
+        arrivals.push(performance.now());
+    });
+    try {
+        // At 16 kHz, 64 ms is exactly one 1024-sample AAC frame. Establish the
+        // synthesized clock with two normal frames before simulating an encoder
+        // timestamp reset several frames backward.
+        flv.write(Buffer.concat([
+            flvTag(8, 700, aacTagData(1, Buffer.alloc(40, 1))),
+            flvTag(8, 764, aacTagData(1, Buffer.alloc(40, 2))),
+        ]));
+        let deadline = Date.now() + 2500;
+        while (packets.length < 2 && Date.now() < deadline)
+            await new Promise(r => setTimeout(r, 10));
+        assert.equal(packets.length, 2, 'timed out waiting for initial AAC RTP packets');
+
+        flv.write(Buffer.concat([
+            flvTag(8, 100, aacTagData(1, Buffer.alloc(40, 3))),
+            flvTag(8, 164, aacTagData(1, Buffer.alloc(40, 4))),
+        ]));
+        deadline = Date.now() + 1000;
+        while (packets.length < 4 && Date.now() < deadline)
+            await new Promise(r => setTimeout(r, 10));
+        assert.equal(packets.length, 4, 'timed out waiting for post-reset AAC RTP packets');
+
+        const timestamps = packets.map(packet => packet.readUInt32BE(4));
+        const deltas = timestamps.slice(1).map((ts, i) => (ts - timestamps[i]) >>> 0);
+        assert.deepEqual(deltas, [1024, 1024, 1024],
+            `AAC RTP clock regressed across FLV reset: ${timestamps.join(', ')}`);
+        const arrivalDeltas = arrivals.slice(1).map((t, i) => t - arrivals[i]);
+        assert.ok(arrivalDeltas.every(d => d >= 35),
+            `AAC packets bunched after FLV reset: ${arrivalDeltas.map(d => d.toFixed(1)).join(', ')}ms`);
+    } finally {
+        unsubscribe();
+        serve.destroy();
+    }
+});
+
+test('AAC clock preserves an exact one-frame loss at 32kHz', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({ flv, hasAudio: true });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(8, 0, aacTagData(0, Buffer.from([0x12, 0x88]))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+
+    const serve = await servePromise;
+    const packets: Buffer[] = [];
+    const unsubscribe = serve.subscribeAudio(packet => packets.push(Buffer.from(packet)));
+    try {
+        // 32 kHz AAC-LC frames are 32 ms. Skip t=32 to model one missing frame;
+        // the next packet must retain that hole rather than permanently shifting
+        // the RTP clock (and RTCP A/V mapping) backward by 32 ms.
+        flv.write(Buffer.concat([
+            flvTag(8, 0, aacTagData(1, Buffer.alloc(4000, 1))),
+            flvTag(8, 64, aacTagData(1, Buffer.alloc(4000, 2))),
+        ]));
+        const deadline = Date.now() + 2500;
+        while (packets.filter(p => (p[1] & 0x80) !== 0).length < 2 && Date.now() < deadline)
+            await new Promise(r => setTimeout(r, 10));
+        const markers = packets.filter(p => (p[1] & 0x80) !== 0);
+        assert.equal(markers.length, 2);
+        assert.equal((markers[1].readUInt32BE(4) - markers[0].readUInt32BE(4)) >>> 0, 2048);
+    } finally {
+        unsubscribe();
+        serve.destroy();
+    }
+});
 
 test('a client joining mid-GOP receives the buffered GOP instantly', async () => {
     const flv = new PassThrough();
@@ -277,6 +495,90 @@ test('a client joining mid-GOP receives the buffered GOP instantly', async () =>
     }
 });
 
+async function verifyBootstrapHandoff(bootstrapFrames: number) {
+    const flv = new PassThrough();
+
+    // Exercise the large-IDR packet spread as well as the frame timeline. Using a
+    // one-packet IDR would miss a handoff that cuts through the middle of a real
+    // keyframe's T-28..T spread window.
+    const idr = Buffer.alloc(200_001, 0x55);
+    idr[0] = 0x65;
+    const bootstrap = [
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(idr))),
+    ];
+    for (let i = 1; i <= bootstrapFrames; i++)
+        bootstrap.push(flvTag(9, i * 33, avcTagData(2, 1, lenPrefixed(Buffer.from([0x41, i & 0xff])))));
+    flv.write(Buffer.concat(bootstrap));
+
+    const serve = await startNativeServe({ flv, hasAudio: false });
+    let client: net.Socket | undefined;
+    try {
+        const playStarted = Date.now();
+        const connected = await connectMarkerClient(serve);
+        client = connected.client;
+
+        // Feed actual post-publication frames at camera cadence. Keeping the test
+        // producer honest prevents a synchronously prefilled queue from masking a
+        // replay-to-live stall or a catch-up burst.
+        const liveFrames = 6;
+        const feeder = (async () => {
+            for (let i = 1; i <= liveFrames; i++) {
+                await new Promise(r => setTimeout(r, 33));
+                const frame = bootstrapFrames + i;
+                flv.write(flvTag(9, frame * 33,
+                    avcTagData(2, 1, lenPrefixed(Buffer.from([0x41, frame & 0xff])))));
+            }
+        })();
+
+        const finalFrame = bootstrapFrames + liveFrames;
+        const finalTs = finalFrame * 33 * 90;
+        const deadline = Date.now() + 2000;
+        await feeder;
+        while (!connected.markers.has(finalTs) && Date.now() < deadline)
+            await new Promise(r => setTimeout(r, 10));
+
+        assert.ok(connected.markers.has(0), 'join did not contain the complete bootstrap IDR');
+        assert.ok(connected.markers.get(0)! - playStarted < 100,
+            `first decodable frame took ${connected.markers.get(0)! - playStarted}ms`);
+
+        // Inspect the last eight retained bootstrap frames and every live frame.
+        // A burst can satisfy only an upper gap bound, so require a substantial
+        // wall-clock span as well as a bounded per-frame handoff gap.
+        const pacedStart = Math.max(1, bootstrapFrames - 8);
+        const wanted = Array.from({ length: finalFrame - pacedStart + 1 },
+            (_, i) => (pacedStart + i) * 33 * 90);
+        assert.ok(wanted.every(ts => connected.markers.has(ts)),
+            'paced bootstrap/live markers were missing');
+        const times = wanted.map(ts => connected.markers.get(ts)!);
+        const bootstrapSpan = connected.markers.get(bootstrapFrames * 33 * 90)!
+            - connected.markers.get(pacedStart * 33 * 90)!;
+        assert.ok(bootstrapSpan > 150,
+            `retained bootstrap collapsed into a ${bootstrapSpan}ms burst`);
+        const firstLive = connected.markers.get((bootstrapFrames + 1) * 33 * 90)!;
+        const lastLive = connected.markers.get(finalTs)!;
+        assert.ok(lastLive - firstLive > 80,
+            `post-bootstrap live frames collapsed into a ${lastLive - firstLive}ms burst`);
+        const gaps = times.slice(1).map((at, i) => at - times[i]);
+        const maxGap = Math.max(...gaps);
+        assert.ok(maxGap < 120,
+            `bootstrap replay froze before paced live video for ${maxGap}ms`);
+    } finally {
+        client?.destroy();
+        serve.destroy();
+    }
+}
+
+// 13/14 frames straddle the 450 ms reserve boundary at 30 fps; 24 frames model
+// the production 800 ms DirectStream settle. All three must join without a burst
+// or a replay-to-live pause.
+for (const bootstrapFrames of [13, 14, 24]) {
+    test(`bootstrap handoff is gapless with ${bootstrapFrames * 33}ms of media`, async () => {
+        await verifyBootstrapHandoff(bootstrapFrames);
+    });
+}
+
 test('the egress pacer spreads live frames over wall-clock by media timestamp', async () => {
     const flv = new PassThrough();
     const servePromise = startNativeServe({ flv, hasAudio: false });
@@ -336,7 +638,7 @@ test('the egress pacer spreads live frames over wall-clock by media timestamp', 
         // Write 12 live P-frames, media timestamps 40 ms apart, ALL synchronously
         // (one tick). A non-paced egress would flush them to the client instantly;
         // the pacer must instead release them ~40 ms apart on the wall clock.
-        const N = 12, STEP = 40, T0 = 200;
+        const N = 12, STEP = 40, T0 = 400;
         const writeWall = Date.now();
         for (let i = 0; i < N; i++) {
             const p = Buffer.concat([Buffer.from([0x41, 0xA0, i]), randBytes(rng(30 + i), 40)]);
@@ -350,13 +652,130 @@ test('the egress pacer spreads live frames over wall-clock by media timestamp', 
         const times = [...arrivals.entries()].sort((a, b) => a[0] - b[0]).map(e => e[1]);
         const firstDelay = times[0] - writeWall;
         const span = times[N - 1] - times[0];
-        // Paced, not burst: the first frame waits out the smoothing delay, and the
-        // batch is spread across roughly its (N-1)*STEP media span — an unpaced
-        // egress would deliver the whole synchronous write in a few ms.
-        assert.ok(firstDelay > 120, `first live frame arrived too soon (${firstDelay}ms) — not paced`);
+        // Paced, not burst: the first frame retains its future media deadline and
+        // the batch is spread across roughly its (N-1)*STEP media span — an
+        // unpaced egress would deliver the whole synchronous write in a few ms.
+        assert.ok(firstDelay > 220, `first live frame arrived too soon (${firstDelay}ms) — not paced`);
         assert.ok(span > 200, `live frames arrived in a ${span}ms burst — not spread by timestamp`);
         client.destroy();
     } finally {
+        serve.destroy();
+    }
+});
+
+test('a large IDR does not bunch the following P-frames behind its packet spread', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({ flv, hasAudio: false });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+    const serve = await servePromise;
+    const { client, markers } = await connectMarkerClient(serve);
+    try {
+        // Let the initial frame establish the pacer's wall/media epoch.
+        await new Promise(r => setTimeout(r, 650));
+        markers.clear();
+
+        // 500 KB is representative of a 4 MP IDR and exercises BURST_SLICE. All
+        // tags arrive in one tick, as they do after the camera's keyframe burst.
+        // Keep a production-sized reserve ahead of egress. This unit fixture
+        // publishes from a single IDR (unlike DirectStream's 800 ms bootstrap),
+        // so its initial epoch intentionally has no full smoothing reserve.
+        const base = 1100;
+        const idr = Buffer.alloc(500_001, 0x55); idr[0] = 0x65;
+        const tags = [flvTag(9, base, avcTagData(1, 1, lenPrefixed(idr)))];
+        for (let i = 1; i <= 4; i++)
+            tags.push(flvTag(9, base + i * 33, avcTagData(2, 1, lenPrefixed(Buffer.from([0x41, i])))));
+        flv.write(Buffer.concat(tags));
+
+        const wanted = [base, base + 33, base + 66].map(ms => ms * 90);
+        const deadline = Date.now() + 2500;
+        while (!wanted.every(ts => markers.has(ts)) && Date.now() < deadline)
+            await new Promise(r => setTimeout(r, 10));
+        assert.ok(wanted.every(ts => markers.has(ts)), 'timed out waiting for IDR and following P-frames');
+        const times = wanted.map(ts => markers.get(ts)!);
+        assert.ok(times[1] - times[0] >= 15,
+            `first P-frame was bunched with the IDR (${times[1] - times[0]}ms)`);
+        assert.ok(times[2] - times[1] >= 15,
+            `second P-frame was bunched with its predecessor (${times[2] - times[1]}ms)`);
+    } finally {
+        client.destroy();
+        serve.destroy();
+    }
+});
+
+test('same-time AAC ahead of a large IDR does not collapse the IDR packet spread', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({ flv, hasAudio: true });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(8, 0, aacTagData(0, Buffer.from([0x14, 0x08]))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+    const serve = await servePromise;
+    const { client, markers, packetTimes } = await connectMarkerClient(serve);
+    try {
+        await new Promise(r => setTimeout(r, 650));
+        markers.clear();
+        packetTimes.clear();
+
+        const base = 1100;
+        const idr = Buffer.alloc(500_001, 0x55); idr[0] = 0x65;
+        flv.write(Buffer.concat([
+            // FLV commonly places same-time audio before video. The audio packet
+            // must not head-of-line block the IDR's pre-deadline packet schedule.
+            flvTag(8, base, aacTagData(1, Buffer.alloc(100, 1))),
+            flvTag(9, base, avcTagData(1, 1, lenPrefixed(idr))),
+            flvTag(9, base + 33, avcTagData(2, 1, lenPrefixed(Buffer.from([0x41, 2])))),
+        ]));
+
+        const target = base * 90;
+        const deadline = Date.now() + 2500;
+        while (!markers.has(target) && Date.now() < deadline)
+            await new Promise(r => setTimeout(r, 10));
+        assert.ok(markers.has(target), 'timed out waiting for representative IDR');
+        const times = packetTimes.get(target) ?? [];
+        assert.ok(times.length > 120, `IDR did not exercise packet spreading (${times.length} packets)`);
+        const span = times[times.length - 1] - times[0];
+        assert.ok(span >= 10, `same-time AAC collapsed the IDR into a ${span.toFixed(1)}ms microburst`);
+    } finally {
+        client.destroy();
+        serve.destroy();
+    }
+});
+
+test('the egress pacer recovers promptly from a forward FLV timestamp discontinuity', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({ flv, hasAudio: false });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+    const serve = await servePromise;
+    const { client, markers } = await connectMarkerClient(serve);
+    try {
+        await new Promise(r => setTimeout(r, 650));
+        markers.clear();
+
+        // A camera encoder restart or timestamp glitch can jump the FLV clock
+        // forward while valid media keeps arriving. The relay must re-anchor; it
+        // must not wait the full ten seconds while reporting the input as alive.
+        const jump = 10_000;
+        flv.write(Buffer.concat([
+            flvTag(9, jump, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 2])))),
+            flvTag(9, jump + 33, avcTagData(2, 1, lenPrefixed(Buffer.from([0x41, 3])))),
+        ]));
+        const deadline = Date.now() + 1500;
+        while (!markers.has(jump * 90) && Date.now() < deadline)
+            await new Promise(r => setTimeout(r, 10));
+        assert.ok(markers.has(jump * 90), 'forward timestamp jump left egress frozen');
+        assert.equal(serve.alive, true);
+    } finally {
+        client.destroy();
         serve.destroy();
     }
 });
