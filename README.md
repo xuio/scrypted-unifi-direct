@@ -135,6 +135,9 @@ API of their own.
 - `npm test` — run the unit/integration test suite (`test/`, node:test; covers the
   extendedFlv de-trailer, FLV/RTP/SDP handling, the RTSP session, zone payload
   building, camera-settings mapping, and the detection engine — no camera needed).
+- `npm run test:soak` — exercise the restart-safe, token-redacting 24-hour stream
+  monitor entirely offline. Starting a real soak remains an explicit host-side
+  operation; this command never connects to or modifies Scrypted.
 - H.265 is deliberately not requested from cameras: the stream is passed through
   untranscoded and HomeKit requires H.264.
 

@@ -32,7 +32,8 @@
     "scrypted-deploy": "scrypted-deploy",
     "scrypted-readme": "scrypted-readme",
     "scrypted-package-json": "scrypted-package-json",
-    "test": "tsc -p tsconfig.test.json && node --test build-test/test/*.test.js"
+    "test": "tsc -p tsconfig.test.json && node --test build-test/test/*.test.js",
+    "test:soak": "python3 scripts/unifi-soak.py --self-test"
   },
   "main": "dist/main.nodejs.js",
   "devDependencies": {
