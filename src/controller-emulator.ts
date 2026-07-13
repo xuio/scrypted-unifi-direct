@@ -9,14 +9,19 @@ type Logger = { log: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
-// The camera has ONE shared audio encoder feeding all stream serializers. Mixed
-// rates across serializers make it emit garbage-decoding AAC, so we quiesce the
-// substreams (video2/video3 → /dev/null, audio off) and request 16 kHz on video1
-// — 16000 is the camera's native Opus/AAC rate (features.opusSampleRates=[16000]),
-// verified clean on all cameras. (Older notes mentioned 24 kHz; that predates the
-// substream quiesce and no longer applies.)
+// The camera has ONE shared audio encoder feeding all stream serializers. Asking
+// a serializer for Opus at a rate that differs from the AAC encoder's own rate
+// makes that shared encoder emit garbage-decoding AAC (mixed-rate conflict). We
+// only ever consume the AAC track (the native muxer has no Opus path), so we do
+// NOT request Opus at all — `withOpus: false` lets the camera push clean AAC at
+// whatever rate the encoder runs. This matters especially when the encoder is
+// not at 16 kHz: with a firmware patch that pins 32 kHz AAC, requesting
+// opusSampleRate=16000 corrupted ~2-3% of frames (audible glitch/level loss);
+// dropping the Opus request eliminates it (and the ~0.5% residual on 16 kHz cams).
+// AUDIO_SAMPLE_RATE stays only as the (now inert) opusSampleRate hint; the actual
+// AAC rate is the camera's own, and the muxer's parseAsc follows it.
 const AUDIO_SAMPLE_RATE = 16000;
-const AUDIO_WITH_OPUS = true;
+const AUDIO_WITH_OPUS = false;
 
 function wsAccept(key: string) {
     return crypto.createHash('sha1').update(key + WS_GUID).digest('base64');
