@@ -10,7 +10,9 @@ let nextPort = 28100;
 /** Registry with automatic teardown — open listeners would otherwise keep the
  *  test process's event loop alive forever and hang the runner. */
 function makeReg(t: { after(fn: () => Promise<void> | void): void }) {
-    const reg = new PushPortRegistry();
+    // Keep negative-route tests fast while production uses the one-second
+    // reload grace.
+    const reg = new PushPortRegistry(25);
     t.after(() => reg.close());
     return reg;
 }
@@ -29,6 +31,76 @@ async function connect(port: number): Promise<net.Socket> {
     await once(c, 'connect');
     return c;
 }
+
+test('register resolves only when the listener and route are both armed', async t => {
+    const reg = makeReg(t);
+    const port = nextPort++;
+    const match = makeRoute(['127.0.0.1']);
+
+    await reg.register(port, match.route);
+    // Connect immediately after the await: there is no scheduling/grace window
+    // in which a camera command could beat either listener bind or route install.
+    const c = await connect(port);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(match.received.length, 1);
+    c.destroy();
+});
+
+test('a transient unmatched push is held and delivered when its route arms', async t => {
+    const reg = new PushPortRegistry(250);
+    t.after(() => reg.close());
+    const port = nextPort++;
+    const other = makeRoute(['10.9.9.9']);
+    await reg.register(port, other.route); // establishes the shared listener
+
+    const c = await connect(port);
+    let clientClosed = false;
+    c.once('close', () => { clientClosed = true; });
+    await new Promise<void>(resolve => setTimeout(resolve, 10));
+    assert.equal(clientClosed, false, 'unmatched push was destroyed without reload grace');
+    assert.equal(other.received.length, 0, 'grace routed a socket fail-open');
+
+    const match = makeRoute(['127.0.0.1']);
+    await reg.register(port, match.route);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(match.received.length, 1, 'armed route did not claim the held push');
+    assert.equal(match.received[0].destroyed, false);
+    c.destroy();
+});
+
+test('a newer held retry replaces the older socket for the same source', async t => {
+    const reg = new PushPortRegistry(250);
+    t.after(() => reg.close());
+    const port = nextPort++;
+    const other = makeRoute(['10.9.9.9']);
+    await reg.register(port, other.route);
+
+    const oldClient = await connect(port);
+    const oldClosed = once(oldClient, 'close');
+    const freshClient = await connect(port);
+    await oldClosed;
+
+    const match = makeRoute(['127.0.0.1']);
+    await reg.register(port, match.route);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(match.received.length, 1, 'duplicate held retries were flushed together');
+    assert.equal(match.received[0].destroyed, false, 'freshest held retry was not retained');
+    freshClient.destroy();
+});
+
+test('close destroys grace-held sockets without waiting for their timer', async () => {
+    const reg = new PushPortRegistry(10_000);
+    const port = nextPort++;
+    const other = makeRoute(['10.9.9.9']);
+    await reg.register(port, other.route);
+    const c = await connect(port);
+    const clientClosed = once(c, 'close');
+    await new Promise<void>(resolve => setImmediate(resolve));
+
+    await reg.close();
+    await clientClosed;
+    assert.equal(other.received.length, 0);
+});
 
 test('routes a connection to the route matching its source IP', async t => {
     const reg = makeReg(t);

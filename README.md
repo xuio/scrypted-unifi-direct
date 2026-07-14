@@ -185,8 +185,10 @@ the emulator TLS certificate.
 
   The monitor discovers loopback RTSP URLs from `/tmp/unifi-direct.log`, never
   writes their random path tokens to its result files, and resumes safely when
-  invoked again with the same run directory. Use `--log` if the diagnostic log
-  is elsewhere. The built-in FFmpeg default points to the Darwin ARM64 binary in
+  invoked again with the same run directory. Deep audio events retain AAC codec
+  profile/object type plus observed encoded bitrate statistics while preserving
+  the existing sample-rate/channel-layout summary. Use `--log` if the diagnostic
+  log is elsewhere. The built-in FFmpeg default points to the Darwin ARM64 binary in
   Scrypted.app on macOS; Linux, Docker, Intel macOS, and custom installations
   must pass the correct path with `--ffmpeg`. Run `python3
   scripts/unifi-soak.py --help` for probe interval and timeout options.

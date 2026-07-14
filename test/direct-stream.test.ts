@@ -41,6 +41,75 @@ function makeStream() {
     );
 }
 
+test('arms the push route and readiness observers before commanding the camera', async () => {
+    let releaseRegistration!: () => void;
+    let registrationResolved = false;
+    const calls: string[] = [];
+    const registry = {
+        register: async () => {
+            calls.push('register');
+            await new Promise<void>(resolve => { releaseRegistration = resolve; });
+            registrationResolved = true;
+            calls.push('armed');
+        },
+        unregister: () => calls.push('unregister'),
+    };
+    let stream!: DirectStream;
+    const emulator = {
+        startStream() {
+            calls.push('startStream');
+            assert.equal(registrationResolved, true,
+                'camera was commanded before push registration completed');
+            assert.equal(typeof (stream as any).onServeReady, 'function',
+                'camera was commanded before the readiness observer was installed');
+            // Model an immediate camera push/promotion. A synchronous completion
+            // is intentionally harsher than the network can be and locks down
+            // the ordering without waiting for production settle timeouts.
+            (stream as any).serve = { url: 'rtsp://127.0.0.1/test', destroy() { } };
+            (stream as any).onServeReady();
+        },
+        stopStream() { calls.push('stopStream'); },
+    };
+    stream = new DirectStream(
+        emulator as any, 'AABBCCDDEEFF', 'video1', 'h264', '127.0.0.1', 17550,
+        '127.0.0.1', { log() { } }, registry as any,
+    );
+
+    const starting = stream.start();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual(calls, ['register'], 'camera command did not wait for route registration');
+
+    releaseRegistration();
+    await starting;
+    assert.deepEqual(calls, ['register', 'armed', 'startStream']);
+    stream.stop();
+    assert.deepEqual(calls, ['register', 'armed', 'startStream', 'stopStream', 'unregister']);
+});
+
+test('a synchronous camera command failure disarms startup observers cleanly', async () => {
+    const calls: string[] = [];
+    const emulator = {
+        startStream() { calls.push('startStream'); throw new Error('management session lost'); },
+        stopStream() { calls.push('stopStream'); },
+    };
+    const registry = {
+        register: async () => { calls.push('register'); },
+        unregister: () => calls.push('unregister'),
+    };
+    const stream = new DirectStream(
+        emulator as any, 'AABBCCDDEEFF', 'video1', 'h264', '127.0.0.1', 17550,
+        '127.0.0.1', { log() { } }, registry as any,
+    );
+
+    await assert.rejects(stream.start(), /management session lost/);
+    assert.equal((stream as any).onServeReady, undefined);
+    assert.equal((stream as any).onServeFail, undefined);
+    assert.deepEqual(calls, ['register', 'startStream', 'stopStream', 'unregister']);
+    // Give Node's unhandled-rejection check a turn; the abandoned readiness
+    // promise must remain disarmed rather than reject behind the caller's back.
+    await new Promise<void>(resolve => setImmediate(resolve));
+});
+
 const TEST_SPS = Buffer.from('6742c01eda0280b7fe5c05050502', 'hex');
 const TEST_PPS = Buffer.from('68ce3c80', 'hex');
 function makeAvcC() {

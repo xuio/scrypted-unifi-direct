@@ -32,6 +32,22 @@ READY_RE = re.compile(r"\bDS ([0-9A-F]{12}) (video[12]) ready (rtsp://\S+)")
 FRAMECRC_LINE_RE = re.compile(r"^\s*\d+\s*,")
 RTSP_RE = re.compile(r"(?:rtsp|rtsps)://\S+", re.IGNORECASE)
 TOKEN_RE = re.compile(r"(?i)(?:token|password|passwd|secret|credential)=\S+")
+AUDIO_STREAM_RE = re.compile(
+    r"\bAudio:\s*([A-Za-z0-9_.-]+)(?:\s*\(([^)]*)\))?",
+    re.IGNORECASE,
+)
+AUDIO_BITRATE_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*kb/s\b", re.IGNORECASE)
+
+AAC_OBJECT_TYPES = {
+    "main": 1,
+    "lc": 2,
+    "ssr": 3,
+    "ltp": 4,
+    "he-aac": 5,
+    "he-aacv2": 29,
+    "ld": 23,
+    "eld": 39,
+}
 
 ERROR_PATTERNS = {
     "pipeline_restart": re.compile(r"pipeline restart|restarting media pipeline", re.I),
@@ -220,7 +236,40 @@ def parse_framecrc_metadata(output: str) -> dict[str, Any]:
                 pass
         elif key == "channel_layout_name":
             metadata["channel_layout"] = value
+        elif key == "codec_id":
+            metadata["codec"] = value
     return metadata
+
+
+def parse_ffmpeg_audio_metadata(output: str) -> dict[str, Any]:
+    """Extract source codec details from FFmpeg's human-readable stream lines."""
+    metadata: dict[str, Any] = {}
+    for line in output.splitlines():
+        match = AUDIO_STREAM_RE.search(line)
+        if not match:
+            continue
+        codec, profile = match.groups()
+        metadata.setdefault("codec", codec.lower())
+        if profile:
+            metadata.setdefault("codec_profile", profile.strip())
+        bitrate = AUDIO_BITRATE_RE.search(line[match.end():])
+        if bitrate:
+            metadata.setdefault("declared_bitrate_bps", round(float(bitrate.group(1)) * 1000))
+    profile = metadata.get("codec_profile")
+    if metadata.get("codec") == "aac" and isinstance(profile, str):
+        object_type = AAC_OBJECT_TYPES.get(profile.casefold().replace(" ", ""))
+        if object_type is not None:
+            metadata["aac_object_type"] = object_type
+    return metadata
+
+
+def numeric_summary(values: list[int | float]) -> dict[str, int | float | None]:
+    return {
+        "samples": len(values),
+        "min": min(values) if values else None,
+        "median": statistics.median(values) if values else None,
+        "max": max(values) if values else None,
+    }
 
 
 def timestamp_anomalies(frames: list[dict[str, int | str]]) -> dict[str, int]:
@@ -572,7 +621,7 @@ class SoakMonitor:
             "-hide_banner",
             "-nostdin",
             "-loglevel",
-            "error",
+            "error" if media == "video" else "info",
             "-xerror",
             "-rtsp_transport",
             "tcp",
@@ -607,6 +656,7 @@ class SoakMonitor:
         wall_ms = round((time.monotonic() - started) * 1000, 1)
         frames = parse_framecrc(run.stdout)
         metadata = parse_framecrc_metadata(run.stdout)
+        audio_metadata = parse_ffmpeg_audio_metadata(run.stderr) if media == "audio" else {}
         anomalies = timestamp_anomalies(frames)
         coverage_seconds = None
         time_base = metadata.get("time_base")
@@ -641,6 +691,11 @@ class SoakMonitor:
         if media == "audio":
             result["sample_rate"] = metadata.get("sample_rate")
             result["channel_layout"] = metadata.get("channel_layout")
+            result["codec"] = audio_metadata.get("codec") or metadata.get("codec")
+            result["codec_profile"] = audio_metadata.get("codec_profile")
+            result["aac_object_type"] = audio_metadata.get("aac_object_type")
+            result["declared_bitrate_bps"] = audio_metadata.get("declared_bitrate_bps")
+            result.update(self.audio_bitrate_probe(url))
         if run.returncode:
             result["error"] = error_category(run.stderr, run.returncode)
         elif not coverage_ok:
@@ -652,6 +707,66 @@ class SoakMonitor:
         elif arrival["arrival_stalls"]:
             result["error"] = "arrival-stall"
         return result
+
+    def audio_bitrate_probe(self, url: str) -> dict[str, Any]:
+        """Best-effort encoded-packet sample; decoder health remains authoritative."""
+        command = [
+            self.args.ffmpeg,
+            "-hide_banner",
+            "-nostdin",
+            "-loglevel",
+            "error",
+            "-xerror",
+            "-rtsp_transport",
+            "tcp",
+            "-i",
+            url,
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-c:a",
+            "copy",
+            "-t",
+            str(self.args.deep_seconds),
+            "-f",
+            "framecrc",
+            "pipe:1",
+        ]
+        try:
+            run = run_command(
+                command,
+                timeout=max(self.args.probe_timeout, self.args.deep_seconds + 10),
+            )
+        except subprocess.TimeoutExpired:
+            return {"bitrate_probe_error": "timeout"}
+        except OSError as error:
+            return {"bitrate_probe_error": error_category(str(error))}
+        if run.returncode:
+            return {"bitrate_probe_error": error_category(run.stderr, run.returncode)}
+        frames = parse_framecrc(run.stdout)
+        metadata = parse_framecrc_metadata(run.stdout)
+        time_base = metadata.get("time_base")
+        if not frames or not time_base:
+            return {"bitrate_probe_error": "metadata-unavailable"}
+        numerator, denominator = time_base
+        if numerator <= 0 or denominator <= 0:
+            return {"bitrate_probe_error": "metadata-unavailable"}
+        first_pts = min(int(frame["pts"]) for frame in frames)
+        last_end = max(
+            int(frame["pts"]) + max(0, int(frame["duration"]))
+            for frame in frames
+        )
+        coverage_seconds = (last_end - first_pts) * numerator / denominator
+        if coverage_seconds <= 0:
+            return {"bitrate_probe_error": "metadata-unavailable"}
+        return {
+            "bitrate_bps": round(
+                sum(int(frame["size"]) for frame in frames) * 8 / coverage_seconds
+            ),
+            "bitrate_source": "encoded-frame-sizes",
+            "bitrate_probe_frames": len(frames),
+            "bitrate_probe_seconds": round(coverage_seconds, 4),
+        }
 
     def deep_probe(self) -> None:
         sources = self.discover_sources()
@@ -742,12 +857,31 @@ class SoakMonitor:
         video_rows = [row for event in deep for row in event.get("video", [])]
         audio_rows = [row for event in deep for row in event.get("audio", [])]
         audio_profiles: dict[str, int] = {}
+        audio_codec_profiles: dict[str, int] = {}
+        aac_object_types: dict[str, int] = {}
+        audio_bitrates: list[int | float] = []
+        declared_audio_bitrates: list[int | float] = []
         for row in audio_rows:
             sample_rate = row.get("sample_rate")
             channel_layout = row.get("channel_layout")
             if sample_rate or channel_layout:
                 label = f"{sample_rate or 'unknown'}Hz/{channel_layout or 'unknown'}"
                 audio_profiles[label] = audio_profiles.get(label, 0) + 1
+            codec = row.get("codec")
+            codec_profile = row.get("codec_profile")
+            if codec or codec_profile:
+                label = f"{codec or 'unknown'}/{codec_profile or 'unknown'}"
+                audio_codec_profiles[label] = audio_codec_profiles.get(label, 0) + 1
+            object_type = row.get("aac_object_type")
+            if object_type is not None:
+                label = str(object_type)
+                aac_object_types[label] = aac_object_types.get(label, 0) + 1
+            bitrate = row.get("bitrate_bps")
+            if isinstance(bitrate, (int, float)) and not isinstance(bitrate, bool):
+                audio_bitrates.append(bitrate)
+            declared_bitrate = row.get("declared_bitrate_bps")
+            if isinstance(declared_bitrate, (int, float)) and not isinstance(declared_bitrate, bool):
+                declared_audio_bitrates.append(declared_bitrate)
         ended_epoch = time.time()
         if not final:
             status = "running"
@@ -815,6 +949,13 @@ class SoakMonitor:
                     default=None,
                 ),
                 "profiles": dict(sorted(audio_profiles.items())),
+                "codec_profiles": dict(sorted(audio_codec_profiles.items())),
+                "aac_object_types": dict(sorted(aac_object_types.items())),
+                "bitrate_bps": numeric_summary(audio_bitrates),
+                "declared_bitrate_bps": numeric_summary(declared_audio_bitrates),
+                "bitrate_probe_failures": sum(
+                    bool(row.get("bitrate_probe_error")) for row in audio_rows
+                ),
             },
         }
         return summary
@@ -881,10 +1022,22 @@ def self_test() -> None:
     }
     audio_fixture = (
         "#tb 0: 1/32000\n"
+        "#codec_id 0: pcm_s16le\n"
         "#sample_rate 0: 32000\n"
         "#channel_layout_name 0: mono\n"
-        "0, 0, 0, 960, 128, 0xaaaa\n"
-        "0, 960, 960, 960, 128, 0xbbbb\n"
+        "0, 0, 0, 1024, 2048, 0xaaaa\n"
+        "0, 1024, 1024, 1024, 2048, 0xbbbb\n"
+    )
+    audio_packet_fixture = (
+        "#tb 0: 1/32000\n"
+        "#codec_id 0: aac\n"
+        "#sample_rate 0: 32000\n"
+        "#channel_layout_name 0: mono\n"
+        "0, 0, 0, 1024, 512, 0xaaaa\n"
+        "0, 1024, 1024, 1024, 512, 0xbbbb\n"
+    )
+    audio_stderr_fixture = (
+        "Stream #0:0: Audio: aac (LC), 32000 Hz, mono, fltp, 128 kb/s\n"
     )
     video_fixture = (
         "#tb 0: 1/25\n"
@@ -898,7 +1051,18 @@ def self_test() -> None:
         "time_base": [1, 32000],
         "sample_rate": 32000,
         "channel_layout": "mono",
+        "codec": "pcm_s16le",
     }
+    assert parse_ffmpeg_audio_metadata(audio_stderr_fixture) == {
+        "codec": "aac",
+        "codec_profile": "LC",
+        "declared_bitrate_bps": 128000,
+        "aac_object_type": 2,
+    }
+    assert parse_ffmpeg_audio_metadata("Stream #0:0: Audio: aac, 16000 Hz, mono\n") == {
+        "codec": "aac",
+    }
+    assert numeric_summary([]) == {"samples": 0, "min": None, "median": None, "max": None}
     assert timestamp_anomalies(frames) == {
         "nonpositive_pts": 0,
         "positive_pts_gaps": 0,
@@ -932,12 +1096,19 @@ def self_test() -> None:
                 ]
             )
         elif args[0] == "/fake/ffmpeg" and "framecrc" in args:
-            stdout = video_fixture if "0:v:0" in args else audio_fixture
+            if "0:v:0" in args:
+                stdout = video_fixture
+            elif "-c:a" in args:
+                assert args[args.index("-c:a") + 1] == "copy"
+                stdout = audio_packet_fixture
+            else:
+                stdout = audio_fixture
         elif args[0] == "/fake/ffmpeg":
             stdout = ""
         else:
             raise AssertionError(f"unexpected self-test command: {args[0]}")
-        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr="")
+        stderr = audio_stderr_fixture if "0:a:0" in args else ""
+        return subprocess.CompletedProcess(args, 0, stdout=stdout, stderr=stderr)
 
     def fake_framecrc_command(
         args: list[str],
@@ -946,6 +1117,7 @@ def self_test() -> None:
         run = fake_run_command(args, timeout)
         if "0:v:0" in args:
             return run, [0.0, 0.04, 0.08]
+        assert "-c:a" not in args, "the authoritative audio health probe must decode AAC"
         return run, [0.0, 0.03]
 
     globals()["run_command"] = fake_run_command
@@ -1002,6 +1174,20 @@ def self_test() -> None:
             assert summary["deep_audio"]["cadence_anomalies"] == 0
             assert summary["deep_audio"]["arrival_stalls"] == 0
             assert summary["deep_audio"]["profiles"] == {"32000Hz/mono": 4}
+            assert summary["deep_audio"]["codec_profiles"] == {"aac/LC": 4}
+            assert summary["deep_audio"]["aac_object_types"] == {"2": 4}
+            assert summary["deep_audio"]["bitrate_bps"] == {
+                "samples": 4,
+                "min": 128000,
+                "median": 128000.0,
+                "max": 128000,
+            }
+            assert summary["deep_audio"]["declared_bitrate_bps"] == {
+                "samples": 4,
+                "min": 128000,
+                "median": 128000.0,
+                "max": 128000,
+            }
             assert "rtsp://" not in events_text
             assert not monitor.pid_path.exists()
             monitor.append_event("monitor_fatal", error="synthetic-failure")
@@ -1031,6 +1217,23 @@ def self_test() -> None:
             assert missing_summary["deep_video"]["probes"] == 8
             assert missing_summary["deep_video"]["failures"] == 1
             assert "rtsp://" not in missing_monitor.events_path.read_text()
+
+            # Old deep events lack codec/profile/bitrate fields. They must still
+            # summarize with the original rate/layout profile and no exceptions.
+            legacy_run = root / "legacy-run"
+            legacy_run.mkdir()
+            legacy_args = argparse.Namespace(**{**vars(args), "run_dir": str(legacy_run)})
+            legacy_monitor = SoakMonitor(legacy_args)
+            legacy_monitor.append_event(
+                "deep",
+                video=[],
+                audio=[{"camera": "Legacy", "sample_rate": 16000, "channel_layout": "mono", "ok": True}],
+            )
+            legacy_audio = legacy_monitor.build_summary(final=False)["deep_audio"]
+            assert legacy_audio["profiles"] == {"16000Hz/mono": 1}
+            assert legacy_audio["codec_profiles"] == {}
+            assert legacy_audio["aac_object_types"] == {}
+            assert legacy_audio["bitrate_bps"]["samples"] == 0
     finally:
         globals()["run_command"] = original_run_command
         globals()["run_framecrc_command"] = original_framecrc_command

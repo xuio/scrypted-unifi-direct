@@ -246,19 +246,35 @@ export class DirectStream {
                 throw new Error('stopped');
             }
             this.registered = true;
-            this.commandCameraStream();
 
-            // Resolve once a stable connection has been promoted and its RTSP serve is
-            // up; reject if that doesn't happen in time (no camera push, or endless
-            // connection churn) so the provider can retry from scratch.
-            await new Promise<void>((resolve, reject) => {
+            // Arm completion observers before commanding the camera. The push
+            // listener and source-scoped route are already live because
+            // register() was awaited above; installing these callbacks first also
+            // makes an immediately delivered/settled push impossible to miss.
+            // (Real cameras arrive asynchronously, but keeping the ordering
+            // explicit avoids a timing dependency and makes reload startup
+            // deterministic.)
+            let disarmReady = () => { };
+            const ready = new Promise<void>((resolve, reject) => {
                 let timer: any = setTimeout(() => reject(new Error('timed out waiting for a stable camera connection')), 25000);
                 // clear both callbacks once settled so a later stop() can't invoke
                 // a stale rejection against the already-resolved promise.
                 const done = () => { clearTimeout(timer); timer = undefined; this.onServeReady = undefined; this.onServeFail = undefined; };
+                disarmReady = done;
                 this.onServeReady = () => { done(); resolve(); };
                 this.onServeFail = (e) => { done(); reject(e); };
             });
+            try {
+                this.commandCameraStream();
+            } catch (e) {
+                // The command can fail synchronously if the management session
+                // disappeared. Clear the timer/callbacks without rejecting the
+                // not-yet-awaited promise (which would become an unhandled
+                // rejection while the original command error propagates).
+                disarmReady();
+                throw e;
+            }
+            await ready;
         } catch (e) {
             this.stop();   // release cameraPort/emulator so the next attempt is clean
             throw e;
