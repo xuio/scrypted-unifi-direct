@@ -20,12 +20,13 @@ export interface PushRoute {
 // and destroying a burst which the camera immediately recreates. The bound
 // ensures each camera retry replaces, rather than accumulates beside, its prior
 // pending socket.
-export const PENDING_ROUTE_GRACE_MS = 1000;
+export const PENDING_ROUTE_GRACE_MS = 10_000;
 const MAX_PENDING_PER_SOURCE = 1;
 
 interface PendingPush {
     sock: net.Socket;
     timer: ReturnType<typeof setTimeout>;
+    deadline: number;
     onClose: () => void;
     onError: () => void;
 }
@@ -160,13 +161,20 @@ export class PushPortRegistry {
         let group = bySource.get(ip);
         if (!group) { group = new Set(); bySource.set(ip, group); }
 
+        let deadline = Date.now() + this.pendingRouteGraceMs;
+
         // Keep only the freshest camera retry. DirectStream also prefers the
         // newest setup candidate, and flushing duplicate held retries would
-        // create needless candidate churn and retained kernel buffers. This is
-        // an expected reload path, so replacement is deliberately silent.
+        // create needless candidate churn and retained kernel buffers. Preserve
+        // the first retry's deadline so a source that never gets a route is
+        // still reported periodically instead of extending its grace forever.
+        // This is an expected reload path, so replacement is deliberately silent.
         if (group.size >= MAX_PENDING_PER_SOURCE) {
             const oldest = group.values().next().value as PendingPush | undefined;
-            if (oldest) this.removePending(port, ip, oldest, true);
+            if (oldest) {
+                deadline = oldest.deadline;
+                this.removePending(port, ip, oldest, true);
+            }
             // removePending may have pruned the maps; reacquire the live group.
             bySource = this.pending.get(port);
             if (!bySource) { bySource = new Map(); this.pending.set(port, bySource); }
@@ -180,8 +188,8 @@ export class PushPortRegistry {
         const timer = setTimeout(() => {
             this.removePending(port, ip, held, false);
             this.dropUnrouted(port, ip, sock);
-        }, this.pendingRouteGraceMs);
-        held = { sock, timer, onClose, onError };
+        }, Math.max(0, deadline - Date.now()));
+        held = { sock, timer, deadline, onClose, onError };
         group.add(held);
         sock.once('close', onClose);
         sock.once('error', onError);

@@ -76,9 +76,14 @@ test('a newer held retry replaces the older socket for the same source', async t
     await reg.register(port, other.route);
 
     const oldClient = await connect(port);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    const originalDeadline = [...(reg as any).pending.get(port).get('127.0.0.1')][0].deadline;
     const oldClosed = once(oldClient, 'close');
     const freshClient = await connect(port);
     await oldClosed;
+    const replacementDeadline = [...(reg as any).pending.get(port).get('127.0.0.1')][0].deadline;
+    assert.equal(replacementDeadline, originalDeadline,
+        'duplicate retries extended the bounded route-registration grace');
 
     const match = makeRoute(['127.0.0.1']);
     await reg.register(port, match.route);
