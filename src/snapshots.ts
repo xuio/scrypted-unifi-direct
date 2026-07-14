@@ -26,6 +26,22 @@ const FULL_RES_SNAPSHOT_TIMEOUT_MS = 3000;
 /** The native camera still is the final cold/error fallback and must itself be
  *  bounded; CameraApiClient also aborts its underlying HTTPS request. */
 const MJPG_SNAPSHOT_TIMEOUT_MS = 1600;
+/** Image conversion is normally tens of milliseconds. A wedged remote
+ * Sharp/Vips worker must not outlive the HomeKit resource request. */
+const RESIZE_TIMEOUT_MS = 1000;
+/** End-to-end budget for the independent exact-size conversion, including the
+ * media-manager lookup that resolves the ffmpeg executable. */
+const FALLBACK_RESIZE_TIMEOUT_MS = 800;
+/** Keep a camera-native, Apple-safe still ready even while full-resolution
+ * keyframe snapshots are healthy. It is the zero-work escape hatch when an
+ * image converter or unrelated full-resolution caller is busy. */
+const NATIVE_PREVIEW_REFRESH_MS = 30_000;
+/** HomeKit does not currently pass RequestPictureOptions.timeout. Bound the
+ * complete preview path anyway so HAP always receives bytes before iOS gives up. */
+const PREVIEW_REQUEST_TIMEOUT_MS = 4000;
+/** Full-resolution capture is deliberately not hedged with a native request, so
+ * leave room for the bounded native fallback after its stream deadline. */
+const FULL_REQUEST_TIMEOUT_MS = FULL_RES_SNAPSHOT_TIMEOUT_MS + MJPG_SNAPSHOT_TIMEOUT_MS + 200;
 /** Frames smaller than this are treated as a broken/empty decode and not cached.
  *  Kept low so a legitimately dark night scene (which still compresses to tens of
  *  KB) is accepted — only a near-empty/corrupt result is rejected. */
@@ -39,43 +55,49 @@ const JPEG_EOI_1 = 0xd9;
 
 /** Cheap structural validation before bytes are ever labelled image/jpeg.
  *  EOI may be followed by a small amount of transport whitespace/padding. */
-export function isUsableJpeg(jpeg: Buffer | undefined): boolean {
-    if (!jpeg || jpeg.length < MIN_VALID_SNAPSHOT) return false;
-    if (jpeg[0] !== JPEG_SOI_0 || jpeg[1] !== JPEG_SOI_1) return false;
-    let hasDimensions = false;
+export function jpegDimensions(jpeg: Buffer | undefined): { width: number; height: number } | undefined {
+    if (!jpeg || jpeg.length < MIN_VALID_SNAPSHOT) return undefined;
+    if (jpeg[0] !== JPEG_SOI_0 || jpeg[1] !== JPEG_SOI_1) return undefined;
+    let dimensions: { width: number; height: number } | undefined;
     // Walk the metadata segments through Start Of Scan and require a real SOF
     // with non-zero dimensions. This rejects HTML/junk wrapped in SOI/EOI.
     for (let i = 2; i + 3 < jpeg.length;) {
-        if (jpeg[i] !== 0xff) return false;
+        if (jpeg[i] !== 0xff) return undefined;
         while (i < jpeg.length && jpeg[i] === 0xff) i++;
         const marker = jpeg[i++];
         if (marker === 0xd9 || marker === 0xda) break;
         if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
-        if (i + 1 >= jpeg.length) return false;
+        if (i + 1 >= jpeg.length) return undefined;
         const segmentLength = jpeg.readUInt16BE(i);
-        if (segmentLength < 2 || i + segmentLength > jpeg.length) return false;
+        if (segmentLength < 2 || i + segmentLength > jpeg.length) return undefined;
         const isSof = (marker >= 0xc0 && marker <= 0xcf)
             && ![0xc4, 0xc8, 0xcc].includes(marker);
         if (isSof) {
-            if (segmentLength < 8) return false;
+            if (segmentLength < 8) return undefined;
             const height = jpeg.readUInt16BE(i + 3);
             const width = jpeg.readUInt16BE(i + 5);
-            if (!width || !height) return false;
-            hasDimensions = true;
+            if (!width || !height) return undefined;
+            dimensions = { width, height };
         }
         i += segmentLength;
     }
-    if (!hasDimensions) return false;
+    if (!dimensions) return undefined;
     const start = Math.max(2, jpeg.length - 64);
     for (let i = jpeg.length - 2; i >= start; i--) {
-        if (jpeg[i] === JPEG_SOI_0 && jpeg[i + 1] === JPEG_EOI_1) return true;
+        if (jpeg[i] === JPEG_SOI_0 && jpeg[i + 1] === JPEG_EOI_1) return dimensions;
     }
-    return false;
+    return undefined;
 }
 
-/** A cached snapshot frame: its capture timestamp doubles as a stable identity
- *  for keying resized variants. */
-export type SnapFrame = { ts: number; jpeg: Buffer };
+export function isUsableJpeg(jpeg: Buffer | undefined): boolean {
+    return !!jpegDimensions(jpeg);
+}
+
+/** A cached snapshot frame. The monotonic id is the stable identity used for
+ * resized variants; timestamp is reserved for freshness decisions. */
+export type SnapFrame = { ts: number; jpeg: Buffer; id?: number };
+
+type CaptureLane = 'preview' | 'event' | 'full';
 
 /** Narrow dependency seams used by deterministic unit tests. Production callers
  *  use the defaults, so ffmpeg/media-manager behavior remains unchanged. */
@@ -83,8 +105,12 @@ export interface SnapshotManagerOptions {
     now?: () => number;
     fullResTimeoutMs?: number;
     mjpgTimeoutMs?: number;
+    resizeTimeoutMs?: number;
+    fallbackResizeTimeoutMs?: number;
+    previewTimeoutMs?: number;
     decodeKeyframeToJpeg?: (annexb: Buffer) => Promise<Buffer>;
     resizeJpeg?: (jpeg: Buffer, options: RequestPictureOptions, sourceId: string | undefined) => Promise<Buffer>;
+    fallbackResizeJpeg?: (jpeg: Buffer, options: RequestPictureOptions) => Promise<Buffer>;
     loadImage?: (jpeg: Buffer, sourceId: string | undefined) => Promise<Image>;
 }
 
@@ -126,15 +152,26 @@ export class SnapshotManager {
     constructor(private src: SnapshotSource, private options: SnapshotManagerOptions = {}) { }
 
     private cache?: SnapFrame;
+    private previewCache?: SnapFrame;
     private lastGood?: SnapFrame;   // last valid frame, served when a fresh capture fails
     private generation = 0;
-    private inflight?: { generation: number; promise: Promise<SnapFrame> };
+    private nextFrameId = 0;
+    /** Preview, event, and full-resolution work must never share a cold promise:
+     * a HomeKit tile otherwise inherits a detection caller's multi-second path. */
+    private inflight = new Map<CaptureLane, { generation: number; promise: Promise<SnapFrame> }>();
+    private nativePreview?: SnapFrame;
+    private nativePreviewGeneration = 0;
+    private nativePreviewInflight?: { generation: number; promise: Promise<SnapFrame> };
 
     // Cache of resized variants, keyed by "WxH" and tied to the SOURCE FRAME's
-    // identity (its ts) so a burst of same-size requests re-uses one resize — and
+    // monotonic identity so a burst of same-size requests re-uses one resize — and
     // so a background refresh that swaps the source frame can't mislabel an old
     // resized frame under the new timestamp.
-    private resized = new Map<string, { srcTs: number; jpeg: Buffer }>();
+    private resized = new Map<string, { srcId: number; jpeg: Buffer }>();
+    private resizing = new Map<string, { srcId: number; event: boolean; promise: Promise<Buffer> }>();
+    private latestResizeOperation = new Map<string, number>();
+    private nextResizeOperation = 0;
+    private externalFrameIds = new WeakMap<SnapFrame, number>();
 
     private now() { return this.options.now?.() ?? Date.now(); }
 
@@ -142,70 +179,177 @@ export class SnapshotManager {
     clearCache() {
         this.generation++;
         this.cache = undefined;
-        this.resized.clear();
+        this.previewCache = undefined;
         // The old promise is not forcibly cancelled, but generation checks keep
         // it from repopulating state after a camera/setting change.
-        this.inflight = undefined;
+        this.inflight.clear();
+        this.resizing.clear();
+        this.latestResizeOperation.clear();
+        this.nativePreviewInflight = undefined;
     }
     /** Drop everything, including the last-good frame (camera identity changed). */
-    reset() { this.clearCache(); this.lastGood = undefined; }
+    reset() {
+        this.clearCache();
+        this.lastGood = undefined;
+        this.nativePreview = undefined;
+        this.resized.clear();
+        this.externalFrameIds = new WeakMap();
+    }
+
+    private lane(options?: RequestPictureOptions): CaptureLane {
+        if (options?.reason === 'event') return 'event';
+        if (options?.reason === 'periodic' || options?.periodicRequest
+            || options?.picture?.width || options?.picture?.height)
+            return 'preview';
+        return 'full';
+    }
 
     /** Get a snapshot frame with stale-while-revalidate caching: return any cached
      *  frame INSTANTLY and refresh in the background when stale, so a fresh decode
      *  never blocks the request. */
     async getFrame(options?: RequestPictureOptions): Promise<SnapFrame> {
+        const lane = this.lane(options);
         const ttl = this.src.cacheTtlMs();
-        if (this.cache && ttl > 0) {
-            const age = this.now() - this.cache.ts;
-            if (age >= ttl && !this.inflight) {
-                const refresh = this.startCapture(options);
+        // Event thumbnails need a fresh camera frame and must not join periodic
+        // capture/cache work.
+        const cached = lane === 'preview' ? this.previewCache : this.cache;
+        if (lane !== 'event' && cached && ttl > 0) {
+            const age = this.now() - cached.ts;
+            if (age >= ttl && !this.inflight.has(lane)) {
+                const refresh = this.startCapture(lane);
                 refresh.promise.catch(() => { });   // errors keep the stale frame
             }
-            return this.cache;
+            return cached;
         }
         // No cached frame yet (or caching disabled): capture now, coalescing callers.
-        if (!this.inflight) this.startCapture(options);
-        return this.inflight!.promise;
+        if (!this.inflight.has(lane)) this.startCapture(lane);
+        return this.inflight.get(lane)!.promise;
     }
 
-    /** Seed the first post-load preview without waiting for HomeKit's first poll. */
+    /** Seed an always-ready camera-native still without waiting for HomeKit's
+     * first poll. Unlike a regular preview capture this deliberately does not
+     * choose a full-resolution keyframe when one happens to be available. */
     warm(): void {
-        if (this.src.cacheTtlMs() <= 0 || this.cache || this.inflight) return;
-        this.getFrame({ reason: 'periodic', picture: { width: 640, height: 360 } })
-            .catch(e => dbg('snapshot warm failed', this.src.tag(), (e as Error)?.message));
+        if (this.src.cacheTtlMs() <= 0) return;
+        this.ensureNativePreview();
     }
 
-    private startCapture(options?: RequestPictureOptions) {
+    private startCapture(lane: CaptureLane) {
         const generation = this.generation;
         const holder = { generation, promise: undefined as unknown as Promise<SnapFrame> };
-        holder.promise = this.captureJpeg(generation, this.isFastPreview(options)).finally(() => {
-            if (this.inflight === holder) this.inflight = undefined;
+        holder.promise = this.captureJpeg(generation, lane).finally(() => {
+            if (this.inflight.get(lane) === holder) this.inflight.delete(lane);
         });
-        this.inflight = holder;
+        this.inflight.set(lane, holder);
         return holder;
     }
 
-    private isFastPreview(options?: RequestPictureOptions) {
-        return options?.reason === 'periodic' || !!(options?.picture?.width || options?.picture?.height);
+    private frameId(frame: SnapFrame): number {
+        if (frame.id !== undefined) return frame.id;
+        let id = this.externalFrameIds.get(frame);
+        if (id === undefined) {
+            id = ++this.nextFrameId;
+            this.externalFrameIds.set(frame, id);
+        }
+        return id;
     }
 
-    /** Downscale a snapshot frame to the requested picture size (never upscale).
-     *  Caches per size against the source frame. */
+    private resizedKey(options?: RequestPictureOptions) {
+        const w = options?.picture?.width, h = options?.picture?.height;
+        return w || h ? `${w || ''}x${h || ''}` : undefined;
+    }
+
+    private matchesRequestedSize(jpeg: Buffer, options?: RequestPictureOptions) {
+        const dimensions = jpegDimensions(jpeg);
+        if (!dimensions) return false;
+        const width = options?.picture?.width;
+        const height = options?.picture?.height;
+        return (!width || dimensions.width === Math.round(width))
+            && (!height || dimensions.height === Math.round(height));
+    }
+
+    private rememberResized(
+        key: string,
+        srcId: number,
+        jpeg: Buffer,
+        generation: number,
+        operation: number,
+        options: RequestPictureOptions,
+    ) {
+        if (!this.matchesRequestedSize(jpeg, options)) {
+            const dimensions = jpegDimensions(jpeg);
+            throw new Error(`resize returned wrong dimensions (${dimensions?.width || 0}x${dimensions?.height || 0})`);
+        }
+        if (generation !== this.generation || this.latestResizeOperation.get(key) !== operation) return;
+        this.resized.set(key, { srcId, jpeg });
+        if (this.resized.size > 8) this.resized.delete(this.resized.keys().next().value!);
+    }
+
+    /** Refresh the low-resolution native safety image at low frequency. It is
+     * deliberately separate from the full-resolution cache: warming HomeKit
+     * must not downgrade an unrelated no-size snapshot for an entire TTL. */
+    private ensureNativePreview(): void {
+        this.getNativePreview().catch(e =>
+            dbg('snapshot native warm failed', this.src.tag(), (e as Error)?.message));
+    }
+
+    /** Return one fresh native still, coalescing the warm hedge with a cold
+     * preview fallback so startup never sends duplicate camera requests. */
+    private getNativePreview(
+        generation = this.generation,
+        maxAgeMs = NATIVE_PREVIEW_REFRESH_MS,
+        reuseInflight = true,
+    ): Promise<SnapFrame> {
+        if (this.nativePreviewGeneration === generation
+            && this.nativePreview && this.now() - this.nativePreview.ts < maxAgeMs)
+            return Promise.resolve(this.nativePreview);
+        if (reuseInflight && this.nativePreviewInflight?.generation === generation)
+            return this.nativePreviewInflight.promise;
+        const holder = { generation, promise: undefined as unknown as Promise<SnapFrame> };
+        holder.promise = this.captureMjpgJpeg(generation).then(jpeg => {
+            const frame = { id: ++this.nextFrameId, ts: this.now(), jpeg };
+            if (generation === this.generation && this.nativePreviewInflight === holder) {
+                this.nativePreview = frame;
+                this.nativePreviewGeneration = generation;
+            }
+            return frame;
+        }).finally(() => {
+            if (this.nativePreviewInflight === holder) this.nativePreviewInflight = undefined;
+        });
+        this.nativePreviewInflight = holder;
+        return holder.promise;
+    }
+
+    /** Normalize a snapshot frame to the exact requested picture size. Caches
+     * per size against the source frame. */
     async resizeFor(frame: SnapFrame, options?: RequestPictureOptions): Promise<Buffer> {
         const w = options?.picture?.width, h = options?.picture?.height;
         if (!w && !h) return frame.jpeg;   // no size hint → full resolution
-        const key = `${w || ''}x${h || ''}`;
+        const key = this.resizedKey(options)!;
+        const srcId = this.frameId(frame);
+        const event = options?.reason === 'event';
         const hit = this.resized.get(key);
-        if (hit && hit.srcTs === frame.ts) return hit.jpeg;
-        try {
-            if (this.options.resizeJpeg) {
-                const out = await this.options.resizeJpeg(frame.jpeg, options!, this.src.sourceId());
-                if (!isUsableJpeg(out)) throw new Error(`resize returned invalid jpeg (${out?.length || 0}B)`);
-                this.resized.set(key, { srcTs: frame.ts, jpeg: out });
-                if (this.resized.size > 8) this.resized.delete(this.resized.keys().next().value!);
-                return out;
-            }
-            let image: Image;
+        if (hit && hit.srcId === srcId && this.matchesRequestedSize(hit.jpeg, options)) return hit.jpeg;
+
+        // Coalesce only requests for the same frame and freshness contract. A
+        // fresh event must never inherit an older periodic frame's resize.
+        const active = this.resizing.get(key);
+        if (active && active.srcId === srcId && active.event === event) return active.promise;
+
+        const generation = this.generation;
+        const operation = ++this.nextResizeOperation;
+        this.latestResizeOperation.set(key, operation);
+        let image: Image | undefined;
+        let abandoned = false;
+        let imageClosed = false;
+        const closeImage = async () => {
+            if (!image || imageClosed) return;
+            imageClosed = true;
+            try { await image.close(); } catch { }
+        };
+        const raw = (async () => {
+            if (this.options.resizeJpeg)
+                return this.options.resizeJpeg(frame.jpeg, options!, this.src.sourceId());
             if (this.options.loadImage) {
                 image = await this.options.loadImage(frame.jpeg, this.src.sourceId());
             } else {
@@ -213,30 +357,136 @@ export class SnapshotManager {
                 const mo = await mediaManager.createMediaObject(frame.jpeg, 'image/jpeg', { sourceId: this.src.sourceId() });
                 image = await mediaManager.convertMediaObject(mo, imageMimeType) as Image;
             }
+            if (abandoned) {
+                await closeImage();
+                throw new Error('snapshot resize abandoned');
+            }
             try {
-                if ((!w || image.width <= w) && (!h || image.height <= h)) return frame.jpeg;   // already small enough
-                const out = await image.toBuffer({ resize: { width: w || undefined, height: h || undefined }, format: 'jpg' });
-                if (!isUsableJpeg(out)) throw new Error(`resize returned invalid jpeg (${out?.length || 0}B)`);
-                this.resized.set(key, { srcTs: frame.ts, jpeg: out });
-                if (this.resized.size > 8) this.resized.delete(this.resized.keys().next().value!);
-                return out;
+                // Always normalize to the exact HAP-requested dimensions,
+                // including upscaling the camera's 640x360 native safety still.
+                return image.toBuffer({
+                    resize: { width: w || undefined, height: h || undefined },
+                    format: 'jpg',
+                });
             } finally {
-                // Image is a remote Sharp/Vips resource in Scrypted. Failing to
-                // close it leaks native image handles on every HomeKit refresh.
-                try { await image.close(); } catch { }
+                await closeImage();
             }
+        })();
+
+        // A late successful converter result is useful for the next request, but
+        // an older operation may never replace a newer frame's cached result.
+        raw.then(out => {
+            try { this.rememberResized(key, srcId, out, generation, operation, options!); } catch { }
+        }, () => { });
+
+        const resizeTimeout = Math.max(10, Math.min(
+            this.options.resizeTimeoutMs ?? RESIZE_TIMEOUT_MS,
+            options?.timeout || Number.POSITIVE_INFINITY,
+        ));
+        const promise = (async () => {
+            try {
+                const out = await withTimeout(raw, resizeTimeout, 'snapshot resize');
+                this.rememberResized(key, srcId, out, generation, operation, options!);
+                return out;
+            } catch (e) {
+                // A true remote-worker hang never reaches raw's finally. Closing
+                // here releases the native image handle and permits a later frame
+                // to make an independent conversion attempt.
+                abandoned = true;
+                void closeImage();
+                dbg('snapshot resize failed', this.src.tag(), (e as Error)?.message);
+                // Event requests explicitly prohibit cached/error images.
+                if (!event && hit && this.matchesRequestedSize(hit.jpeg, options)) {
+                    // Retag the exact fallback for this source frame so every poll
+                    // does not retry the same unhealthy converter.
+                    this.rememberResized(key, srcId, hit.jpeg, generation, operation, options!);
+                    return hit.jpeg;
+                }
+
+                // Use independent ffmpeg so a wedged Scrypted image worker cannot
+                // take the fallback down with it. Events resize their freshly
+                // captured frame; periodic requests prefer the smaller warmed
+                // native still.
+                let fallback = frame.jpeg;
+                if (!event) {
+                    try { fallback = (await this.getNativePreview(generation)).jpeg; }
+                    catch { /* current validated frame remains usable */ }
+                }
+                try {
+                    const normalized = await this.normalizeFallbackJpeg(fallback, options!);
+                    this.rememberResized(key, srcId, normalized, generation, operation, options!);
+                    return normalized;
+                } catch (fallbackError) {
+                    throw new Error(`snapshot resize and exact-size fallback failed: ${(fallbackError as Error)?.message}`);
+                }
+            }
+        })();
+        const holder = { srcId, event, promise };
+        this.resizing.set(key, holder);
+        const cleanup = () => {
+            if (this.resizing.get(key) === holder) this.resizing.delete(key);
+        };
+        promise.then(cleanup, cleanup);
+        return promise;
+    }
+
+    /** Complete snapshot path with a hard preview deadline and zero-work cached
+     * fallbacks. HomeKit currently omits options.timeout, so enforce our own. */
+    async getPicture(options?: RequestPictureOptions): Promise<Buffer> {
+        const started = Date.now();
+        const lane = this.lane(options);
+        if (lane === 'preview') this.ensureNativePreview();
+        const work = this.getFrame(options).then(frame => this.resizeFor(frame, options));
+        const requested = options?.timeout;
+        const explicitTimeout = Number.isFinite(requested) && requested! > 0;
+        const budget = explicitTimeout
+            ? requested!
+            : lane === 'full'
+                ? FULL_REQUEST_TIMEOUT_MS
+                : this.options.previewTimeoutMs || PREVIEW_REQUEST_TIMEOUT_MS;
+        const key = this.resizedKey(options);
+        const fallbackLimit = Math.max(1, this.options.fallbackResizeTimeoutMs ?? FALLBACK_RESIZE_TIMEOUT_MS);
+        const canRecoverSizedPreview = !explicitTimeout && lane === 'preview' && !!key;
+        // Reserve the final slice of the same overall deadline for an independent
+        // exact-size conversion. The fallback never extends HomeKit's 4s budget.
+        const fallbackReserve = canRecoverSizedPreview
+            ? Math.min(fallbackLimit, Math.max(0, budget - 1))
+            : 0;
+        const workBudget = Math.max(1, budget - fallbackReserve);
+        try {
+            return await withTimeout(work, workBudget, 'snapshot request');
         } catch (e) {
-            dbg('snapshot resize failed', this.src.tag(), (e as Error)?.message);
-            // An older correctly-sized preview is safer than handing HomeKit the
-            // original 4 MP image (which it can render as a black tile).
-            if (hit && isUsableJpeg(hit.jpeg)) return hit.jpeg;
-            // First-request resize failure: use the camera's small native still.
-            // It may be a little larger than requested, but is HomeKit-safe and
-            // substantially smaller than the full sensor frame.
-            try { return await this.captureMjpgJpeg(); }
-            catch (fallbackError) {
-                throw new Error(`snapshot resize and fallback failed: ${(fallbackError as Error)?.message}`);
+            dbg('snapshot request deadline fallback', this.src.tag(), (e as Error)?.message);
+            // SDK contract: event requests must never return cached/error images.
+            if (lane === 'event') throw e;
+            const sized = key && this.resized.get(key)?.jpeg;
+            if (sized && this.matchesRequestedSize(sized, options)) return sized;
+            // Honor an explicit caller deadline exactly. HomeKit currently omits
+            // it, so its default path still has the independent recovery below.
+            if (explicitTimeout) throw e;
+            if (key) {
+                const fallback = this.nativePreview?.jpeg || this.lastGood?.jpeg;
+                if (fallback && isUsableJpeg(fallback)) {
+                    try {
+                        const remaining = Math.floor(started + budget - Date.now());
+                        if (remaining <= 0) throw new Error('snapshot request deadline exhausted');
+                        const normalized = await this.normalizeFallbackJpeg(
+                            fallback,
+                            options!,
+                            Math.min(fallbackLimit, remaining),
+                        );
+                        if (this.matchesRequestedSize(normalized, options)) return normalized;
+                    } catch (fallbackError) {
+                        dbg('snapshot deadline exact-size fallback failed', this.src.tag(), (fallbackError as Error)?.message);
+                    }
+                }
+                // A dimension-mismatched success is the source of intermittent
+                // black Home tiles; fail cleanly if no exact JPEG can be made.
+                throw e;
             }
+            if (this.lastGood && isUsableJpeg(this.lastGood.jpeg)) return this.lastGood.jpeg;
+            if (this.nativePreview && isUsableJpeg(this.nativePreview.jpeg)) return this.nativePreview.jpeg;
+            throw e;
         }
     }
 
@@ -249,41 +499,60 @@ export class SnapshotManager {
      *   3. a last-known-good frame if both fresh paths fail.
      * Invalid bytes are rejected and never returned or cached.
      */
-    private async captureJpeg(generation: number, fastPreview: boolean): Promise<SnapFrame> {
-        if (this.src.fullResEnabled()) {
+    private async captureJpeg(generation: number, lane: CaptureLane): Promise<SnapFrame> {
+        const fastPreview = lane !== 'full';
+        // Event requests must be current by SDK contract. Even a valid cached
+        // stream keyframe can be up to one GOP old, so use a fresh native still.
+        if (this.src.fullResEnabled() && lane !== 'event') {
             try {
                 const jpeg = await withTimeout(
                     this.captureFullResJpeg(fastPreview),
                     this.options.fullResTimeoutMs ?? (fastPreview ? FAST_KEYFRAME_TIMEOUT_MS : FULL_RES_SNAPSHOT_TIMEOUT_MS),
                     'full-res snapshot',
                 );
-                if (isUsableJpeg(jpeg)) return this.remember(jpeg, generation);
+                if (isUsableJpeg(jpeg)) return this.remember(jpeg, generation, lane);
                 this.src.warn(`full-res snapshot invalid (${jpeg.length}B), treating as broken`);
             } catch (e) {
                 dbg('full-res snapshot failed/slow', this.src.tag(), (e as Error)?.message);
             }
         }
         try {
-            return this.remember(await this.captureMjpgJpeg(), generation);
+            // A just-finished warm request may satisfy initial startup, while a
+            // TTL refresh still reaches the camera. Events require a fresh still.
+            const nativeReuseMs = lane === 'event'
+                ? 0
+                : Math.min(1000, Math.max(0, this.src.cacheTtlMs()));
+            const native = await this.getNativePreview(generation, nativeReuseMs, lane !== 'event');
+            return this.remember(native.jpeg, generation, lane);
         } catch (e) {
             this.src.warn('native snapshot failed/invalid:', (e as Error)?.message);
+            if (lane === 'event') throw e;
             // Never return invalid bytes as image/jpeg. A stale known-good frame
             // is preferable for both HomeKit and non-full-resolution callers.
-            if (this.lastGood) return this.lastGood;
+            if (this.lastGood) {
+                // Restore it as a stale cache entry: periodic callers return it
+                // immediately while exactly one background refresh retries.
+                if (generation === this.generation) {
+                    if (lane === 'preview') this.previewCache = this.lastGood;
+                    else this.cache = this.lastGood;
+                }
+                return this.lastGood;
+            }
             throw e;
         }
     }
 
-    private remember(jpeg: Buffer, generation: number): SnapFrame {
-        const frame = { ts: this.now(), jpeg };
+    private remember(jpeg: Buffer, generation: number, lane: CaptureLane): SnapFrame {
+        const frame = { id: ++this.nextFrameId, ts: this.now(), jpeg };
         if (generation === this.generation) {
-            this.cache = frame;
+            if (lane === 'preview') this.previewCache = frame;
+            else if (lane === 'full') this.cache = frame;
             this.lastGood = frame;
         }
         return frame;
     }
 
-    private async captureMjpgJpeg(): Promise<Buffer> {
+    private async captureMjpgJpeg(_generation = this.generation): Promise<Buffer> {
         const jpeg = await withTimeout(
             this.src.mjpgSnapshot(),
             this.options.mjpgTimeoutMs ?? MJPG_SNAPSHOT_TIMEOUT_MS,
@@ -291,6 +560,79 @@ export class SnapshotManager {
         );
         if (!isUsableJpeg(jpeg)) throw new Error(`native snapshot returned invalid jpeg (${jpeg?.length || 0}B)`);
         return jpeg;
+    }
+
+    /** Independent exact-size fallback. The ordinary path uses Scrypted's image
+     * worker; this uses a short-lived ffmpeg process so a wedged Sharp/Vips RPC
+     * cannot take both the primary and safety paths down together. */
+    private normalizeFallbackJpeg(
+        jpeg: Buffer,
+        options: RequestPictureOptions,
+        timeoutOverrideMs?: number,
+    ): Promise<Buffer> {
+        const timeoutMs = Math.max(1, Math.floor(
+            timeoutOverrideMs ?? this.options.fallbackResizeTimeoutMs ?? FALLBACK_RESIZE_TIMEOUT_MS,
+        ));
+        return new Promise<Buffer>((resolve, reject) => {
+            let settled = false;
+            let abandoned = false;
+            let child: ReturnType<typeof spawn> | undefined;
+            let timer: NodeJS.Timeout;
+            const finish = (error?: Error, out?: Buffer) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                error ? reject(error) : resolve(out!);
+            };
+            timer = setTimeout(() => {
+                abandoned = true;
+                try { child?.kill('SIGKILL'); } catch { }
+                finish(new Error(`snapshot fallback resize timed out after ${timeoutMs}ms`));
+            }, timeoutMs);
+
+            const work = async () => {
+                if (this.options.fallbackResizeJpeg) {
+                    const out = await this.options.fallbackResizeJpeg(jpeg, options);
+                    if (!isUsableJpeg(out)) throw new Error(`fallback resize returned invalid jpeg (${out?.length || 0}B)`);
+                    return out;
+                }
+                const w = options.picture?.width, h = options.picture?.height;
+                if (!w && !h) return jpeg;
+                const { mediaManager } = scryptedMedia();
+                const ffmpegPath = await mediaManager.getFFmpegPath();
+                // The path lookup may itself be a remote RPC. Do not spawn a
+                // process if its caller's deadline elapsed while it was pending.
+                if (abandoned) throw new Error('snapshot fallback resize abandoned');
+                const width = w && Number.isFinite(w) && w > 0 ? Math.round(w) : -2;
+                const height = h && Number.isFinite(h) && h > 0 ? Math.round(h) : -2;
+                return new Promise<Buffer>((resolveChild, rejectChild) => {
+                    const cp = child = spawn(ffmpegPath, [
+                        '-hide_banner', '-loglevel', 'error',
+                        '-f', 'mjpeg', '-i', 'pipe:0',
+                        '-frames:v', '1', '-vf', `scale=${width}:${height}`,
+                        '-q:v', '4', '-f', 'mjpeg', 'pipe:1',
+                    ], { stdio: ['pipe', 'pipe', 'ignore'] });
+                    const chunks: Buffer[] = [];
+                    let childSettled = false;
+                    const finishChild = (error?: Error, out?: Buffer) => {
+                        if (childSettled) return;
+                        childSettled = true;
+                        error ? rejectChild(error) : resolveChild(out!);
+                    };
+                    cp.stdout.on('data', d => chunks.push(d));
+                    cp.on('error', e => finishChild(e));
+                    cp.on('close', code => {
+                        const out = Buffer.concat(chunks);
+                        if (code !== 0) return finishChild(new Error(`fallback resize exited ${code}`));
+                        if (!isUsableJpeg(out)) return finishChild(new Error(`invalid fallback jpeg (${out.length}B)`));
+                        finishChild(undefined, out);
+                    });
+                    cp.stdin.on('error', () => { });
+                    cp.stdin.end(jpeg);
+                });
+            };
+            work().then(out => finish(undefined, out), error => finish(error));
+        });
     }
 
     /** Decode a full-res still. Fast path: the native muxer already holds the

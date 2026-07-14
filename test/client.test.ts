@@ -73,7 +73,43 @@ test('snapshot timeout also bounds the initial camera login', async t => {
 
     await client.getSnapshot(275);
     assert.equal(seen.length, 2);
-    assert.deepEqual([seen[0].path, seen[0].timeoutMs], ['/api/1.1/login', 275]);
+    assert.equal(seen[0].path, '/api/1.1/login');
+    assert.ok(seen[0].timeoutMs > 0 && seen[0].timeoutMs <= 275);
     assert.match(seen[1].path, /^\/snap\.jpeg\?/);
-    assert.equal(seen[1].timeoutMs, 275);
+    assert.ok(seen[1].timeoutMs > 0 && seen[1].timeoutMs <= seen[0].timeoutMs);
+});
+
+test('snapshot timeout is one absolute login, 401, relogin, and retry budget', async t => {
+    const client = new CameraApiClient('camera.invalid', 'user', 'password');
+    t.after(() => client.destroy());
+    let now = 0;
+    (client as any).now = () => now;
+    const seen: any[] = [];
+    (client as any).raw = async (options: any) => {
+        seen.push({ path: options.path, timeoutMs: options.timeoutMs });
+        now += 100;
+        if (options.path === '/api/1.1/login')
+            return { statusCode: 200, headers: { 'set-cookie': ['authId=test; Secure'] }, body: Buffer.alloc(0) };
+        return { statusCode: 401, headers: {}, body: Buffer.alloc(0) };
+    };
+
+    await assert.rejects(client.getSnapshot(250), /request timeout/);
+    assert.deepEqual(seen.map(v => v.path), [
+        '/api/1.1/login',
+        seen[1].path,
+        '/api/1.1/login',
+    ]);
+    assert.match(seen[1].path, /^\/snap\.jpeg\?/);
+    assert.deepEqual(seen.map(v => v.timeoutMs), [250, 150, 50]);
+});
+
+test('snapshot caller does not inherit an older long-running login deadline', async t => {
+    const client = new CameraApiClient('camera.invalid', 'user', 'password');
+    t.after(() => client.destroy());
+    (client as any).loginPromise = new Promise<void>(() => { });
+
+    const started = Date.now();
+    await assert.rejects(client.getSnapshot(20), /request timeout/);
+    assert.ok(Date.now() - started < 100, 'snapshot waited for the existing login promise');
+    (client as any).loginPromise = undefined;
 });

@@ -299,12 +299,24 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
 
     // ---- Camera (snapshot) ----
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
-        const frame = await this.snapshots.getFrame(options);
-        // Honor the requested dimensions. HomeKit asks for a small tile-sized
-        // snapshot; returning the full 2688×1512 (~400 KB) makes its previews go
-        // black. Detection/NVR/UI that pass no size still get full resolution.
-        const sized = await this.snapshots.resizeFor(frame, options);
-        return mediaManager.createMediaObject(sized, 'image/jpeg', { sourceId: this.id });
+        const started = Date.now();
+        try {
+            // SnapshotManager owns the complete deadline as well as resizing.
+            // Keeping those stages together prevents a bounded capture from
+            // being followed by an unbounded image-worker RPC in the HAP path.
+            const jpeg = await this.snapshots.getPicture(options);
+            return mediaManager.createMediaObject(jpeg, 'image/jpeg', { sourceId: this.id });
+        } finally {
+            const elapsed = Date.now() - started;
+            if (elapsed >= 1000) {
+                dbg('snapshot request slow', this.mac, {
+                    ms: elapsed,
+                    reason: options?.reason,
+                    width: options?.picture?.width,
+                    height: options?.picture?.height,
+                });
+            }
+        }
     }
 
     async getPictureOptions(): Promise<ResponsePictureOptions[]> {

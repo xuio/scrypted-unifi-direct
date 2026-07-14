@@ -1,14 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isUsableJpeg, SnapshotManager, SnapshotSource } from '../src/snapshots';
+import { isUsableJpeg, jpegDimensions, SnapshotManager, SnapshotSource } from '../src/snapshots';
 
-function jpeg(fill: number, size = 4000) {
+function jpeg(fill: number, size = 4000, width = 640, height = 360) {
     const ret = Buffer.alloc(size, fill);
-    // Structurally valid baseline JPEG envelope with a 640x360 SOF and SOS.
+    // Structurally valid baseline JPEG envelope with a configurable SOF and SOS.
     ret[0] = 0xff; ret[1] = 0xd8;
     ret[2] = 0xff; ret[3] = 0xe0; ret.writeUInt16BE(4, 4);
     ret[8] = 0xff; ret[9] = 0xc0; ret.writeUInt16BE(11, 10);
-    ret[12] = 8; ret.writeUInt16BE(360, 13); ret.writeUInt16BE(640, 15);
+    ret[12] = 8; ret.writeUInt16BE(height, 13); ret.writeUInt16BE(width, 15);
     ret[17] = 1; ret[18] = 1; ret[19] = 0x11; ret[20] = 0;
     ret[21] = 0xff; ret[22] = 0xda;
     ret[ret.length - 2] = 0xff; ret[ret.length - 1] = 0xd9;
@@ -32,6 +32,7 @@ function source(overrides: Partial<SnapshotSource> = {}): SnapshotSource {
 
 test('JPEG validation rejects short, wrapped junk, truncated, and dimensionless bodies', () => {
     assert.equal(isUsableJpeg(jpeg(1)), true);
+    assert.deepEqual(jpegDimensions(jpeg(1, 4000, 1280, 720)), { width: 1280, height: 720 });
     assert.equal(isUsableJpeg(Buffer.alloc(0)), false);
     assert.equal(isUsableJpeg(Buffer.alloc(4000, 1)), false);
 
@@ -70,7 +71,7 @@ test('SnapshotManager returns stale immediately and refreshes it once in the bac
     assert.strictEqual(staleB, first);
     assert.equal(captures, 2, 'concurrent stale reads launched duplicate refreshes');
 
-    const inflight = (manager as any).inflight.promise as Promise<unknown>;
+    const inflight = (manager as any).inflight.get('full').promise as Promise<unknown>;
     finishRefresh(jpeg(3));
     await inflight;
     const fresh = await manager.getFrame();
@@ -141,11 +142,13 @@ test('SnapshotManager ignores stale keyframes but decodes fresh ones', async () 
 test('SnapshotManager resize cache is keyed by requested size and source-frame identity', async () => {
     let calls = 0;
     const manager = new SnapshotManager(source(), {
-        resizeJpeg: async () => jpeg(++calls + 10),
+        resizeJpeg: async () => jpeg(++calls + 10, 4000, 320, 180),
     });
     const options = { picture: { width: 320, height: 180 } } as any;
     const frameA = { ts: 1, jpeg: jpeg(1) };
-    const frameB = { ts: 2, jpeg: jpeg(2) };
+    // Distinct frames can complete in the same millisecond; timestamp equality
+    // must never alias their resized output.
+    const frameB = { ts: 1, jpeg: jpeg(2) };
 
     const a1 = await manager.resizeFor(frameA, options);
     const a2 = await manager.resizeFor(frameA, options);
@@ -197,7 +200,7 @@ test('HomeKit-sized cold capture skips the 4-second stream path and uses native 
 test('resize failure reuses a prior sized frame and never returns the full-resolution original', async () => {
     let calls = 0;
     let nativeCalls = 0;
-    const sized = jpeg(9);
+    const sized = jpeg(9, 4000, 320, 180);
     const manager = new SnapshotManager(source({
         mjpgSnapshot: async () => { nativeCalls++; return jpeg(10); },
     }), {
@@ -217,18 +220,23 @@ test('resize failure reuses a prior sized frame and never returns the full-resol
     assert.equal(nativeCalls, 0, 'stale sized frame should be preferred over network fallback');
 });
 
-test('first resize failure falls back to a validated native still', async () => {
+test('first resize failure normalizes a validated native still to the exact size', async () => {
     const native = jpeg(11);
+    const normalized = jpeg(12, 4000, 320, 180);
     const original = jpeg(1, 500_000);
     const manager = new SnapshotManager(source({ mjpgSnapshot: async () => native }), {
         resizeJpeg: async () => { throw new Error('resize unavailable'); },
+        fallbackResizeJpeg: async input => {
+            assert.strictEqual(input, native);
+            return normalized;
+        },
     });
 
     const recovered = await manager.resizeFor(
         { ts: 1, jpeg: original },
         { picture: { width: 320, height: 180 } } as any,
     );
-    assert.strictEqual(recovered, native);
+    assert.strictEqual(recovered, normalized);
     assert.notStrictEqual(recovered, original);
 });
 
@@ -241,7 +249,7 @@ test('resize always closes the Scrypted image resource on success and failure', 
             height: 360,
             toBuffer: async () => {
                 if (fail) throw new Error('vips failed');
-                return jpeg(15);
+                return jpeg(15, 4000, 320, 180);
             },
             close: async () => { closes++; },
         } as any),
@@ -283,9 +291,414 @@ test('warm is idempotent and coalesces the first camera still', async () => {
     manager.warm();
     manager.warm();
     assert.equal(calls, 1);
-    const inflight = (manager as any).inflight.promise as Promise<unknown>;
+    const inflight = (manager as any).nativePreviewInflight.promise as Promise<unknown>;
     resolveWarm(jpeg(14));
     await inflight;
     assert.ok((await manager.getFrame()).jpeg.equals(jpeg(14)));
     assert.equal(calls, 1);
+});
+
+test('a preview never joins a cold full-resolution capture', async () => {
+    let streamCalls = 0;
+    let nativeCalls = 0;
+    let fullSettled = false;
+    const manager = new SnapshotManager(source({
+        fullResEnabled: () => true,
+        cacheTtlMs: () => 0,
+        latestKeyframe: () => undefined,
+        streamJpeg: async () => {
+            streamCalls++;
+            return new Promise<Buffer>(() => { });
+        },
+        mjpgSnapshot: async () => { nativeCalls++; return jpeg(20); },
+    }), {
+        fullResTimeoutMs: 30,
+        resizeJpeg: async () => jpeg(21, 4000, 320, 180),
+    });
+
+    const full = manager.getFrame().then(value => { fullSettled = true; return value; });
+    await Promise.resolve();
+    assert.equal(streamCalls, 1);
+
+    const preview = await manager.getPicture({ reason: 'periodic', picture: { width: 320, height: 180 } });
+    assert.ok(isUsableJpeg(preview));
+    assert.equal(fullSettled, false, 'preview waited for the full-resolution lane');
+    assert.ok(nativeCalls >= 1);
+    await full;
+});
+
+test('a hung resize returns an exact native fallback and closes the late image', async () => {
+    let resolveResize!: (value: Buffer) => void;
+    const delayed = new Promise<Buffer>(resolve => { resolveResize = resolve; });
+    let closes = 0;
+    let fallbackResizes = 0;
+    const manager = new SnapshotManager(source({
+        mjpgSnapshot: async () => jpeg(22),
+    }), {
+        resizeTimeoutMs: 10,
+        previewTimeoutMs: 100,
+        loadImage: async () => ({
+            width: 640,
+            height: 360,
+            toBuffer: async () => delayed,
+            close: async () => { closes++; },
+        } as any),
+        fallbackResizeJpeg: async (_jpeg, options) => {
+            fallbackResizes++;
+            return jpeg(23, 4000, options.picture!.width!, options.picture!.height!);
+        },
+    });
+
+    manager.warm();
+    await (manager as any).nativePreviewInflight.promise;
+    const out = await manager.getPicture({ reason: 'periodic', picture: { width: 1280, height: 720 } });
+    assert.equal(out.readUInt16BE(13), 720);
+    assert.equal(out.readUInt16BE(15), 1280);
+    assert.equal(fallbackResizes, 1);
+
+    resolveResize(jpeg(24, 4000, 1280, 720));
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(closes, 1, 'late image resource was leaked after request timeout');
+});
+
+test('last-good recovery is restored as stale cache instead of blocking every poll', async () => {
+    let now = 0;
+    let calls = 0;
+    let finishRetry!: (value: Buffer) => void;
+    const retry = new Promise<Buffer>(resolve => { finishRetry = resolve; });
+    const good = jpeg(25);
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 100,
+        mjpgSnapshot: async () => {
+            calls++;
+            if (calls === 1) return good;
+            if (calls === 2) return Buffer.from('invalid');
+            return retry;
+        },
+    }), { now: () => now });
+
+    const first = await manager.getFrame();
+    manager.clearCache();
+    const recovered = await manager.getFrame();
+    assert.strictEqual(recovered, first);
+    assert.equal(calls, 2);
+
+    now = 200;
+    const stale = await manager.getFrame();
+    assert.strictEqual(stale, first);
+    assert.equal(calls, 3, 'stale recovery did not launch one background retry');
+    finishRetry(jpeg(26));
+    await (manager as any).inflight.get('full').promise;
+});
+
+test('event snapshots bypass periodic cache and use their own capture lane', async () => {
+    let captures = 0;
+    const manager = new SnapshotManager(source({
+        mjpgSnapshot: async () => jpeg(++captures + 30),
+    }));
+    const periodic = await manager.getFrame({ reason: 'periodic', picture: { width: 320, height: 180 } });
+    const event = await manager.getFrame({ reason: 'event', picture: { width: 320, height: 180 } });
+    assert.equal(captures, 2);
+    assert.notStrictEqual(event, periodic);
+});
+
+test('already-small native images are normalized to exact requested HAP dimensions', async () => {
+    let resize: any;
+    let calls = 0;
+    const manager = new SnapshotManager(source(), {
+        loadImage: async () => ({
+            width: 640,
+            height: 360,
+            toBuffer: async (options: any) => {
+                calls++;
+                resize = options.resize;
+                return jpeg(40, 4000, options.resize.width, options.resize.height);
+            },
+            close: async () => { },
+        } as any),
+    });
+    const options = { picture: { width: 1280, height: 720 } } as any;
+    const frame = { ts: 1, jpeg: jpeg(39) };
+    const first = await manager.resizeFor(frame, options);
+    const second = await manager.resizeFor(frame, options);
+    assert.deepEqual(resize, { width: 1280, height: 720 });
+    assert.equal(first.readUInt16BE(13), 720);
+    assert.equal(first.readUInt16BE(15), 1280);
+    assert.strictEqual(second, first);
+    assert.equal(calls, 1);
+});
+
+test('reset during a delayed resize cannot repopulate the old sized frame', async () => {
+    let finishOld!: (value: Buffer) => void;
+    const old = new Promise<Buffer>(resolve => { finishOld = resolve; });
+    let calls = 0;
+    const current = jpeg(42, 4000, 320, 180);
+    const manager = new SnapshotManager(source(), {
+        resizeTimeoutMs: 100,
+        resizeJpeg: async () => ++calls === 1 ? old : current,
+        fallbackResizeJpeg: async () => jpeg(43, 4000, 320, 180),
+    });
+    const options = { picture: { width: 320, height: 180 } } as any;
+    const obsolete = manager.resizeFor({ ts: 1, jpeg: jpeg(1) }, options);
+    manager.reset();
+    finishOld(jpeg(41, 4000, 320, 180));
+    await obsolete;
+
+    const fresh = await manager.resizeFor({ ts: 2, jpeg: jpeg(2) }, options);
+    assert.strictEqual(fresh, current);
+    assert.equal(calls, 2);
+});
+
+test('wrong-size primary output is rejected and replaced by an exact fallback', async () => {
+    const options = { picture: { width: 1280, height: 720 } } as any;
+    const exact = jpeg(51, 4000, 1280, 720);
+    const manager = new SnapshotManager(source(), {
+        resizeJpeg: async () => jpeg(50),
+        fallbackResizeJpeg: async () => exact,
+    });
+
+    const out = await manager.resizeFor({ ts: 1, jpeg: jpeg(1) }, options);
+    assert.strictEqual(out, exact);
+    assert.deepEqual(jpegDimensions(out), { width: 1280, height: 720 });
+});
+
+test('dual resize failure never returns a dimension-mismatched native image', async () => {
+    const manager = new SnapshotManager(source({ mjpgSnapshot: async () => jpeg(52) }), {
+        resizeJpeg: async () => { throw new Error('primary unavailable'); },
+        fallbackResizeJpeg: async () => { throw new Error('fallback unavailable'); },
+    });
+
+    await assert.rejects(
+        manager.resizeFor(
+            { ts: 1, jpeg: jpeg(1, 4000, 2688, 1512) },
+            { picture: { width: 1280, height: 720 } } as any,
+        ),
+        /exact-size fallback failed/,
+    );
+});
+
+test('outer HomeKit deadline still returns an exact-size independent fallback', async () => {
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 0,
+        mjpgSnapshot: async () => jpeg(53),
+    }), {
+        resizeTimeoutMs: 50,
+        fallbackResizeTimeoutMs: 15,
+        previewTimeoutMs: 50,
+        resizeJpeg: async () => new Promise<Buffer>(() => { }),
+        fallbackResizeJpeg: async (_input, options) =>
+            jpeg(54, 4000, options.picture!.width!, options.picture!.height!),
+    });
+
+    const started = Date.now();
+    const out = await manager.getPicture({ reason: 'periodic', picture: { width: 1280, height: 720 } });
+    assert.deepEqual(jpegDimensions(out), { width: 1280, height: 720 });
+    assert.ok(Date.now() - started < 65, 'fallback extended the total preview deadline');
+    // Let the inner timeout/fallback settle too; it must not produce an unhandled
+    // rejection after the outer request has already recovered.
+    await new Promise(resolve => setTimeout(resolve, 60));
+});
+
+test('a timed-out image worker is closed before its conversion promise settles', async () => {
+    let closes = 0;
+    const manager = new SnapshotManager(source(), {
+        resizeTimeoutMs: 10,
+        loadImage: async () => ({
+            width: 640,
+            height: 360,
+            toBuffer: async () => new Promise<Buffer>(() => { }),
+            close: async () => { closes++; },
+        } as any),
+        fallbackResizeJpeg: async () => jpeg(55, 4000, 320, 180),
+    });
+
+    const out = await manager.resizeFor(
+        { ts: 1, jpeg: jpeg(1) },
+        { picture: { width: 320, height: 180 } } as any,
+    );
+    assert.deepEqual(jpegDimensions(out), { width: 320, height: 180 });
+    assert.equal(closes, 1);
+});
+
+test('new frames do not join stale resizes or accept their late cache writes', async () => {
+    let finishOld!: (value: Buffer) => void;
+    const oldPending = new Promise<Buffer>(resolve => { finishOld = resolve; });
+    let calls = 0;
+    const current = jpeg(57, 4000, 320, 180);
+    const manager = new SnapshotManager(source(), {
+        resizeJpeg: async () => ++calls === 1 ? oldPending : current,
+    });
+    const options = { picture: { width: 320, height: 180 } } as any;
+    const frameA = { ts: 1, jpeg: jpeg(1) };
+    const frameB = { ts: 2, jpeg: jpeg(2) };
+
+    const old = manager.resizeFor(frameA, options);
+    await Promise.resolve();
+    const fresh = await manager.resizeFor(frameB, options);
+    assert.strictEqual(fresh, current);
+    assert.equal(calls, 2, 'new frame joined the old resize operation');
+
+    finishOld(jpeg(56, 4000, 320, 180));
+    await old;
+    assert.strictEqual(await manager.resizeFor(frameB, options), current);
+    assert.equal(calls, 2, 'late old result replaced the new frame cache');
+});
+
+test('event capture failure never falls back to a periodic cached image', async () => {
+    let captures = 0;
+    const manager = new SnapshotManager(source({
+        mjpgSnapshot: async () => ++captures === 1 ? jpeg(58) : Buffer.from('camera error'),
+    }), {
+        resizeJpeg: async (_input, options) =>
+            jpeg(59, 4000, options.picture!.width!, options.picture!.height!),
+    });
+    const picture = { width: 320, height: 180 };
+    assert.ok(await manager.getPicture({ reason: 'periodic', picture }));
+    await assert.rejects(manager.getPicture({ reason: 'event', picture }), /invalid jpeg/);
+    assert.equal(captures, 2);
+});
+
+test('cold preview hedges native capture without sending a duplicate request', async () => {
+    let finishNative!: (value: Buffer) => void;
+    const native = new Promise<Buffer>(resolve => { finishNative = resolve; });
+    let nativeCalls = 0;
+    const manager = new SnapshotManager(source({
+        fullResEnabled: () => true,
+        cacheTtlMs: () => 0,
+        latestKeyframe: () => undefined,
+        mjpgSnapshot: async () => { nativeCalls++; return native; },
+    }), {
+        resizeJpeg: async (_input, options) =>
+            jpeg(60, 4000, options.picture!.width!, options.picture!.height!),
+    });
+
+    const pending = manager.getPicture({ reason: 'periodic', picture: { width: 320, height: 180 } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(nativeCalls, 1);
+    finishNative(jpeg(61));
+    assert.deepEqual(jpegDimensions(await pending), { width: 320, height: 180 });
+    assert.equal(nativeCalls, 1);
+});
+
+test('native warming does not downgrade the no-size full-resolution cache', async () => {
+    const high = jpeg(62, 20_000, 2688, 1512);
+    let streams = 0;
+    const manager = new SnapshotManager(source({
+        fullResEnabled: () => true,
+        mjpgSnapshot: async () => jpeg(63),
+        latestKeyframe: () => undefined,
+        streamJpeg: async () => { streams++; return high; },
+    }));
+
+    manager.warm();
+    await (manager as any).nativePreviewInflight.promise;
+    assert.strictEqual((await manager.getFrame()).jpeg, high);
+    assert.equal(streams, 1);
+});
+
+test('explicit full-picture timeout is not raised to the default full budget', async () => {
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 0,
+        mjpgSnapshot: async () => new Promise<Buffer>(() => { }),
+    }), { mjpgTimeoutMs: 80 });
+    const started = Date.now();
+    await assert.rejects(manager.getPicture({ timeout: 15 } as any), /timed out/);
+    assert.ok(Date.now() - started < 70, 'explicit timeout was overridden by the full-picture default');
+});
+
+test('never-settling exact-size fallback remains end-to-end bounded', async () => {
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 0,
+        mjpgSnapshot: async () => jpeg(64),
+    }), {
+        resizeTimeoutMs: 10,
+        fallbackResizeTimeoutMs: 15,
+        previewTimeoutMs: 20,
+        resizeJpeg: async () => new Promise<Buffer>(() => { }),
+        fallbackResizeJpeg: async () => new Promise<Buffer>(() => { }),
+    });
+
+    const started = Date.now();
+    await assert.rejects(
+        manager.getPicture({ reason: 'periodic', picture: { width: 1280, height: 720 } }),
+        /timed out/,
+    );
+    assert.ok(Date.now() - started < 100, 'fallback exceeded the HomeKit recovery budget');
+});
+
+test('event pictures skip GOP-cached keyframes and use a fresh camera still', async () => {
+    let keyframeReads = 0;
+    let nativeReads = 0;
+    const manager = new SnapshotManager(source({
+        fullResEnabled: () => true,
+        latestKeyframe: () => ({
+            ts: Date.now(),
+            annexb: () => { keyframeReads++; return Buffer.from([0, 0, 0, 1, 0x65]); },
+        }),
+        mjpgSnapshot: async () => { nativeReads++; return jpeg(65); },
+    }), {
+        decodeKeyframeToJpeg: async () => jpeg(66, 20_000, 2688, 1512),
+        resizeJpeg: async (_input, options) =>
+            jpeg(67, 4000, options.picture!.width!, options.picture!.height!),
+    });
+
+    const out = await manager.getPicture({ reason: 'event', picture: { width: 320, height: 180 } });
+    assert.deepEqual(jpegDimensions(out), { width: 320, height: 180 });
+    assert.equal(keyframeReads, 0);
+    assert.equal(nativeReads, 1);
+});
+
+test('default full-picture budget leaves room for native fallback after stream timeout', async () => {
+    const native = jpeg(68);
+    const manager = new SnapshotManager(source({
+        fullResEnabled: () => true,
+        cacheTtlMs: () => 0,
+        latestKeyframe: () => undefined,
+        streamJpeg: async () => new Promise<Buffer>(() => { }),
+        mjpgSnapshot: async () => native,
+    }), { fullResTimeoutMs: 15 });
+
+    assert.strictEqual(await manager.getPicture(), native);
+});
+
+test('a native preview capture never populates the full-resolution cache', async () => {
+    const high = jpeg(69, 20_000, 2688, 1512);
+    let streams = 0;
+    const manager = new SnapshotManager(source({
+        fullResEnabled: () => true,
+        latestKeyframe: () => undefined,
+        streamJpeg: async () => { streams++; return high; },
+        mjpgSnapshot: async () => jpeg(70),
+    }));
+
+    await manager.getFrame({ reason: 'periodic', picture: { width: 320, height: 180 } });
+    assert.strictEqual((await manager.getFrame()).jpeg, high);
+    assert.equal(streams, 1);
+});
+
+test('event capture never joins a native request that started before the event', async () => {
+    const resolvers: Array<(value: Buffer) => void> = [];
+    let captures = 0;
+    const manager = new SnapshotManager(source({
+        mjpgSnapshot: async () => {
+            captures++;
+            return new Promise<Buffer>(resolve => resolvers.push(resolve));
+        },
+    }), {
+        resizeJpeg: async (_input, options) =>
+            jpeg(71, 4000, options.picture!.width!, options.picture!.height!),
+    });
+
+    manager.warm();
+    const warm = (manager as any).nativePreviewInflight.promise as Promise<unknown>;
+    const event = manager.getPicture({ reason: 'event', picture: { width: 320, height: 180 } });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(captures, 2);
+
+    const eventNative = jpeg(72);
+    resolvers[1](eventNative);
+    assert.deepEqual(jpegDimensions(await event), { width: 320, height: 180 });
+    resolvers[0](jpeg(73));
+    await warm;
+    assert.strictEqual((manager as any).nativePreview.jpeg, eventNative);
 });

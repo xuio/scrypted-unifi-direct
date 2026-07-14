@@ -47,6 +47,8 @@ export class CameraApiClient {
     // snapshot / settings read pays a full handshake (and behavior would depend
     // on the runtime's global-agent defaults).
     private agent = new https.Agent({ keepAlive: true, maxSockets: 2, rejectUnauthorized: false });
+    /** Test seam; production always uses wall clock. */
+    private now = () => Date.now();
 
     private get loginCooldownMs() {
         return Math.min(LOGIN_COOLDOWN_MS * 2 ** Math.max(0, this.loginFailures - 1), LOGIN_COOLDOWN_MAX_MS);
@@ -83,6 +85,17 @@ export class CameraApiClient {
         timeoutMs?: number;
     }): Promise<{ statusCode: number; headers: Record<string, string | string[] | undefined>; body: Buffer }> {
         return new Promise((resolve, reject) => {
+            let settled = false;
+            let deadlineTimer: NodeJS.Timeout | undefined;
+            const finish = (
+                error?: Error,
+                value?: { statusCode: number; headers: Record<string, string | string[] | undefined>; body: Buffer },
+            ) => {
+                if (settled) return;
+                settled = true;
+                if (deadlineTimer) clearTimeout(deadlineTimer);
+                error ? reject(error) : resolve(value!);
+            };
             const req = https.request({
                 host: this.host,
                 port: 443,
@@ -101,15 +114,24 @@ export class CameraApiClient {
                 res.on('data', (c: Buffer) => chunks.push(c));
                 // a mid-body connection drop emits 'error' (not 'end'); without this
                 // the promise would hang forever.
-                res.on('error', reject);
-                res.on('end', () => resolve({
+                res.on('error', e => finish(e));
+                res.on('end', () => finish(undefined, {
                     statusCode: res.statusCode || 0,
                     headers: res.headers,
                     body: Buffer.concat(chunks),
                 }));
             });
+            const timeoutMs = Math.max(1, options.timeoutMs ?? 15000);
+            // ClientRequest's `timeout` is socket-inactivity based. Keep a true
+            // wall-clock deadline too, so a camera dribbling response bytes can
+            // never occupy the complete HomeKit snapshot budget.
+            deadlineTimer = setTimeout(() => {
+                const error = new Error('request timeout');
+                req.destroy(error);
+                finish(error);
+            }, timeoutMs);
             req.on('timeout', () => req.destroy(new Error('request timeout')));
-            req.on('error', reject);
+            req.on('error', e => finish(e));
             if (options.body)
                 req.write(options.body);
             req.end();
@@ -158,15 +180,34 @@ export class CameraApiClient {
         }
     }
 
-    /** Perform a request, logging in first if needed and retrying once on 401. */
+    /** Perform a request, logging in first if needed and retrying once on 401.
+     * timeoutMs is one absolute transaction budget, not a fresh allowance for
+     * login, request, re-login, and retry independently. */
     private async authed(options: Parameters<CameraApiClient['raw']>[0]) {
+        const deadline = this.now() + (options.timeoutMs ?? 15000);
+        const remaining = () => {
+            const ms = Math.ceil(deadline - this.now());
+            if (ms <= 0) throw new Error('request timeout');
+            return ms;
+        };
+        const bounded = <T>(promise: Promise<T>) => {
+            const ms = remaining();
+            return new Promise<T>((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('request timeout')), ms);
+                promise.then(
+                    value => { clearTimeout(timer); resolve(value); },
+                    error => { clearTimeout(timer); reject(error); },
+                );
+            });
+        };
+        const request = () => bounded(this.raw({ ...options, timeoutMs: remaining() }));
         if (!this.cookie)
-            await this.login(options.timeoutMs);
-        let res = await this.raw(options);
+            await bounded(this.login(remaining()));
+        let res = await request();
         if (res.statusCode === 401) {
             this.cookie = undefined;
-            await this.login(options.timeoutMs);
-            res = await this.raw(options);
+            await bounded(this.login(remaining()));
+            res = await request();
         }
         return res;
     }
