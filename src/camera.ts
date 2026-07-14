@@ -16,6 +16,7 @@ import sdk, {
     FFmpegInput,
     Online,
 } from '@scrypted/sdk';
+import { createHash } from 'crypto';
 import { CameraApiClient } from './client';
 import { ControllerEmulator } from './controller-emulator';
 import { DirectStream } from './direct-stream';
@@ -25,7 +26,7 @@ import {
 } from './zones';
 import { CameraZoneManager, cameraCoordsToPoints, isFullFrameZone } from './camera-zones';
 import { DetectionEngine } from './detections';
-import { SnapshotManager } from './snapshots';
+import { jpegDimensions, SnapshotManager, SnapshotRequestTrace } from './snapshots';
 import { AUDIO_RTSP_PORT } from './audio-rtsp';
 import { dbg } from './debug';
 import type { UnifiDirectProvider } from './provider';
@@ -66,6 +67,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     private lifecycleAbort = new AbortController();
     private onlineWaiters = new Set<() => void>();
     private zoneManager = new CameraZoneManager(this.storage);
+    private snapshotRequestSequence = 0;
 
     // Detection runs on the full sensor FoV regardless of the streamed channel.
     private detections = new DetectionEngine(CHANNELS.high, {
@@ -119,6 +121,12 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     private get snapshotCacheTtlMs(): number {
         const v = parseFloat(this.storage.getItem('snapshotCacheTtl') || '');
         return Number.isFinite(v) && v >= 0 ? v * 1000 : 10_000;
+    }
+
+    /** Detailed per-request snapshot tracing is opt-in: the debug logger writes
+     * synchronously so ordinary HomeKit polling should not pay that cost. */
+    private get snapshotDiagnostics(): boolean {
+        return this.storage.getItem('snapshotDiagnostics') === 'true';
     }
 
     private getClient(): CameraApiClient {
@@ -300,20 +308,46 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     // ---- Camera (snapshot) ----
     async takePicture(options?: RequestPictureOptions): Promise<MediaObject> {
         const started = Date.now();
+        const diagnostics = this.snapshotDiagnostics;
+        const trace: SnapshotRequestTrace | undefined = diagnostics
+            ? { requestId: `${process.pid}-${this.id}-${++this.snapshotRequestSequence}` }
+            : undefined;
+        let jpeg: Buffer | undefined;
+        let error: Error | undefined;
         try {
             // SnapshotManager owns the complete deadline as well as resizing.
             // Keeping those stages together prevents a bounded capture from
             // being followed by an unbounded image-worker RPC in the HAP path.
-            const jpeg = await this.snapshots.getPicture(options);
-            return mediaManager.createMediaObject(jpeg, 'image/jpeg', { sourceId: this.id });
+            jpeg = await this.snapshots.getPicture(options, trace);
+            return await mediaManager.createMediaObject(jpeg, 'image/jpeg', { sourceId: this.id });
+        } catch (e) {
+            error = e as Error;
+            throw e;
         } finally {
             const elapsed = Date.now() - started;
-            if (elapsed >= 1000) {
+            if (diagnostics) {
+                const dimensions = jpegDimensions(jpeg);
+                dbg('snapshot trace', this.mac, {
+                    ...trace,
+                    status: !error && jpeg ? 'ok' : 'error',
+                    ms: elapsed,
+                    reason: options?.reason,
+                    periodicRequest: options?.periodicRequest || undefined,
+                    requestedWidth: options?.picture?.width,
+                    requestedHeight: options?.picture?.height,
+                    width: dimensions?.width,
+                    height: dimensions?.height,
+                    bytes: jpeg?.length,
+                    sha256: jpeg && createHash('sha256').update(jpeg).digest('hex').slice(0, 16),
+                    error: error?.message,
+                });
+            } else if (elapsed >= 1000) {
                 dbg('snapshot request slow', this.mac, {
                     ms: elapsed,
                     reason: options?.reason,
                     width: options?.picture?.width,
                     height: options?.picture?.height,
+                    error: error?.message,
                 });
             }
         }
@@ -886,6 +920,11 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 value: this.snapshotCacheTtlMs / 1000, type: 'number',
                 description: 'Reuse the last snapshot for this many seconds so bursts of requests don’t each trigger a fresh decode. 0 = always capture fresh.',
             },
+            {
+                key: 'snapshotDiagnostics', title: 'Snapshot diagnostics', group: 'Snapshots',
+                value: this.snapshotDiagnostics, type: 'boolean',
+                description: 'Temporarily log one correlated record per snapshot with cache/capture/resize path, latency, dimensions, byte count, and a short content hash. Images and credentials are never logged. Leave off during ordinary use.',
+            },
         ];
         // Camera audio DSP profile (opt-in), only on models that advertise it.
         if (Array.isArray(cameraFeatures?.audioStyle) && cameraFeatures.audioStyle.length) {
@@ -1028,6 +1067,9 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             case 'snapshotCacheTtl':
                 this.storage.setItem('snapshotCacheTtl', String(value));
                 this.snapshots.clearCache();
+                return;
+            case 'snapshotDiagnostics':
+                this.storage.setItem('snapshotDiagnostics', String(value === true || value === 'true'));
                 return;
             case 'audio.tuning':
                 this.storage.setItem('audio.tuning', String(value));

@@ -166,9 +166,10 @@ the emulator TLS certificate.
   monitor entirely offline. Starting a real soak remains an explicit host-side
   operation; this command never connects to or modifies Scrypted.
 - `npm run test:client-runners` — smoke-test the credential redaction, argument
-  parsing, and profile selection used by the headless browser and open-source HAP
-  startup benchmarks. See [client startup validation](scripts/client-validation.md)
-  for the non-GUI browser and HomeKit commands and pairing constraints.
+  parsing, profile selection, exact periodic HAP resource payload, and black-frame
+  classifier used by the headless browser and open-source HAP startup/snapshot
+  benchmarks. See [client startup validation](scripts/client-validation.md) for
+  the non-GUI browser and HomeKit commands and pairing constraints.
 - To run a real monitor, first enable **Mirror diagnostic events** in the plugin
   settings, then run the script in the same host or container namespace as the
   Scrypted plugin worker. Supply every expected camera and use a fresh,

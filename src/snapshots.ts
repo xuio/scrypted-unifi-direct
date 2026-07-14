@@ -42,10 +42,10 @@ const PREVIEW_REQUEST_TIMEOUT_MS = 4000;
 /** Full-resolution capture is deliberately not hedged with a native request, so
  * leave room for the bounded native fallback after its stream deadline. */
 const FULL_REQUEST_TIMEOUT_MS = FULL_RES_SNAPSHOT_TIMEOUT_MS + MJPG_SNAPSHOT_TIMEOUT_MS + 200;
-/** Frames smaller than this are treated as a broken/empty decode and not cached.
- *  Kept low so a legitimately dark night scene (which still compresses to tens of
- *  KB) is accepted — only a near-empty/corrupt result is rejected. */
-const MIN_VALID_SNAPSHOT = 3000;
+/** Reject only implausibly short JPEG envelopes. A valid low-complexity HomeKit
+ *  tile can be well below 3 KB (a decoder-valid black 320x180 JPEG is ~600 B),
+ *  so byte length must not be used as a proxy for visual content. */
+const MIN_VALID_SNAPSHOT = 256;
 /** Ignore a cached keyframe older than this (stream stalled). Healthy cameras in
  *  this setup produce a keyframe every ~4 s. */
 const KEYFRAME_SNAPSHOT_MAX_AGE_MS = 10_000;
@@ -95,9 +95,34 @@ export function isUsableJpeg(jpeg: Buffer | undefined): boolean {
 
 /** A cached snapshot frame. The monotonic id is the stable identity used for
  * resized variants; timestamp is reserved for freshness decisions. */
-export type SnapFrame = { ts: number; jpeg: Buffer; id?: number };
+export type SnapshotCaptureSource = 'keyframe' | 'stream' | 'native' | 'last-good';
 
-type CaptureLane = 'preview' | 'event' | 'full';
+export type SnapFrame = {
+    ts: number;
+    jpeg: Buffer;
+    id?: number;
+    source?: SnapshotCaptureSource;
+};
+
+export type CaptureLane = 'preview' | 'event' | 'full';
+
+/** Mutable, request-local diagnostics populated without adding another image
+ * conversion to the latency-sensitive HomeKit path. The owning camera logs one
+ * correlated record after the request completes. */
+export interface SnapshotRequestTrace {
+    requestId?: string;
+    lane?: CaptureLane;
+    framePath?: 'cache' | 'stale-cache' | 'capture' | 'capture-join';
+    frameId?: number;
+    frameAgeMs?: number;
+    captureSource?: SnapshotCaptureSource;
+    captureError?: string;
+    resizePath?: 'original' | 'cache' | 'join' | 'image-worker' | 'injected-primary'
+        | 'cached-fallback' | 'ffmpeg-fallback' | 'deadline-cache'
+        | 'deadline-ffmpeg-fallback' | 'last-good' | 'native';
+    resizeError?: string;
+    deadlineError?: string;
+}
 
 /** Narrow dependency seams used by deterministic unit tests. Production callers
  *  use the defaults, so ffmpeg/media-manager behavior remains unchanged. */
@@ -158,7 +183,12 @@ export class SnapshotManager {
     private nextFrameId = 0;
     /** Preview, event, and full-resolution work must never share a cold promise:
      * a HomeKit tile otherwise inherits a detection caller's multi-second path. */
-    private inflight = new Map<CaptureLane, { generation: number; promise: Promise<SnapFrame> }>();
+    private inflight = new Map<CaptureLane, {
+        generation: number;
+        promise: Promise<SnapFrame>;
+        recoverySource?: SnapshotCaptureSource;
+        captureError?: string;
+    }>();
     private nativePreview?: SnapFrame;
     private nativePreviewGeneration = 0;
     private nativePreviewInflight?: { generation: number; promise: Promise<SnapFrame> };
@@ -207,14 +237,21 @@ export class SnapshotManager {
     /** Get a snapshot frame with stale-while-revalidate caching: return any cached
      *  frame INSTANTLY and refresh in the background when stale, so a fresh decode
      *  never blocks the request. */
-    async getFrame(options?: RequestPictureOptions): Promise<SnapFrame> {
+    async getFrame(options?: RequestPictureOptions, trace?: SnapshotRequestTrace): Promise<SnapFrame> {
         const lane = this.lane(options);
+        if (trace) trace.lane = lane;
         const ttl = this.src.cacheTtlMs();
         // Event thumbnails need a fresh camera frame and must not join periodic
         // capture/cache work.
         const cached = lane === 'preview' ? this.previewCache : this.cache;
         if (lane !== 'event' && cached && ttl > 0) {
             const age = this.now() - cached.ts;
+            if (trace) {
+                trace.framePath = age >= ttl ? 'stale-cache' : 'cache';
+                trace.frameId = this.frameId(cached);
+                trace.frameAgeMs = age;
+                trace.captureSource = cached.source;
+            }
             if (age >= ttl && !this.inflight.has(lane)) {
                 const refresh = this.startCapture(lane);
                 refresh.promise.catch(() => { });   // errors keep the stale frame
@@ -222,8 +259,18 @@ export class SnapshotManager {
             return cached;
         }
         // No cached frame yet (or caching disabled): capture now, coalescing callers.
-        if (!this.inflight.has(lane)) this.startCapture(lane);
-        return this.inflight.get(lane)!.promise;
+        const joined = this.inflight.has(lane);
+        if (!joined) this.startCapture(lane);
+        if (trace) trace.framePath = joined ? 'capture-join' : 'capture';
+        const active = this.inflight.get(lane)!;
+        const frame = await active.promise;
+        if (trace) {
+            trace.frameId = this.frameId(frame);
+            trace.frameAgeMs = Math.max(0, this.now() - frame.ts);
+            trace.captureSource = active.recoverySource || frame.source;
+            trace.captureError = active.captureError;
+        }
+        return frame;
     }
 
     /** Seed an always-ready camera-native still without waiting for HomeKit's
@@ -236,8 +283,16 @@ export class SnapshotManager {
 
     private startCapture(lane: CaptureLane) {
         const generation = this.generation;
-        const holder = { generation, promise: undefined as unknown as Promise<SnapFrame> };
-        holder.promise = this.captureJpeg(generation, lane).finally(() => {
+        const holder: {
+            generation: number;
+            promise: Promise<SnapFrame>;
+            recoverySource?: SnapshotCaptureSource;
+            captureError?: string;
+        } = { generation, promise: undefined as unknown as Promise<SnapFrame> };
+        holder.promise = this.captureJpeg(generation, lane, (source, error) => {
+            holder.recoverySource = source;
+            holder.captureError = error;
+        }).finally(() => {
             if (this.inflight.get(lane) === holder) this.inflight.delete(lane);
         });
         this.inflight.set(lane, holder);
@@ -307,7 +362,7 @@ export class SnapshotManager {
             return this.nativePreviewInflight.promise;
         const holder = { generation, promise: undefined as unknown as Promise<SnapFrame> };
         holder.promise = this.captureMjpgJpeg(generation).then(jpeg => {
-            const frame = { id: ++this.nextFrameId, ts: this.now(), jpeg };
+            const frame: SnapFrame = { id: ++this.nextFrameId, ts: this.now(), jpeg, source: 'native' };
             if (generation === this.generation && this.nativePreviewInflight === holder) {
                 this.nativePreview = frame;
                 this.nativePreviewGeneration = generation;
@@ -322,19 +377,32 @@ export class SnapshotManager {
 
     /** Normalize a snapshot frame to the exact requested picture size. Caches
      * per size against the source frame. */
-    async resizeFor(frame: SnapFrame, options?: RequestPictureOptions): Promise<Buffer> {
+    async resizeFor(
+        frame: SnapFrame,
+        options?: RequestPictureOptions,
+        trace?: SnapshotRequestTrace,
+    ): Promise<Buffer> {
         const w = options?.picture?.width, h = options?.picture?.height;
-        if (!w && !h) return frame.jpeg;   // no size hint → full resolution
+        if (!w && !h) {
+            if (trace) trace.resizePath = 'original';
+            return frame.jpeg;   // no size hint → full resolution
+        }
         const key = this.resizedKey(options)!;
         const srcId = this.frameId(frame);
         const event = options?.reason === 'event';
         const hit = this.resized.get(key);
-        if (hit && hit.srcId === srcId && this.matchesRequestedSize(hit.jpeg, options)) return hit.jpeg;
+        if (hit && hit.srcId === srcId && this.matchesRequestedSize(hit.jpeg, options)) {
+            if (trace) trace.resizePath = 'cache';
+            return hit.jpeg;
+        }
 
         // Coalesce only requests for the same frame and freshness contract. A
         // fresh event must never inherit an older periodic frame's resize.
         const active = this.resizing.get(key);
-        if (active && active.srcId === srcId && active.event === event) return active.promise;
+        if (active && active.srcId === srcId && active.event === event) {
+            if (trace) trace.resizePath = 'join';
+            return active.promise;
+        }
 
         const generation = this.generation;
         const operation = ++this.nextResizeOperation;
@@ -364,7 +432,10 @@ export class SnapshotManager {
             try {
                 // Always normalize to the exact HAP-requested dimensions,
                 // including upscaling the camera's 640x360 native safety still.
-                return image.toBuffer({
+                // `await` is intentional: returning the promise would enter the
+                // finally block immediately and close the remote Sharp/Vips image
+                // while its conversion is still running.
+                return await image.toBuffer({
                     resize: { width: w || undefined, height: h || undefined },
                     format: 'jpg',
                 });
@@ -372,12 +443,6 @@ export class SnapshotManager {
                 await closeImage();
             }
         })();
-
-        // A late successful converter result is useful for the next request, but
-        // an older operation may never replace a newer frame's cached result.
-        raw.then(out => {
-            try { this.rememberResized(key, srcId, out, generation, operation, options!); } catch { }
-        }, () => { });
 
         const resizeTimeout = Math.max(10, Math.min(
             this.options.resizeTimeoutMs ?? RESIZE_TIMEOUT_MS,
@@ -387,6 +452,7 @@ export class SnapshotManager {
             try {
                 const out = await withTimeout(raw, resizeTimeout, 'snapshot resize');
                 this.rememberResized(key, srcId, out, generation, operation, options!);
+                if (trace) trace.resizePath = this.options.resizeJpeg ? 'injected-primary' : 'image-worker';
                 return out;
             } catch (e) {
                 // A true remote-worker hang never reaches raw's finally. Closing
@@ -394,12 +460,14 @@ export class SnapshotManager {
                 // to make an independent conversion attempt.
                 abandoned = true;
                 void closeImage();
+                if (trace) trace.resizeError = (e as Error)?.message;
                 dbg('snapshot resize failed', this.src.tag(), (e as Error)?.message);
                 // Event requests explicitly prohibit cached/error images.
                 if (!event && hit && this.matchesRequestedSize(hit.jpeg, options)) {
                     // Retag the exact fallback for this source frame so every poll
                     // does not retry the same unhealthy converter.
                     this.rememberResized(key, srcId, hit.jpeg, generation, operation, options!);
+                    if (trace) trace.resizePath = 'cached-fallback';
                     return hit.jpeg;
                 }
 
@@ -415,6 +483,7 @@ export class SnapshotManager {
                 try {
                     const normalized = await this.normalizeFallbackJpeg(fallback, options!);
                     this.rememberResized(key, srcId, normalized, generation, operation, options!);
+                    if (trace) trace.resizePath = 'ffmpeg-fallback';
                     return normalized;
                 } catch (fallbackError) {
                     throw new Error(`snapshot resize and exact-size fallback failed: ${(fallbackError as Error)?.message}`);
@@ -432,11 +501,12 @@ export class SnapshotManager {
 
     /** Complete snapshot path with a hard preview deadline and zero-work cached
      * fallbacks. HomeKit currently omits options.timeout, so enforce our own. */
-    async getPicture(options?: RequestPictureOptions): Promise<Buffer> {
+    async getPicture(options?: RequestPictureOptions, trace?: SnapshotRequestTrace): Promise<Buffer> {
         const started = Date.now();
         const lane = this.lane(options);
+        if (trace) trace.lane = lane;
         if (lane === 'preview') this.ensureNativePreview();
-        const work = this.getFrame(options).then(frame => this.resizeFor(frame, options));
+        const work = this.getFrame(options, trace).then(frame => this.resizeFor(frame, options, trace));
         const requested = options?.timeout;
         const explicitTimeout = Number.isFinite(requested) && requested! > 0;
         const budget = explicitTimeout
@@ -456,11 +526,15 @@ export class SnapshotManager {
         try {
             return await withTimeout(work, workBudget, 'snapshot request');
         } catch (e) {
+            if (trace) trace.deadlineError = (e as Error)?.message;
             dbg('snapshot request deadline fallback', this.src.tag(), (e as Error)?.message);
             // SDK contract: event requests must never return cached/error images.
             if (lane === 'event') throw e;
             const sized = key && this.resized.get(key)?.jpeg;
-            if (sized && this.matchesRequestedSize(sized, options)) return sized;
+            if (sized && this.matchesRequestedSize(sized, options)) {
+                if (trace) trace.resizePath = 'deadline-cache';
+                return sized;
+            }
             // Honor an explicit caller deadline exactly. HomeKit currently omits
             // it, so its default path still has the independent recovery below.
             if (explicitTimeout) throw e;
@@ -475,7 +549,10 @@ export class SnapshotManager {
                             options!,
                             Math.min(fallbackLimit, remaining),
                         );
-                        if (this.matchesRequestedSize(normalized, options)) return normalized;
+                        if (this.matchesRequestedSize(normalized, options)) {
+                            if (trace) trace.resizePath = 'deadline-ffmpeg-fallback';
+                            return normalized;
+                        }
                     } catch (fallbackError) {
                         dbg('snapshot deadline exact-size fallback failed', this.src.tag(), (fallbackError as Error)?.message);
                     }
@@ -484,8 +561,14 @@ export class SnapshotManager {
                 // black Home tiles; fail cleanly if no exact JPEG can be made.
                 throw e;
             }
-            if (this.lastGood && isUsableJpeg(this.lastGood.jpeg)) return this.lastGood.jpeg;
-            if (this.nativePreview && isUsableJpeg(this.nativePreview.jpeg)) return this.nativePreview.jpeg;
+            if (this.lastGood && isUsableJpeg(this.lastGood.jpeg)) {
+                if (trace) trace.resizePath = 'last-good';
+                return this.lastGood.jpeg;
+            }
+            if (this.nativePreview && isUsableJpeg(this.nativePreview.jpeg)) {
+                if (trace) trace.resizePath = 'native';
+                return this.nativePreview.jpeg;
+            }
             throw e;
         }
     }
@@ -499,7 +582,11 @@ export class SnapshotManager {
      *   3. a last-known-good frame if both fresh paths fail.
      * Invalid bytes are rejected and never returned or cached.
      */
-    private async captureJpeg(generation: number, lane: CaptureLane): Promise<SnapFrame> {
+    private async captureJpeg(
+        generation: number,
+        lane: CaptureLane,
+        reportRecovery?: (source: SnapshotCaptureSource, error: string) => void,
+    ): Promise<SnapFrame> {
         const fastPreview = lane !== 'full';
         // Event requests must be current by SDK contract. Even a valid cached
         // stream keyframe can be up to one GOP old, so use a fresh native still.
@@ -510,8 +597,8 @@ export class SnapshotManager {
                     this.options.fullResTimeoutMs ?? (fastPreview ? FAST_KEYFRAME_TIMEOUT_MS : FULL_RES_SNAPSHOT_TIMEOUT_MS),
                     'full-res snapshot',
                 );
-                if (isUsableJpeg(jpeg)) return this.remember(jpeg, generation, lane);
-                this.src.warn(`full-res snapshot invalid (${jpeg.length}B), treating as broken`);
+                if (isUsableJpeg(jpeg.jpeg)) return this.remember(jpeg.jpeg, generation, lane, jpeg.source);
+                this.src.warn(`full-res snapshot invalid (${jpeg.jpeg.length}B), treating as broken`);
             } catch (e) {
                 dbg('full-res snapshot failed/slow', this.src.tag(), (e as Error)?.message);
             }
@@ -523,13 +610,14 @@ export class SnapshotManager {
                 ? 0
                 : Math.min(1000, Math.max(0, this.src.cacheTtlMs()));
             const native = await this.getNativePreview(generation, nativeReuseMs, lane !== 'event');
-            return this.remember(native.jpeg, generation, lane);
+            return this.remember(native.jpeg, generation, lane, 'native');
         } catch (e) {
             this.src.warn('native snapshot failed/invalid:', (e as Error)?.message);
             if (lane === 'event') throw e;
             // Never return invalid bytes as image/jpeg. A stale known-good frame
             // is preferable for both HomeKit and non-full-resolution callers.
             if (this.lastGood) {
+                reportRecovery?.('last-good', (e as Error)?.message || String(e));
                 // Restore it as a stale cache entry: periodic callers return it
                 // immediately while exactly one background refresh retries.
                 if (generation === this.generation) {
@@ -542,8 +630,13 @@ export class SnapshotManager {
         }
     }
 
-    private remember(jpeg: Buffer, generation: number, lane: CaptureLane): SnapFrame {
-        const frame = { id: ++this.nextFrameId, ts: this.now(), jpeg };
+    private remember(
+        jpeg: Buffer,
+        generation: number,
+        lane: CaptureLane,
+        source: SnapshotCaptureSource,
+    ): SnapFrame {
+        const frame: SnapFrame = { id: ++this.nextFrameId, ts: this.now(), jpeg, source };
         if (generation === this.generation) {
             if (lane === 'preview') this.previewCache = frame;
             else if (lane === 'full') this.cache = frame;
@@ -639,7 +732,9 @@ export class SnapshotManager {
      *  freshest decoded-ready keyframe, so decode that one frame directly — no
      *  RTSP round-trip or wait for the next IDR. Full-resolution callers may
      *  still fall back to spinning up the stream; preview clients may not. */
-    private async captureFullResJpeg(fastPreview: boolean): Promise<Buffer> {
+    private async captureFullResJpeg(
+        fastPreview: boolean,
+    ): Promise<{ jpeg: Buffer; source: 'keyframe' | 'stream' }> {
         const kf = this.src.latestKeyframe();
         if (kf && this.now() - kf.ts < KEYFRAME_SNAPSHOT_MAX_AGE_MS) {
             try {
@@ -647,7 +742,10 @@ export class SnapshotManager {
                 const jpeg = this.options.decodeKeyframeToJpeg
                     ? await this.options.decodeKeyframeToJpeg(annexb)
                     : await this.decodeKeyframeToJpeg(annexb, fastPreview ? 900 : 2500);
-                if (isUsableJpeg(jpeg)) { dbg('captureFullResJpeg', this.src.tag(), 'keyframe', jpeg.length); return jpeg; }
+                if (isUsableJpeg(jpeg)) {
+                    dbg('captureFullResJpeg', this.src.tag(), 'keyframe', jpeg.length);
+                    return { jpeg, source: 'keyframe' };
+                }
             } catch (e) { dbg('keyframe decode failed', this.src.tag(), (e as Error)?.message); }
         }
         // With the configured 4 s GOP, starting a cold stream here is exactly
@@ -655,7 +753,7 @@ export class SnapshotManager {
         if (fastPreview) throw new Error('no decodable cached keyframe');
         const jpeg = await this.src.streamJpeg();
         dbg('captureFullResJpeg', this.src.tag(), 'stream', jpeg.length, 'bytes');
-        return jpeg;
+        return { jpeg, source: 'stream' };
     }
 
     /** One-shot decode of an Annex-B H.264 keyframe to a JPEG via ffmpeg. */

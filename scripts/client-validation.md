@@ -89,6 +89,102 @@ FFmpeg's post-decode `showinfo` filter. High must decode exactly 1920x1080 and
 medium exactly 1280x720. A wrong resolution is reported on the sample and fails
 the run, preventing both profiles from silently benchmarking the same stream.
 
+## HomeKit preview snapshot stress test
+
+`homekit-snapshot.js` exercises the encrypted HAP `POST /resource` image request
+that HomeKit uses for camera preview tiles, including `reason: 0` (periodic). It uses
+[`hap-controller`](https://github.com/Apollon77/hap-controller-node)'s
+verified encrypted connection directly; it does not launch a browser or control
+a Mac. The runner is tested against 0.10.2 and deliberately checks the internal
+connection methods it needs before sending a request.
+
+Keep the diagnostic dependency outside the plugin package and point the runner
+at it explicitly:
+
+```sh
+npm install --prefix /tmp/unifi-hap-controller --no-save --ignore-scripts hap-controller@0.10.2
+export HAP_CONTROLLER_PATH=/tmp/unifi-hap-controller/node_modules/hap-controller
+```
+
+Each camera argument has a display label and its own mode-0600 paired controller
+source file. Neither the paired URLs nor their keys are written to output.
+
+```sh
+chmod 600 /secure/path/*.hap-url
+HAP_CONTROLLER_PATH=/tmp/unifi-hap-controller/node_modules/hap-controller \
+node scripts/homekit-snapshot.js \
+  --camera 'Kamera Teich=/secure/path/kamera-teich.hap-url' \
+  --camera 'Kamera Terasse Hinten=/secure/path/kamera-terasse-hinten.hap-url' \
+  --camera 'Kamera Terasse Vorne=/secure/path/kamera-terasse-vorne.hap-url' \
+  --camera 'Kamera Garten Hinten=/secure/path/kamera-garten-hinten.hap-url' \
+  --size 320x180 --size 640x360 --size 1280x720 \
+  --runs 20 --interval-ms 1000 --timeout-ms 5000 \
+  --run-dir /tmp/unifi-homekit-snapshots
+```
+
+Camera requests in each size/run round are concurrent, and `--interval-ms` is a
+monotonic start-to-start cadence (request/decode time is not added to it). By
+default, each camera reuses one verified HAP connection, which resembles repeat
+Home app refreshes. Samples distinguish Pair Verify from a genuinely reused
+connection, and a server-closed persistent connection is re-verified rather than
+reopened with stale session keys. The runner also tracks the library's otherwise
+hidden Pair Verify socket: a `--timeout-ms` deadline destroys stalled verify or
+resource connections and discards that client before the next sample.
+Add `--fresh-connections` to perform Pair Verify on a new TCP connection for
+every image and expose cold-connection-only failures. For a bridged validation
+accessory, pass a common accessory ID with `--aid N`, or repeat
+`--camera-aid 'Camera label=N'` when cameras use different AIDs.
+`--initial-delay-ms 30000`
+leaves the accessory idle before the first request to exercise a cold snapshot
+path without touching its settings.
+
+Every request emits a JSON Lines record with HAP latency, requested and actual
+JPEG dimensions, byte count, SHA-256, repeated-hash age/count, FFmpeg decode
+status, and luminance measurements from a 64x64 grayscale decode. A conservative
+black-frame classification requires the 99th percentile to remain at video
+black, at least 99.5% of pixels below luma 16, and very low variance and spatial
+gradient. This intentionally avoids classifying an ordinary dark night scene as
+blank. Summary records report request/decode failures, black and slow frames,
+dimension mismatches, repeated hashes, and latency median/p95/max for each camera
+and size. Responses at or above four seconds are marked suspicious because that
+is the plugin's default HomeKit preview deadline.
+
+The default 10-second snapshot cache should also be probed just before, at, and
+just after expiry. Use separate private run directories so the results can be
+compared directly:
+
+```sh
+for size in 320x180 640x360; do
+  for interval in 9800 10000 10200; do
+    HAP_CONTROLLER_PATH=/tmp/unifi-hap-controller/node_modules/hap-controller \
+    node scripts/homekit-snapshot.js \
+      --camera 'Validation=/secure/path/validation.hap-url' \
+      --size "$size" --runs 8 --interval-ms "$interval" --timeout-ms 5000 \
+      --initial-delay-ms 30000 \
+      --run-dir "/tmp/unifi-homekit-cache-$size-$interval"
+  done
+done
+```
+
+Repeat the most failure-prone interval once with `--fresh-connections` to split
+snapshot/cache faults from HAP Pair Verify or TCP connection faults.
+
+### Correlating a black result to the plugin path
+
+Temporarily enable **Snapshot diagnostics** only on the dedicated validation
+camera. Each plugin `snapshot trace` record contains a request ID, timestamp,
+requested and actual size, byte count, short SHA-256 prefix, frame age, and the
+capture/cache/resize/deadline path. Correlate it to the harness sample by camera,
+`startedAt`, requested size, byte count, and the prefix of the harness's full
+SHA-256. This separates a black native/keyframe image from a stale cache,
+conversion fallback, request deadline, or HAP transport failure. Disable the
+setting after the reproduction run; ordinary polling remains untraced.
+
+The run directory is forced to mode 0700 and contains `events.jsonl`. JPEGs are
+retained only for suspicious samples and, when available, the immediately
+preceding and following samples. Files are mode 0600. Treat this directory as
+private camera data and remove it after diagnosis.
+
 ### Pairing limitation
 
 The four production camera accessories are already paired to Apple Home. HAP
@@ -104,9 +200,10 @@ to that accessory once, and retain its resulting `homekit://` URL as the
 mode-0600 source file. The runner itself has no Pair Setup or Unpair operation,
 which makes repeated measurements non-destructive.
 
-Both runners have dependency-free smoke checks:
+All three runners have dependency-free smoke checks:
 
 ```sh
 node scripts/browser-startup.js --self-test
 node scripts/homekit-startup.js --self-test
+node scripts/homekit-snapshot.js --self-test
 ```
