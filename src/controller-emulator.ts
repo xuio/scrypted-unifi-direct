@@ -2,7 +2,8 @@ import https from 'https';
 import crypto from 'crypto';
 import net from 'net';
 import { EventEmitter } from 'events';
-import { EMULATOR_CERT, EMULATOR_KEY } from './emulator-cert';
+import { ByteQueue } from './byte-queue';
+import type { EmulatorTls } from './emulator-tls';
 import { dbg } from './debug';
 
 type Logger = { log: (...a: any[]) => void; warn?: (...a: any[]) => void };
@@ -43,29 +44,57 @@ function encodeFrame(payload: Buffer, opcode = 0x2) {
 
 // A single mgmt message is JSON config/status; anything beyond this is corruption
 // or a hostile peer. Cap it so a bogus 64-bit length can't make us buffer forever.
-const MAX_WS_FRAME = 8 * 1024 * 1024;
+export const MAX_WS_FRAME = 8 * 1024 * 1024;
+const EMPTY_BUFFER = Buffer.alloc(0);
 
-function makeFrameParser(onMessage: (b: Buffer) => void, onControl: (t: string, b: Buffer) => void) {
-    let buf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
+export function makeFrameParser(onMessage: (b: Buffer) => void, onControl: (t: string, b: Buffer) => void) {
+    // Management messages are normally a few KB. Use the shared queue algorithm
+    // without imposing the media parser's 1 MiB initial allocation per camera.
+    const q = new ByteQueue(4096);
+    let closed = false;
     return (chunk: Buffer) => {
-        buf = buf.length ? Buffer.concat([buf, chunk]) : chunk;
-        while (buf.length >= 2) {
+        if (closed) return;
+        q.push(chunk);
+        while (q.length >= 2) {
+            const buf = q.view();
             const opcode = buf[0] & 0x0f;
             const masked = (buf[1] & 0x80) !== 0;
             let len = buf[1] & 0x7f, off = 2;
             if (len === 126) { if (buf.length < 4) return; len = buf.readUInt16BE(2); off = 4; }
-            else if (len === 127) { if (buf.length < 10) return; len = Number(buf.readBigUInt64BE(2)); off = 10; }
-            if (len > MAX_WS_FRAME) { onControl('close', Buffer.alloc(0)); return; }
+            else if (len === 127) {
+                if (buf.length < 10) return;
+                const wide = buf.readBigUInt64BE(2);
+                if (wide > BigInt(MAX_WS_FRAME)) {
+                    closed = true;
+                    onControl('close', EMPTY_BUFFER);
+                    return;
+                }
+                len = Number(wide); off = 10;
+            }
+            if (len > MAX_WS_FRAME) {
+                closed = true;
+                onControl('close', EMPTY_BUFFER);
+                return;
+            }
             let mask: Buffer | undefined;
             if (masked) { if (buf.length < off + 4) return; mask = buf.subarray(off, off + 4); off += 4; }
             if (buf.length < off + len) return;
             let p = buf.subarray(off, off + len);
             if (masked) { const u = Buffer.alloc(len); for (let i = 0; i < len; i++) u[i] = p[i] ^ mask![i & 3]; p = u; }
-            buf = buf.subarray(off + len);
-            if (opcode === 0x8) { onControl('close', p); return; }
-            else if (opcode === 0x9) onControl('ping', p);
-            else if (opcode === 0xa) { /* pong */ }
-            else onMessage(p);
+            const consumed = off + len;
+            try {
+                if (opcode === 0x8) {
+                    closed = true;
+                    onControl('close', p);
+                } else if (opcode === 0x9) onControl('ping', p);
+                else if (opcode === 0xa) { /* pong */ }
+                else onMessage(p);
+            } finally {
+                // Unmasked payloads alias the queue and remain valid through the
+                // synchronous callback above; only then may the store be reused.
+                q.consume(consumed);
+            }
+            if (closed) return;
         }
     };
 }
@@ -75,6 +104,7 @@ interface CameraSession {
     socket: net.Socket;
     send: (fn: string, payload: any, responseExpected?: boolean, inResponseTo?: number) => number;
     authenticated: boolean;
+    handshakeTimer?: NodeJS.Timeout;
 }
 
 /**
@@ -92,12 +122,14 @@ interface CameraSession {
  */
 export class ControllerEmulator extends EventEmitter {
     private server: https.Server | undefined;
+    private starting: Promise<void> | undefined;
+    private stopping: Promise<void> | undefined;
     private sessions = new Map<string, CameraSession>();
     private msgId = 1;
     private pending = new Map<number, (payload: any) => void>();   // messageId -> reply resolver
     public readonly controllerUuid = 'e6f3f5f0-0000-4000-8000-' + crypto.randomBytes(6).toString('hex');
 
-    constructor(private port: number, private logger: Logger) {
+    constructor(private port: number, private logger: Logger, private tlsIdentity: EmulatorTls) {
         super();
     }
 
@@ -105,38 +137,154 @@ export class ControllerEmulator extends EventEmitter {
 
     isOnline(mac: string) { return !!this.sessions.get(mac)?.authenticated; }
 
+    /** Actual management port, including an ephemeral port requested by tests. */
+    get boundPort(): number | undefined {
+        const address = this.server?.address();
+        return typeof address === 'object' && address ? address.port : undefined;
+    }
+
     /** MACs of all cameras that have completed the handshake (for diagnostics). */
     onlineMacs(): string[] {
         return [...this.sessions.values()].filter(s => s.authenticated).map(s => s.mac);
     }
 
     start(): Promise<void> {
-        return new Promise((resolve, reject) => {
-            const server = https.createServer({ cert: EMULATOR_CERT, key: EMULATOR_KEY });
+        if (this.stopping)
+            return this.stopping.then(() => this.start());
+        if (this.starting) return this.starting;
+        const starting = new Promise<void>((resolve, reject) => {
+            const server = https.createServer(this.tlsIdentity);
+            this.server = server;
             server.on('upgrade', (req, socket) => this.onUpgrade(req, socket as net.Socket));
-            server.on('error', reject);
+            const onError = (error: Error) => {
+                if (this.server === server) this.server = undefined;
+                reject(error);
+            };
+            server.once('error', onError);
             server.listen(this.port, '0.0.0.0', () => {
+                server.removeListener('error', onError);
+                // stop() may have won while listen was in flight. Close this stale
+                // generation before resolving so the port cannot resurrect later.
+                if (this.server !== server) {
+                    server.close(() => resolve());
+                    return;
+                }
+                server.on('error', error => this.log('controller server error', error.message));
                 this.log('controller emulator listening on', this.port);
                 resolve();
             });
-            this.server = server;
         });
+        this.starting = starting;
+        starting.catch(() => {
+            if (this.starting === starting) this.starting = undefined;
+        });
+        return starting;
     }
 
-    stop() {
-        for (const s of this.sessions.values()) s.socket.destroy();
+    stop(): Promise<void> {
+        if (!this.stopping) {
+            const stopping = this.stopServer();
+            this.stopping = stopping;
+            stopping.finally(() => {
+                if (this.stopping === stopping) this.stopping = undefined;
+            }).catch(() => { });
+        }
+        return this.stopping;
+    }
+
+    private async stopServer() {
+        for (const s of this.sessions.values()) {
+            this.clearHandshakeTimer(s);
+            try { s.socket.destroy(); } catch { }
+        }
         this.sessions.clear();
-        this.server?.close();
+        for (const resolve of this.pending.values()) resolve(undefined);
+        this.pending.clear();
+        this.activeStreams.clear();
+        const server = this.server;
+        const starting = this.starting;
+        this.server = undefined;
+        this.starting = undefined;
+        if (!server) {
+            await starting?.catch(() => { });
+            return;
+        }
+        if (!server.listening) {
+            // The listen callback observes server !== this.server and closes it.
+            await starting?.catch(() => { });
+            return;
+        }
+        await new Promise<void>(resolve => server.close(() => resolve()));
     }
 
     private onUpgrade(req: any, socket: net.Socket) {
-        const mac = (req.headers['camera-mac'] || '').toUpperCase();
-        socket.write([
-            'HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade',
-            `Sec-WebSocket-Accept: ${wsAccept(req.headers['sec-websocket-key'])}`,
-            'Sec-WebSocket-Protocol: secure_transfer', '\r\n',
-        ].join('\r\n'));
-        this.handleSession(mac, socket);
+        let mac: string | undefined;
+        try {
+            const header = (name: string): string | undefined => {
+                const value = req?.headers?.[name];
+                return typeof value === 'string' ? value.trim() : undefined;
+            };
+            const upgrade = header('upgrade');
+            const key = header('sec-websocket-key');
+            const rawMac = header('camera-mac');
+            mac = rawMac?.toUpperCase();
+
+            // This LAN listener is deliberately unauthenticated, so reject
+            // malformed upgrades before they can allocate a camera session. A
+            // WebSocket nonce is exactly 16 bytes encoded as canonical base64.
+            const validKey = !!key
+                && /^[A-Za-z0-9+/]{22}==$/.test(key)
+                && Buffer.from(key, 'base64').length === 16
+                && Buffer.from(key, 'base64').toString('base64') === key;
+            if (req?.method !== 'GET'
+                || upgrade?.toLowerCase() !== 'websocket'
+                || !validKey
+                || !mac
+                || !/^[0-9A-F]{12}$/.test(mac)) {
+                this.rejectUpgrade(socket);
+                return;
+            }
+
+            socket.write([
+                'HTTP/1.1 101 Switching Protocols', 'Upgrade: websocket', 'Connection: Upgrade',
+                `Sec-WebSocket-Accept: ${wsAccept(key)}`,
+                'Sec-WebSocket-Protocol: secure_transfer', '\r\n',
+            ].join('\r\n'));
+            this.handleSession(mac, socket);
+        } catch (e) {
+            // Upgrade parsing and socket implementations are outside our trust
+            // boundary. Never let their exceptions escape EventEmitter.
+            if (mac) {
+                const session = this.sessions.get(mac);
+                if (session?.socket === socket) {
+                    this.clearHandshakeTimer(session);
+                    this.sessions.delete(mac);
+                }
+            }
+            try { this.log('rejected camera WebSocket upgrade', (e as Error)?.message); } catch { }
+            this.rejectUpgrade(socket);
+        }
+    }
+
+    private rejectUpgrade(socket: net.Socket) {
+        try {
+            if (!socket.destroyed && !socket.writableEnded) {
+                socket.end([
+                    'HTTP/1.1 400 Bad Request',
+                    'Connection: close',
+                    'Content-Length: 0',
+                    '\r\n',
+                ].join('\r\n'));
+                return;
+            }
+        } catch { }
+        try { socket.destroy(); } catch { }
+    }
+
+    private clearHandshakeTimer(session: CameraSession) {
+        if (!session.handshakeTimer) return;
+        clearTimeout(session.handshakeTimer);
+        session.handshakeTimer = undefined;
     }
 
     private handleSession(mac: string, socket: net.Socket) {
@@ -154,13 +302,22 @@ export class ControllerEmulator extends EventEmitter {
         // If this MAC already has a session (reconnect before the old close fired),
         // tear down the stale socket so its parser can't double-fire the handshake.
         const prev = this.sessions.get(mac);
-        if (prev && prev.socket !== socket) { try { prev.socket.destroy(); } catch { } }
+        if (prev && prev.socket !== socket) {
+            this.clearHandshakeTimer(prev);
+            try { prev.socket.destroy(); } catch { }
+        }
         const session: CameraSession = { mac, socket, send, authenticated: false };
         this.sessions.set(mac, session);
 
         const parser = makeFrameParser(payload => {
             let m: any;
-            try { m = JSON.parse(payload.toString()); } catch { return; }
+            try { m = JSON.parse(payload.toString()); }
+            catch {
+                // Never reflect a management payload into logs: settings and
+                // events can contain private camera configuration.
+                this.log('ignored invalid camera JSON frame', mac, `(${payload.length} bytes)`);
+                return;
+            }
             // A throwing handler (including downstream 'event'/'online' listeners)
             // must never propagate into the socket 'data' handler — that would be
             // an uncaught exception and crash the plugin.
@@ -173,6 +330,7 @@ export class ControllerEmulator extends EventEmitter {
 
         socket.on('data', parser);
         socket.on('close', () => {
+            this.clearHandshakeTimer(session);
             if (this.sessions.get(mac) === session) {
                 this.sessions.delete(mac);
                 this.log('camera disconnected', mac);
@@ -185,10 +343,21 @@ export class ControllerEmulator extends EventEmitter {
     private onMessage(session: CameraSession, m: any) {
         const fn = m.functionName;
         if (fn !== 'ubnt_avclient_timeSync') dbg('emu recv', session.mac, fn);
-        // Surface the camera's reply to our Change*Settings commands so we can see
-        // whether it accepted (success/echo) or rejected (error) a config push.
-        if (/Settings$/.test(fn) && m.inResponseTo)
-            dbg('emu recv reply', session.mac, fn, 'payload', JSON.stringify(m.payload ?? {}).slice(0, 800));
+        // Surface the camera's reply to our Change*Settings commands without
+        // reflecting configuration payloads into the diagnostic log. Only
+        // explicitly typed scalar result fields are safe to retain.
+        if (/Settings$/.test(fn) && m.inResponseTo) {
+            const code = typeof m.payload?.statusCode === 'number'
+                ? m.payload.statusCode
+                : undefined;
+            const success = typeof m.payload?.success === 'boolean'
+                ? m.payload.success
+                : undefined;
+            dbg('emu recv settings reply', session.mac, fn,
+                code !== undefined ? `status=${code}`
+                    : success !== undefined ? `success=${success}`
+                        : 'status=received');
+        }
         // Resolve a pending readSetting() awaiting this reply.
         if (m.inResponseTo && this.pending.has(m.inResponseTo)) {
             const resolve = this.pending.get(m.inResponseTo)!;
@@ -204,13 +373,21 @@ export class ControllerEmulator extends EventEmitter {
                     controllerVersion: '1.20.0',
                     overrideUuid: true,
                 }, false, m.messageId);
-                setTimeout(() => session.send('ubnt_avclient_paramAgreement', {
-                    enableStatusCodes: true, useHeartbeats: false, heartbeatsTimeoutMs: 60000,
-                }, true), 500);
+                this.clearHandshakeTimer(session);
+                session.handshakeTimer = setTimeout(() => {
+                    session.handshakeTimer = undefined;
+                    if (this.sessions.get(session.mac) !== session
+                        || session.socket.destroyed
+                        || session.socket.writableEnded) return;
+                    session.send('ubnt_avclient_paramAgreement', {
+                        enableStatusCodes: true, useHeartbeats: false, heartbeatsTimeoutMs: 60000,
+                    }, true);
+                }, 500);
                 break;
             case 'ubnt_avclient_paramAgreement':
                 // camera's reply to our paramAgreement completes the handshake
                 if (!session.authenticated) {
+                    this.clearHandshakeTimer(session);
                     session.authenticated = true;
                     this.log('camera authenticated', session.mac);
                     this.quiesceSubstreams(session);

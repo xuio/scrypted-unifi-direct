@@ -45,14 +45,16 @@ export function flvHeader(flags = 0x05): Buffer {
 
 /** Feed data to a chunk-consuming function in random-sized chunks. */
 export function feedChunked(
-    consume: (chunk: Buffer) => Buffer,
+    consume: (chunk: Buffer) => Buffer | readonly Buffer[],
     data: Buffer, r: () => number, maxChunk: number,
 ): Buffer {
     const out: Buffer[] = [];
     let off = 0;
     while (off < data.length) {
         const n = Math.min(randInt(r, 1, maxChunk), data.length - off);
-        out.push(consume(data.subarray(off, off + n)));
+        const emitted = consume(data.subarray(off, off + n));
+        if (Array.isArray(emitted)) out.push(...emitted);
+        else out.push(emitted as Buffer);
         off += n;
     }
     return Buffer.concat(out);

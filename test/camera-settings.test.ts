@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    PARITY_FIELDS, coerceValue, readField, writeField, buildMgmtSetting,
+    PARITY_FIELDS, coerceValue, readField, writeField, writeFieldForTracks, buildMgmtSetting,
     isFieldSupported, irLedToCamera, getByPath, setByPath, deepMerge,
     buildSshCommand,
     toSetting,
@@ -30,6 +30,21 @@ test('readField/writeField resolve <track> placeholders', () => {
     const w = writeField(f, 15, 'video1');
     assert.equal(getByPath(w, 'av.video.video1.fps'), 15);
     assert.equal(getByPath(w, 'av.video.video1.maxFps'), 15, 'fps writes both fps and maxFps');
+});
+
+test('keyframe interval can be written atomically across all client tracks', () => {
+    const partial = writeFieldForTracks(
+        field('video.keyframeInterval'),
+        1,
+        ['video1', 'video2', 'video2', 'video3'],
+    );
+    assert.deepEqual(partial, {
+        av: { video: {
+            video1: { nMultiplier: 1 },
+            video2: { nMultiplier: 1 },
+            video3: { nMultiplier: 1 },
+        } },
+    });
 });
 
 test('IR led mode round-trips through the camera representation', () => {

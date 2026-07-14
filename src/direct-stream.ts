@@ -22,6 +22,7 @@ const SETTLE_MS = 800;
 
 const MAX_TAG = 4 * 1024 * 1024;   // sanity bound on a single FLV tag's data size
 const MAX_TRAILER_SCAN = 1 << 16;  // how far to look for the next tag past a trailer
+const EMPTY_CHUNKS: readonly Buffer[] = Object.freeze([] as Buffer[]);
 
 /**
  * Convert UniFi "extendedFlv" to standard FLV for ffmpeg.
@@ -45,15 +46,15 @@ const MAX_TRAILER_SCAN = 1 << 16;  // how far to look for the next tag past a tr
 export function makeDetrailer() {
     const q = new ByteQueue();
     let headerDone = false;
-    return (chunk: Buffer) => {
+    return (chunk: Buffer): readonly Buffer[] => {
         q.push(chunk);
-        const out: Buffer[] = [];
+        let out: Buffer[] | undefined;
         for (; ;) {
             const buf = q.view();
             if (!headerDone) {
                 if (buf.length < 13) break;
                 const hdr = Buffer.from(buf.subarray(0, 13)); hdr[4] = 0x05;
-                out.push(hdr); q.consume(13); headerDone = true; continue;
+                (out ??= []).push(hdr); q.consume(13); headerDone = true; continue;
             }
             if (buf.length < 11) break;
             const type = buf[0];
@@ -82,14 +83,17 @@ export function makeDetrailer() {
             if (nextOff < 0) {
                 if (pendingMore) break;   // wait for more data to confirm the next tag
                 // no next tag within the scan window: emit and fall back to a 16-byte skip.
-                out.push(Buffer.from(buf.subarray(0, tagLen)));
+                (out ??= []).push(Buffer.from(buf.subarray(0, tagLen)));
                 q.consume(Math.min(tagLen + 16, buf.length));
                 continue;
             }
-            out.push(Buffer.from(buf.subarray(0, tagLen)));
+            (out ??= []).push(Buffer.from(buf.subarray(0, tagLen)));
             q.consume(nextOff);
         }
-        return out.length ? Buffer.concat(out) : Buffer.alloc(0);
+        // Each emitted chunk owns its bytes: ByteQueue reuses its backing store
+        // after consume(). Return the chunks directly so a large IDR is not copied
+        // once more into a batch-sized Buffer on every tag emission.
+        return out ?? EMPTY_CHUNKS;
     };
 }
 
@@ -100,6 +104,14 @@ const CANDIDATE_IDLE_MS = 500;
 // high/medium stream. A short grace still covers split chunks/event-loop jitter,
 // while a camera with its microphone disabled no longer delays video by 3 seconds.
 const AUDIO_GRACE_MS = 250;
+// Before a reader exists the camera can legitimately deliver most of the 800 ms
+// settle backlog in one burst. Once the native parser is attached, a separate
+// stream with a smaller public HWM bounds recoverable steady-state retention.
+// Do not mutate Node's private stream state after construction.
+export const SETTLE_BUFFER_HWM = 8 * 1024 * 1024;
+export const STEADY_BUFFER_HWM = 512 * 1024;
+
+type IngressPauseReason = 'flv-drain' | 'egress-pressure' | 'handoff';
 
 /**
  * One live direct stream for a camera+channel.
@@ -121,7 +133,17 @@ export class DirectStream {
     private cameraSocket: net.Socket | undefined;
     private cameraSockets = new Set<net.Socket>();   // all inbound conns, for teardown
     private flv: PassThrough | undefined;
-    private detrailer: ((c: Buffer) => Buffer) | undefined;
+    /** Old 8 MiB bootstrap buffer while it is being losslessly handed to the
+     * lower-HWM steady stream. Kept explicitly so stop() can destroy both sides. */
+    private handoffSource: PassThrough | undefined;
+    private detrailer: ((c: Buffer) => readonly Buffer[]) | undefined;
+    private ingressDrain: {
+        flv: PassThrough;
+        socket: net.Socket;
+        listener: () => void;
+    } | undefined;
+    private ingressPauseReasons = new Set<IngressPauseReason>();
+    private ingressPausedSocket: net.Socket | undefined;
     private lastCandidateDataAt = 0;
     private settleTimer: any;
     private serve: RtspServeHandle | undefined;
@@ -306,16 +328,18 @@ export class DirectStream {
             if (this.cameraSocket !== sock || !this.flv || !this.detrailer) return;
             this.lastCandidateDataAt = Date.now();
             const clean = this.detrailer(d);
-            if (clean.length && !this.flv.destroyed) {
-                // write(false) accepted the bytes; pause ingress until the parser
-                // drains them. Dropping would corrupt FLV, while ignoring pressure
-                // lets latency/memory grow without bound on an overloaded host.
-                if (!this.flv.write(clean)) {
-                    sock.pause();
-                    this.flv.once('drain', () => {
-                        if (!this.stopped && this.cameraSocket === sock && !sock.destroyed) sock.resume();
-                    });
+            const flv = this.flv;
+            if (clean.length && !flv.destroyed) {
+                // write(false) still accepted that chunk. Finish this synchronous
+                // detrailer batch (never drop partial FLV), then pause ingress once
+                // until the parser drains it. This keeps the chunks separate and
+                // avoids recreating the full-batch copy that the detrailer removed.
+                let writable = true;
+                for (const part of clean) {
+                    if (flv.destroyed) break;
+                    if (!flv.write(part)) writable = false;
                 }
+                if (!writable) this.pauseIngress(sock, flv);
             }
         });
         sock.on('error', e => dbg('DS', this.mac, 'camera stream error', (e as Error)?.message));
@@ -326,12 +350,68 @@ export class DirectStream {
         });
     }
 
+    private pauseIngress(sock: net.Socket, flv: PassThrough) {
+        // A paused socket should not normally deliver another data event, but one
+        // may already be queued. Never stack drain listeners or pause calls.
+        if (this.ingressDrain) return;
+        const listener = () => {
+            if (this.ingressDrain?.listener !== listener) return;
+            this.ingressDrain = undefined;
+            this.setIngressPauseReason('flv-drain', false);
+        };
+        this.ingressDrain = { flv, socket: sock, listener };
+        flv.once('drain', listener);
+        this.setIngressPauseReason('flv-drain', true, sock);
+    }
+
+    private clearIngressDrain() {
+        const pending = this.ingressDrain;
+        if (pending) {
+            this.ingressDrain = undefined;
+            pending.flv.removeListener('drain', pending.listener);
+        }
+        this.setIngressPauseReason('flv-drain', false);
+    }
+
+    /** Maintain one physical socket pause across independent backpressure
+     * reasons. In particular, a PassThrough `drain` must not resume the camera
+     * while the RTP pacer is still above its egress high-water mark. */
+    private setIngressPauseReason(reason: IngressPauseReason, active: boolean, socket = this.cameraSocket) {
+        if (active) this.ingressPauseReasons.add(reason);
+        else this.ingressPauseReasons.delete(reason);
+
+        if (this.stopped || !socket || socket.destroyed || socket !== this.cameraSocket) {
+            if (!this.ingressPauseReasons.size) this.ingressPausedSocket = undefined;
+            return;
+        }
+        if (this.ingressPauseReasons.size) {
+            if (this.ingressPausedSocket !== socket) {
+                try { socket.pause(); } catch { }
+                this.ingressPausedSocket = socket;
+            }
+        } else if (this.ingressPausedSocket === socket) {
+            this.ingressPausedSocket = undefined;
+            try { socket.resume(); } catch { }
+        }
+    }
+
+    private clearIngressPauses() {
+        const pending = this.ingressDrain;
+        if (pending) pending.flv.removeListener('drain', pending.listener);
+        this.ingressDrain = undefined;
+        this.ingressPauseReasons.clear();
+        // Teardown destroys the socket; resuming it here could deliver one more
+        // data event into a pipeline whose buffers are already being released.
+        this.ingressPausedSocket = undefined;
+    }
+
     /** Dispose only the unpromoted candidate, leaving the DirectStream registered
      *  so the camera's next retry can be adopted. */
     private discardCandidate(reason: string) {
         if (this.serveStarted) return;
         const oldSocket = this.cameraSocket;
         const oldFlv = this.flv;
+        this.clearIngressPauses();
         this.cameraSocket = undefined;
         this.flv = undefined;
         this.detrailer = undefined;
@@ -344,8 +424,9 @@ export class DirectStream {
 
     /** Lock onto a candidate FLV connection with a fresh pipeline and settle timer. */
     private adopt(sock: net.Socket) {
+        this.clearIngressPauses();
         this.cameraSocket = sock;
-        this.flv = new PassThrough({ highWaterMark: 8 * 1024 * 1024 });
+        this.flv = new PassThrough({ highWaterMark: SETTLE_BUFFER_HWM });
         this.detrailer = makeDetrailer();
         this.lastCandidateDataAt = Date.now();
         dbg('DS', this.mac, 'candidate connection from', sock.remoteAddress || '?');
@@ -366,20 +447,82 @@ export class DirectStream {
         }
         this.serveStarted = true;
         dbg('DS', this.mac, 'connection stable; starting native rtsp serve');
+        const settleFlv = this.flv;
+        const steadyFlv = new PassThrough({ highWaterMark: STEADY_BUFFER_HWM });
+        this.handoffSource = settleFlv;
+        this.flv = steadyFlv;
+
+        // Stop camera ingress while the finite bootstrap buffer is piped into the
+        // parser. Both streams use public, construction-time high-water marks:
+        // 8 MiB for camera settlement and 512 KiB for the rest of the generation.
+        // No private Node stream state is mutated, and no bootstrap bytes can be
+        // overtaken by a newly-arriving camera chunk during the handoff.
+        this.setIngressPauseReason('handoff', true);
+        this.clearIngressDrain();
+
         // if this settled connection later collapses, mark dead for rebuild.
-        this.flv.once('close', () => {
+        steadyFlv.once('close', () => {
             if (this.serveStarted && !this.stopped) {
                 dbg('DS', this.mac, 'native media pipeline closed; cleaning up generation');
                 this.stop();
             }
         });
         try {
-            const serve = await startNativeServe({
-                flv: this.flv,
+            // Async functions execute through their first await synchronously, so
+            // this installs the steady stream's parser before the old buffer is
+            // piped into it.
+            const servePromise = startNativeServe({
+                flv: steadyFlv,
                 hasAudio: true,
                 audioGraceMs: AUDIO_GRACE_MS,
                 logger: this.logger,
+                onEgressPressure: paused => {
+                    if (this.flv === steadyFlv)
+                        this.setIngressPauseReason('egress-pressure', paused);
+                },
             });
+
+            const transferDone = new Promise<void>((resolve, reject) => {
+                let settled = false;
+                const cleanup = () => {
+                    settleFlv.removeListener('end', done);
+                    settleFlv.removeListener('close', done);
+                    settleFlv.removeListener('error', failed);
+                };
+                const done = () => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    resolve();
+                };
+                const failed = (e: Error) => {
+                    if (settled) return;
+                    settled = true;
+                    cleanup();
+                    reject(e);
+                };
+                settleFlv.once('end', done);
+                settleFlv.once('close', done);
+                settleFlv.once('error', failed);
+            });
+            settleFlv.pipe(steadyFlv, { end: false });
+            settleFlv.end();
+            // If native startup rejects while the pipe is backpressured, do not
+            // wait forever for an `end` that can no longer reach its destination.
+            // Successful startup must NOT win this race: unpiping before `end`
+            // would discard a tail of the bootstrap buffer on an unusually slow
+            // handoff.
+            const startupFailure = servePromise.then(
+                () => new Promise<never>(() => { }),
+                e => Promise.reject(e),
+            );
+            await Promise.race([transferDone, startupFailure]);
+            settleFlv.unpipe(steadyFlv);
+            try { settleFlv.destroy(); } catch { }
+            if (this.handoffSource === settleFlv) this.handoffSource = undefined;
+            this.setIngressPauseReason('handoff', false);
+
+            const serve = await servePromise;
             // stop() may have run during the (multi-second) SDP wait; it destroyed a
             // still-undefined this.serve, so the freshly-built one would leak
             // (sockets, unreferenced). Destroy it and bail.
@@ -387,12 +530,17 @@ export class DirectStream {
             this.serve = serve;
             this.onServeReady?.();
         } catch (e) {
+            settleFlv.unpipe(steadyFlv);
+            try { settleFlv.destroy(); } catch { }
+            if (this.handoffSource === settleFlv) this.handoffSource = undefined;
+            this.setIngressPauseReason('handoff', false);
             this.onServeFail?.(e as Error);
         }
     }
 
     private onSocketClose(sock: net.Socket) {
         if (this.cameraSocket !== sock) return;
+        this.clearIngressDrain();
         this.cameraSocket = undefined;
         this.lastCandidateDataAt = 0;
         clearTimeout(this.settleTimer);
@@ -415,6 +563,7 @@ export class DirectStream {
         this.stopped = true;
         clearTimeout(this.settleTimer);
         clearInterval(this.resolveTimer);
+        this.clearIngressPauses();
         try { this.emulator.stopStream(this.mac, this.channel); } catch { }
         this.streaming = false;
         for (const s of this.cameraSockets) { try { s.destroy(); } catch { } }   // incl. non-adopted strays
@@ -422,6 +571,8 @@ export class DirectStream {
         this.cameraSocket = undefined;
         this.serve?.destroy();
         try { this.flv?.destroy(); } catch { }
+        try { this.handoffSource?.destroy(); } catch { }
+        this.handoffSource = undefined;
         if (this.route) { this.registry.unregister(this.cameraPort, this.route); this.route = undefined; }
         this.registered = false;
         // unblock a start() still waiting on us.

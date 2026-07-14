@@ -16,6 +16,7 @@ import { ControllerEmulator } from './controller-emulator';
 import { PushPortRegistry } from './push-registry';
 import { AudioRtspServer, AUDIO_RTSP_PORT } from './audio-rtsp';
 import { UnifiCamera } from './camera';
+import { loadOrCreateEmulatorTls } from './emulator-tls';
 import { dbg, setDbgEnabled } from './debug';
 
 const { deviceManager } = sdk;
@@ -30,9 +31,14 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
     readonly pushRegistry = new PushPortRegistry();
     // Stable audio-only RTSP endpoints (17553), started lazily on first enable.
     private audioServer: AudioRtspServer | undefined;
-    private pairTimer: any;
-    private healthTimer: any;
+    private pairTimer: ReturnType<typeof setInterval> | undefined;
+    private healthTimer: ReturnType<typeof setInterval> | undefined;
+    private initialRepairTimer: ReturnType<typeof setTimeout> | undefined;
+    private initRetryTimer: ReturnType<typeof setTimeout> | undefined;
+    private initPromise: Promise<void> | undefined;
     private initAttempt = 0;
+    private shuttingDown = false;
+    private shutdownPromise: Promise<void> | undefined;
 
     private initError: string | undefined;
 
@@ -40,18 +46,34 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
         super(nativeId);
         this.storage.removeItem('cameraPorts');   // legacy per-camera port map
         setDbgEnabled(this.storage.getItem('fileLog') !== 'false');
-        this.init();
+        this.startInit();
+    }
+
+    private startInit() {
+        if (this.shuttingDown || this.initPromise) return;
+        const running = this.init();
+        this.initPromise = running;
+        running.finally(() => {
+            if (this.initPromise === running) this.initPromise = undefined;
+        }).catch(() => { /* init handles and reports its own failures */ });
     }
 
     private async init() {
+        if (this.shuttingDown) return;
+        let emulator: ControllerEmulator | undefined;
         try {
-            this.emulator = new ControllerEmulator(MGMT_PORT, this.console);
-            this.emulator.on('online', (mac: string) => {
+            const tlsIdentity = await loadOrCreateEmulatorTls(this.storage, this.console);
+            if (this.shuttingDown) return;
+            emulator = new ControllerEmulator(MGMT_PORT, this.console, tlsIdentity);
+            this.emulator = emulator;
+            emulator.on('online', (mac: string) => {
                 // handler runs inside a socket 'data' path — never let it throw.
                 try {
+                    if (this.shuttingDown) return;
                     this.console.log('[unifi-direct] camera online:', mac);
                     for (const cam of this.cameras.values())
                         if (cam.mac === mac) {
+                            cam.onManagementConnectionChanged(true);
                             // Import any zones already on the camera FIRST (reads are only
                             // valid before applyZones overwrites the smart-detect/motion
                             // config), then re-assert our config over the live mgmt session.
@@ -63,25 +85,58 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
                         }
                 } catch (e) { dbg('online handler failed', mac, (e as Error)?.message); }
             });
-            this.emulator.on('event', (mac: string, fn: string, payload: any) => {
-                for (const cam of this.cameras.values())
-                    if (cam.mac === mac) {
-                        try { cam.onCameraEvent(fn, payload); }
-                        catch (e) { dbg('event handler failed', mac, fn, (e as Error)?.message); }
-                    }
+            emulator.on('offline', (mac: string) => {
+                // Management can reconnect independently of an active media push.
+                // Publish Online=false immediately, but only reap streams already
+                // known dead instead of disrupting healthy viewers.
+                try {
+                    if (this.shuttingDown) return;
+                    this.console.log('[unifi-direct] camera offline:', mac);
+                    for (const cam of this.cameras.values())
+                        if (cam.mac === mac) {
+                            cam.onManagementConnectionChanged(false);
+                            cam.reapDeadStreams();
+                        }
+                } catch (e) { dbg('offline handler failed', mac, (e as Error)?.message); }
             });
-            await this.emulator.start();
+            emulator.on('event', (mac: string, fn: string, payload: any) => {
+                try {
+                    if (this.shuttingDown) return;
+                    for (const cam of this.cameras.values())
+                        if (cam.mac === mac) {
+                            try { cam.onCameraEvent(fn, payload); }
+                            catch (e) { dbg('event handler failed', mac, fn, (e as Error)?.message); }
+                        }
+                } catch (e) { dbg('event handler failed', mac, fn, (e as Error)?.message); }
+            });
+            await emulator.start();
+            if (this.shuttingDown || this.emulator !== emulator) {
+                emulator.removeAllListeners();
+                await emulator.stop();
+                return;
+            }
 
             // load existing cameras so their sessions/pairing resume
             for (const nativeId of deviceManager.getNativeIds()) {
-                if (nativeId && nativeId.startsWith('cam:')) await this.getDevice(nativeId);
+                if (this.shuttingDown) break;
+                if (nativeId && nativeId.startsWith('cam:')) {
+                    const cam = await this.getDevice(nativeId);
+                    // Re-report existing children so descriptor additions (such
+                    // as Online) apply on upgrade, not only to newly added cameras.
+                    const name = cam.providedName || cam.name || cam.storage.getItem('host') || nativeId;
+                    await deviceManager.onDeviceDiscovered(this.deviceDescriptor(nativeId, name));
+                }
             }
+            if (this.shuttingDown) return;
             // bring the audio endpoint up if any camera has it enabled
             if ([...this.cameras.values()].some(c => c.audioEndpointEnabled))
                 this.ensureAudioRtspServer().catch(e => this.console.warn('audio rtsp endpoint failed to start:', (e as Error)?.message));
             // periodically (re)pair cameras that aren't connected (handles reboots/backoff)
-            this.pairTimer = setInterval(() => this.repairAll(), 30000);
-            setTimeout(() => this.repairAll(), 3000);
+            this.pairTimer = setInterval(() => { void this.repairAll(); }, 30000);
+            this.initialRepairTimer = setTimeout(() => {
+                this.initialRepairTimer = undefined;
+                void this.repairAll();
+            }, 3000);
             // health watchdog: reap dead/stalled streams so consumers reconnect fresh.
             this.healthTimer = setInterval(() => this.reapAll(), 15000);
             this.initAttempt = 0;
@@ -90,24 +145,48 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
             // e.g. EADDRINUSE on 7442 while an old plugin process lingers through a
             // reload. Without a retry the plugin would sit dead until manually
             // restarted — retry with backoff instead.
-            try { this.emulator?.stop(); } catch { }
-            this.emulator = undefined;
-            clearInterval(this.pairTimer);
-            clearInterval(this.healthTimer);
+            try {
+                emulator?.removeAllListeners();
+                await emulator?.stop();
+            } catch { }
+            if (this.emulator === emulator) this.emulator = undefined;
+            this.clearRunTimers();
+            if (this.shuttingDown) return;
             const delay = Math.min(15_000 * 2 ** this.initAttempt++, 120_000);
             this.initError = (e as Error)?.message ?? String(e);
             this.console.error(`init failed (retrying in ${delay / 1000}s):`, this.initError);
-            setTimeout(() => this.init(), delay);
+            this.initRetryTimer = setTimeout(() => {
+                this.initRetryTimer = undefined;
+                this.startInit();
+            }, delay);
         }
     }
 
+    private clearRunTimers() {
+        clearInterval(this.pairTimer);
+        clearInterval(this.healthTimer);
+        clearTimeout(this.initialRepairTimer);
+        this.pairTimer = undefined;
+        this.healthTimer = undefined;
+        this.initialRepairTimer = undefined;
+    }
+
+    private clearAllTimers() {
+        this.clearRunTimers();
+        clearTimeout(this.initRetryTimer);
+        this.initRetryTimer = undefined;
+    }
+
     private async repairAll() {
+        if (this.shuttingDown) return;
         for (const cam of this.cameras.values()) {
+            if (this.shuttingDown) return;
             try { await cam.ensurePaired(); } catch { }
         }
     }
 
     private reapAll() {
+        if (this.shuttingDown) return;
         for (const cam of this.cameras.values()) {
             try { cam.reapDeadStreams(); } catch { }
         }
@@ -119,6 +198,8 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
 
     /** Start the shared audio-only RTSP listener (idempotent). */
     ensureAudioRtspServer(): Promise<void> {
+        if (this.shuttingDown)
+            return Promise.reject(new Error('provider is shutting down'));
         if (!this.audioServer)
             this.audioServer = new AudioRtspServer(AUDIO_RTSP_PORT, key => this.resolveAudioSource(key));
         return this.audioServer.start();
@@ -182,14 +263,23 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
     }
 
     async createDevice(settings: DeviceCreatorSettings): Promise<string> {
+        if (this.shuttingDown) throw new Error('provider is shutting down');
         const host = String(settings.host || '').trim();
         const username = String(settings.username || '').trim();
         const password = String(settings.password || '');
         if (!host) throw new Error('camera IP/host is required');
 
         const probe = new CameraApiClient(host, username, password, this.console);
-        const status = await probe.getStatus();
-        const mac = await probe.getMac();
+        let status;
+        let mac;
+        try {
+            status = await probe.getStatus();
+            mac = await probe.getMac();
+        } finally {
+            // The probe owns a keep-alive HTTPS agent just like a long-lived
+            // camera client. Never leave its pooled socket behind after create.
+            probe.destroy();
+        }
         const name = status.hostName || status.board?.name || host;
         const nativeId = `cam:${host}`;
 
@@ -214,21 +304,72 @@ export class UnifiDirectProvider extends ScryptedDeviceBase implements DevicePro
                 ScryptedInterface.Settings,
                 ScryptedInterface.MotionSensor,
                 ScryptedInterface.ObjectDetector,
+                ScryptedInterface.Online,
             ],
             info: { manufacturer: 'Ubiquiti', model: 'UniFi Protect Camera (direct)' },
         };
     }
 
     async getDevice(nativeId: ScryptedNativeId): Promise<UnifiCamera> {
+        if (this.shuttingDown) throw new Error('provider is shutting down');
         const key = nativeId || '';
         let cam = this.cameras.get(key);
-        if (!cam) { cam = new UnifiCamera(this, key); this.cameras.set(key, cam); }
+        if (!cam) {
+            cam = new UnifiCamera(this, key);
+            this.cameras.set(key, cam);
+            cam.onManagementConnectionChanged(!!this.emulator?.isOnline(cam.mac));
+        }
         return cam;
     }
 
     async releaseDevice(id: string, nativeId: ScryptedNativeId): Promise<void> {
         const key = nativeId || '';
         const cam = this.cameras.get(key);
-        if (cam) { await cam.release(); this.cameras.delete(key); }
+        if (cam) {
+            // Remove first so an emulator event racing release cannot call back
+            // into a half-disposed camera.
+            this.cameras.delete(key);
+            await cam.release();
+        }
+    }
+
+    /** Idempotent owner cleanup for tests and any future SDK lifecycle hook.
+     * The provider's release() hook delegates here, while tests may call this
+     * directly and await full listener/port teardown. */
+    shutdown(): Promise<void> {
+        if (!this.shutdownPromise) {
+            this.shuttingDown = true;
+            this.shutdownPromise = this.shutdownResources();
+        }
+        return this.shutdownPromise;
+    }
+
+    /** Compatibility lifecycle entry point for hosts that call release on a
+     * provider. SDK 0.5.59 does not declare a provider-unload hook, but returning
+     * the owner promise lets any host that observes thenables wait until every
+     * listener has actually released its port before loading a new generation. */
+    release(): Promise<void> {
+        return this.shutdown();
+    }
+
+    private async shutdownResources(): Promise<void> {
+        this.clearAllTimers();
+
+        const emulator = this.emulator;
+        this.emulator = undefined;
+        // Stop new socket callbacks before releasing the camera objects they
+        // reference. In-flight async apply operations observe camera.released.
+        emulator?.removeAllListeners();
+
+        const cameras = [...this.cameras.values()];
+        this.cameras.clear();
+        await Promise.allSettled(cameras.map(cam => cam.release()));
+
+        const audioServer = this.audioServer;
+        this.audioServer = undefined;
+        await audioServer?.stop();
+
+        try { await emulator?.stop(); } catch { }
+        await this.pushRegistry.close();
     }
 }

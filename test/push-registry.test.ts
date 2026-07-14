@@ -121,3 +121,19 @@ test('listen failure rejects register and is retryable', async t => {
     assert.equal(a.received.length, 1);
     c.destroy();
 });
+
+test('close is idempotent, releases the port, and permanently rejects new routes', async () => {
+    const reg = new PushPortRegistry();
+    const port = nextPort++;
+    const a = makeRoute(['127.0.0.1']);
+    await reg.register(port, a.route);
+
+    await Promise.all([reg.close(), reg.close()]);
+    await assert.rejects(reg.register(port, a.route), /registry is closed/);
+
+    // Awaited close means another owner can bind immediately; no listener from
+    // the old provider generation is lingering on the port.
+    const replacement = net.createServer(() => { });
+    await new Promise<void>(resolve => replacement.listen(port, '0.0.0.0', resolve));
+    await new Promise<void>(resolve => replacement.close(() => resolve()));
+});

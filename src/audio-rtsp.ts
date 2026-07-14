@@ -28,6 +28,7 @@ export class AudioRtspServer {
     private server: net.Server | undefined;
     private sessions = new Set<RtspSession>();
     private starting: Promise<void> | undefined;
+    private stopping: Promise<void> | undefined;
 
     constructor(
         private port: number,
@@ -44,10 +45,15 @@ export class AudioRtspServer {
 
     /** Idempotent; concurrent callers share one listen attempt. */
     start(): Promise<void> {
+        if (this.stopping)
+            return this.stopping.then(() => this.start());
         if (!this.starting) {
-            this.starting = this.listen().catch(e => {
-                this.starting = undefined;   // allow a retry on the next enable
-                throw e;
+            const starting = this.listen();
+            this.starting = starting;
+            // Allow retry after a failed listen, but do not let an older failed
+            // attempt clear a newer start scheduled after stop().
+            starting.catch(() => {
+                if (this.starting === starting) this.starting = undefined;
             });
         }
         return this.starting;
@@ -56,11 +62,21 @@ export class AudioRtspServer {
     private listen(): Promise<void> {
         return new Promise((resolve, reject) => {
             const server = net.createServer(sock => this.onConnection(sock));
-            server.once('error', reject);
+            this.server = server;
+            const onError = (e: Error) => {
+                if (this.server === server) this.server = undefined;
+                reject(e);
+            };
+            server.once('error', onError);
             server.listen(this.port, '0.0.0.0', () => {
-                server.removeListener('error', reject);
+                server.removeListener('error', onError);
+                // stop() may have won while listen was in flight. Close this
+                // stale generation before resolving its start promise.
+                if (this.server !== server) {
+                    server.close(() => resolve());
+                    return;
+                }
                 server.on('error', e => dbg('audio rtsp server error', (e as Error)?.message));
-                this.server = server;
                 dbg('audio rtsp endpoint listening on', this.port);
                 resolve();
             });
@@ -104,13 +120,36 @@ export class AudioRtspServer {
         this.sessions.add(s);
     }
 
-    /** Close the listener and all sessions (tests; the plugin runs for the
-     *  process lifetime). */
-    stop() {
+    /** Close the listener and all sessions, awaiting the bound port's release.
+     * Idempotent and safe when called while start() is still pending. */
+    stop(): Promise<void> {
+        if (!this.stopping) {
+            const stopping = this.stopServer();
+            this.stopping = stopping;
+            stopping.finally(() => {
+                if (this.stopping === stopping) this.stopping = undefined;
+            }).catch(() => { });
+        }
+        return this.stopping;
+    }
+
+    private async stopServer() {
         for (const s of this.sessions) s.close();
         this.sessions.clear();
-        try { this.server?.close(); } catch { }
+        const server = this.server;
+        const starting = this.starting;
         this.server = undefined;
         this.starting = undefined;
+        if (!server) {
+            await starting?.catch(() => { });
+            return;
+        }
+        if (!server.listening) {
+            // The listen callback observes server !== this.server and closes
+            // the stale generation before resolving.
+            await starting?.catch(() => { });
+            return;
+        }
+        await new Promise<void>(resolve => server.close(() => resolve()));
     }
 }

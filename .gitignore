@@ -11,3 +11,12 @@ HANDOVER.md
 build-test/
 __pycache__/
 *.pyc
+
+# local browser/startup validation artifacts
+/.playwright-cli/
+/.playwright-scrypted.json
+
+# local scratch output and host soak runs
+/.tmp-*
+/soak-runs/
+/*.log

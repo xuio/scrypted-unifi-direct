@@ -27,6 +27,17 @@ const LOGIN_COOLDOWN_MS = 15000;
  *  repair timer, whose 30s cadence would otherwise defeat a fixed cooldown. */
 const LOGIN_COOLDOWN_MAX_MS = 600_000;
 
+/** Parse a camera API response without reflecting response contents into logs or
+ * error messages. Settings responses may contain credentials or other private
+ * configuration, so only the operation and byte count are safe context. */
+function parseJsonResponse<T>(operation: string, body: Buffer): T {
+    try {
+        return JSON.parse(body.toString('utf8')) as T;
+    } catch {
+        throw new Error(`${operation} returned invalid JSON (${body.length} bytes)`);
+    }
+}
+
 export class CameraApiClient {
     private cookie: string | undefined;
     private loginPromise: Promise<void> | undefined;
@@ -105,7 +116,7 @@ export class CameraApiClient {
         });
     }
 
-    async login(): Promise<void> {
+    async login(timeoutMs = 15000): Promise<void> {
         // collapse concurrent logins
         if (this.loginPromise)
             return this.loginPromise;
@@ -122,6 +133,7 @@ export class CameraApiClient {
                 path: '/api/1.1/login',
                 body,
                 headers: { 'Content-Type': 'application/json' },
+                timeoutMs,
             });
             if (res.statusCode !== 200)
                 throw new Error(`camera login failed: HTTP ${res.statusCode}`);
@@ -149,11 +161,11 @@ export class CameraApiClient {
     /** Perform a request, logging in first if needed and retrying once on 401. */
     private async authed(options: Parameters<CameraApiClient['raw']>[0]) {
         if (!this.cookie)
-            await this.login();
+            await this.login(options.timeoutMs);
         let res = await this.raw(options);
         if (res.statusCode === 401) {
             this.cookie = undefined;
-            await this.login();
+            await this.login(options.timeoutMs);
             res = await this.raw(options);
         }
         return res;
@@ -163,14 +175,14 @@ export class CameraApiClient {
         const res = await this.authed({ method: 'GET', path: '/api/1.1/status' });
         if (res.statusCode !== 200)
             throw new Error(`getStatus failed: HTTP ${res.statusCode}`);
-        return JSON.parse(res.body.toString());
+        return parseJsonResponse<CameraStatus>('getStatus', res.body);
     }
 
     async getSettings(): Promise<any> {
         const res = await this.authed({ method: 'GET', path: '/api/1.1/settings' });
         if (res.statusCode !== 200)
             throw new Error(`getSettings failed: HTTP ${res.statusCode}`);
-        return JSON.parse(res.body.toString());
+        return parseJsonResponse<any>('getSettings', res.body);
     }
 
     /** PUT a partial settings object; the camera merges it into its config. */
@@ -182,9 +194,10 @@ export class CameraApiClient {
             headers: { 'Content-Type': 'application/json' },
         });
         if (res.statusCode !== 200)
-            throw new Error(`putSettings failed: HTTP ${res.statusCode}: ${res.body.toString().slice(0, 200)}`);
-        const text = res.body.toString();
-        return text ? JSON.parse(text) : {};
+            throw new Error(`putSettings failed: HTTP ${res.statusCode}`);
+        if (!res.body.length)
+            return {};
+        return parseJsonResponse<any>('putSettings', res.body);
     }
 
     /** Normalized MAC (no separators, uppercase) — matches the camera-mac header. */
@@ -210,10 +223,11 @@ export class CameraApiClient {
     }
 
     /** Live JPEG frame. Works over the direct HTTPS session; no NVR involved. */
-    async getSnapshot(): Promise<Buffer> {
+    async getSnapshot(timeoutMs = 1500): Promise<Buffer> {
         const res = await this.authed({
             method: 'GET',
             path: `/snap.jpeg?cb=${Math.round(Date.now() / 1000)}`,
+            timeoutMs,
         });
         if (res.statusCode !== 200)
             throw new Error(`getSnapshot failed: HTTP ${res.statusCode}`);

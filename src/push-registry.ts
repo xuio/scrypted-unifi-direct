@@ -25,8 +25,12 @@ export interface PushRoute {
 export class PushPortRegistry {
     private servers = new Map<number, Promise<net.Server>>();
     private routes = new Map<number, Set<PushRoute>>();
+    private closed = false;
+    private closing: Promise<void> | undefined;
 
     async register(port: number, route: PushRoute): Promise<void> {
+        if (this.closed)
+            throw new Error('push port registry is closed');
         let set = this.routes.get(port);
         if (!set) { set = new Set(); this.routes.set(port, set); }
         set.add(route);
@@ -37,6 +41,10 @@ export class PushPortRegistry {
         }
         try {
             await listening;
+            if (this.closed) {
+                set.delete(route);
+                throw new Error('push port registry is closed');
+            }
         } catch (e) {
             // let a future register retry the listen; drop this registration.
             this.servers.delete(port);
@@ -50,14 +58,28 @@ export class PushPortRegistry {
         this.routes.get(port)?.delete(route);
     }
 
-    /** Close all listeners. The plugin never calls this (listeners live for the
-     *  process lifetime); it exists so tests can drain the event loop. */
-    async close() {
+    /** Permanently close all listeners. Idempotent and safe while a listen is
+     * still pending; used by provider-wide shutdown and tests. */
+    close(): Promise<void> {
+        if (!this.closing) {
+            this.closed = true;
+            this.closing = this.closeServers();
+        }
+        return this.closing;
+    }
+
+    private async closeServers() {
         const pending = [...this.servers.values()];
         this.servers.clear();
         this.routes.clear();
         for (const p of pending) {
-            try { (await p).close(); } catch { }
+            try {
+                const server = await p;
+                await new Promise<void>(resolve => {
+                    if (!server.listening) return resolve();
+                    server.close(() => resolve());
+                });
+            } catch { }
         }
     }
 

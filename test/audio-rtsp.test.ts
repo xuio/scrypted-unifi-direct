@@ -30,12 +30,19 @@ function fakeHandle() {
 }
 
 /** Server on an ephemeral port with automatic teardown. */
-async function makeServer(t: { after(fn: () => void): void }, resolve: (key: string) => Promise<RtspServeHandle | undefined>) {
+async function makeServer(t: { after(fn: () => Promise<void> | void): void }, resolve: (key: string) => Promise<RtspServeHandle | undefined>) {
     const server = new AudioRtspServer(0, resolve);
     t.after(() => server.stop());
     await server.start();
     return server;
 }
+
+test('stop is idempotent while listen is pending and leaves no bound listener', async () => {
+    const server = new AudioRtspServer(0, async () => undefined);
+    const starting = server.start();
+    await Promise.all([starting, server.stop(), server.stop()]);
+    assert.equal(server.boundPort, undefined);
+});
 
 function makeClient(port: number) {
     const sock = net.connect(port, '127.0.0.1');

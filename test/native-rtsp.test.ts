@@ -6,7 +6,8 @@ import { performance } from 'perf_hooks';
 import { PassThrough } from 'stream';
 import {
     FlvTagParser, parseAvcC, parseAsc, splitNals, toAnnexB,
-    RtpTrack, packetizeH264, packetizeAac, buildSdp, startNativeServe,
+    LazyRtpKeyframe, PacedQueue, RtpTrack, packetizeH264, packetizeAac, buildSdp, startNativeServe,
+    type EgressPressureSample,
 } from '../src/native-rtsp';
 import { rng, randBytes, flvTag, flvHeader } from './helpers';
 
@@ -29,6 +30,32 @@ test('FlvTagParser emits tags with correct type/timestamp/data across chunking',
         assert.equal(got[i].ts, t.ts);
         assert.ok(got[i].data.equals(t.data));
     });
+});
+
+test('PacedQueue preserves FIFO/flags through head compaction without packet wrappers', () => {
+    const q = new PacedQueue();
+    for (let i = 0; i < 5000; i++)
+        q.push(Buffer.from([i & 0xff]), i / 3, i === 0, i % 7 === 0, i % 49 === 0);
+    assert.equal(q.length, 5000);
+    assert.equal(q.frontIsKeyframeStart(), true);
+    assert.equal(q.frontIsMarker(), true);
+    assert.equal(q.frontIsKeyframeMarker(), true);
+    for (let i = 0; i < 3500; i++) {
+        assert.equal(q.frontDue(), i / 3);
+        assert.equal(q.frontPacket()[0], i & 0xff);
+        q.shift();
+    }
+    assert.equal(q.length, 1500);
+    for (let i = 5000; i < 6200; i++) q.push(Buffer.from([i & 0xff]), i / 3, false, true, false);
+    assert.equal(q.length, 2700);
+    const dues: number[] = [];
+    q.forEachRemaining(due => dues.push(due));
+    assert.equal(dues.length, 2700);
+    assert.equal(dues[0], 3500 / 3);
+    assert.equal(dues.at(-1), 6199 / 3);
+    assert.equal(q.findLastMarkerDue(), 6199 / 3);
+    q.clear();
+    assert.equal(q.length, 0);
 });
 
 // ---- codec parameter parsing ----
@@ -182,6 +209,56 @@ test('packetizeH264: FU-A fragments reassemble to the original NAL', () => {
     assert.ok(Buffer.concat([Buffer.from([nalHeader]), body]).equals(nal));
 });
 
+test('packetizeH264: FU-A headers, sizes, markers, and RTCP accounting are exact', () => {
+    const v = parseAvcC(makeAvcC(SPS, PPS))!;
+    // Body spans two full 1198-byte FU payloads plus a short final fragment.
+    const nal = Buffer.concat([Buffer.from([0x65]), randBytes(rng(44), 1198 * 2 + 17)]);
+    const track = new RtpTrack(96);
+    const out: Buffer[] = [];
+    packetizeH264(track, v, [nal], 0x12345678, false, out);
+    assert.equal(out.length, 3);
+
+    const parsed = out.map(parseRtp);
+    assert.deepEqual(parsed.map(p => p.payload.length), [1200, 1200, 19]);
+    assert.deepEqual(parsed.map(p => [...p.payload.subarray(0, 2)]), [
+        [0x7c, 0x85],   // FU-A, start, IDR type 5
+        [0x7c, 0x05],
+        [0x7c, 0x45],   // FU-A, end, IDR type 5
+    ]);
+    assert.deepEqual(parsed.map(p => p.marker), [false, false, true]);
+    assert.ok(parsed.slice(1).every((p, i) => p.seq === ((parsed[i].seq + 1) & 0xffff)));
+    assert.ok(parsed.every(p => p.ts === 0x12345678 && p.pt === 96));
+
+    track.stamp(0x12345678);
+    const sr = track.senderReport()!;
+    assert.equal(sr.readUInt32BE(20), 3);
+    assert.equal(sr.readUInt32BE(24), 1200 + 1200 + 19,
+        'RTCP octet count must include FU headers but exclude RTP headers');
+});
+
+test('LazyRtpKeyframe retains immutable RTP data and materializes Annex-B once', () => {
+    const v = parseAvcC(makeAvcC(SPS, PPS))!;
+    const nals = [
+        Buffer.concat([Buffer.from([0x65]), randBytes(rng(45), 5000)]),
+        Buffer.from([0x06, 1, 2, 3]),
+    ];
+    const expected = toAnnexB(v, nals);
+    const packets: Buffer[] = [];
+    packetizeH264(new RtpTrack(96), v, nals, 9000, true, packets);
+    const keyframe = new LazyRtpKeyframe(1234, packets);
+
+    assert.equal(keyframe.ts, 1234);
+    assert.equal((keyframe as any).cached, undefined, 'status access eagerly materialized the access unit');
+    // Simulate the FLV parser reusing/overwriting its ByteQueue backing storage.
+    for (const nal of nals) nal.fill(0);
+    for (const sps of v.sps) sps.fill(0);
+    for (const pps of v.pps) pps.fill(0);
+
+    const first = keyframe.annexb();
+    assert.ok(first.equals(expected));
+    assert.strictEqual(keyframe.annexb(), first, 'Annex-B allocation was not cached');
+});
+
 test('packetizeAac: a legacy small AU uses one packet with the correct header', () => {
     const frame = randBytes(rng(5), 333);
     const packets = packetizeAac(new RtpTrack(97), frame, 4800);
@@ -249,12 +326,13 @@ const aacTagData = (packetType: number, payload: Buffer) =>
 /** Connect a minimal interleaved-TCP client and record wall time for each AU's
  * marker packet, keyed by its RTP timestamp. No DESCRIBE is needed for these
  * synthetic streams: the track/control IDs are fixed by startNativeServe. */
-async function connectMarkerClient(serve: { url: string }) {
+async function connectMarkerClient(serve: { url: string }, capturePayloads = false) {
     const client = net.connect(parseInt(new URL(serve.url).port), '127.0.0.1');
     await once(client, 'connect');
     let buf = Buffer.alloc(0), responses = 0;
     const markers = new Map<number, number>();
     const packetTimes = new Map<number, number[]>();
+    const videoPayloads: Buffer[] = [];
     let readyResolve!: () => void;
     const ready = new Promise<void>(resolve => { readyResolve = resolve; });
     client.on('data', d => {
@@ -275,6 +353,7 @@ async function connectMarkerClient(serve: { url: string }) {
             const packet = buf.subarray(4, 4 + len);
             buf = buf.subarray(4 + len);
             if (channel === 0 && packet.length >= 12) {
+                if (capturePayloads) videoPayloads.push(Buffer.from(packet.subarray(12)));
                 const ts = packet.readUInt32BE(4);
                 const times = packetTimes.get(ts) ?? [];
                 times.push(performance.now());
@@ -286,8 +365,30 @@ async function connectMarkerClient(serve: { url: string }) {
     client.write('SETUP rtsp://x/trackID=0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n');
     client.write('PLAY rtsp://x/ RTSP/1.0\r\nCSeq: 2\r\n\r\n');
     await ready;
-    return { client, markers, packetTimes };
+    return { client, markers, packetTimes, videoPayloads };
 }
+
+test('snapshot/GOP cache requires an actual IDR rather than FLV keyframe metadata', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({ flv, hasAudio: false });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        // Metadata says keyframe, but NAL type 1 is not independently decodable.
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x61, 1])))),
+    ]));
+    const serve = await servePromise;
+    try {
+        assert.equal(serve.latestKeyframe(), undefined);
+        // Trust the bitstream in the opposite direction too: type 5 is an IDR
+        // even if the FLV frameType metadata is wrong.
+        flv.write(flvTag(9, 33, avcTagData(2, 1, lenPrefixed(Buffer.from([0x65, 2])))));
+        await new Promise(resolve => setImmediate(resolve));
+        assert.ok(serve.latestKeyframe());
+    } finally {
+        serve.destroy();
+    }
+});
 
 test('late AAC config leaves an established video-only serve alive', async () => {
     const flv = new PassThrough();
@@ -743,6 +844,93 @@ test('same-time AAC ahead of a large IDR does not collapse the IDR packet spread
         assert.ok(span >= 10, `same-time AAC collapsed the IDR into a ${span.toFixed(1)}ms microburst`);
     } finally {
         client.destroy();
+        serve.destroy();
+    }
+});
+
+test('recoverable egress overload soft-pauses and resumes with ordered lossless output', async () => {
+    const flv = new PassThrough();
+    const pressure: ({ paused: boolean } & EgressPressureSample)[] = [];
+    const servePromise = startNativeServe({
+        flv,
+        hasAudio: false,
+        onEgressPressure: (paused, sample) => pressure.push({ paused, ...sample }),
+    });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+    const serve = await servePromise;
+    const connected = await connectMarkerClient(serve, true);
+    try {
+        const count = 4100;   // just above the 4000-packet soft threshold, below hard 8000
+        const tags: Buffer[] = [];
+        for (let i = 0; i < count; i++) {
+            const nal = Buffer.from([0x41, 0xee, i >>> 8, i & 0xff]);
+            // One synchronous camera burst with a common deadline makes queue
+            // pressure deterministic without relying on a deliberately slow CI host.
+            tags.push(flvTag(9, 0, avcTagData(2, 1, lenPrefixed(nal))));
+        }
+        flv.write(Buffer.concat(tags));
+        assert.equal(pressure[0]?.paused, true, 'soft threshold did not pause ingress');
+        assert.ok(pressure[0].queued >= 4000 && pressure[0].queued < 8000);
+
+        const deadline = Date.now() + 2500;
+        let ids: number[] = [];
+        do {
+            ids = connected.videoPayloads
+                .filter(p => p.length === 4 && p[0] === 0x41 && p[1] === 0xee)
+                .map(p => (p[2] << 8) | p[3]);
+            if (ids.length >= count && pressure.some(p => !p.paused)) break;
+            await new Promise(r => setTimeout(r, 10));
+        } while (Date.now() < deadline);
+
+        assert.equal(ids.length, count, 'recoverable overload lost or duplicated RTP packets');
+        assert.deepEqual(ids, Array.from({ length: count }, (_, i) => i),
+            'recoverable overload reordered RTP packets');
+        const resumed = pressure.find(p => !p.paused);
+        assert.ok(resumed, 'pacer never resumed ingress below the low watermark');
+        assert.ok(resumed.queued <= 2000);
+        assert.ok(resumed.maxQueued >= count);
+        assert.equal(resumed.pauseCount, 1);
+        assert.equal(resumed.resumeCount, 1);
+        assert.equal(serve.alive, true, 'recoverable pressure restarted the generation');
+    } finally {
+        connected.client.destroy();
+        serve.destroy();
+    }
+});
+
+test('unrecoverable egress overload retains the hard clean-restart guard', async () => {
+    const flv = new PassThrough();
+    const pressure: ({ paused: boolean } & EgressPressureSample)[] = [];
+    const servePromise = startNativeServe({
+        flv,
+        hasAudio: false,
+        onEgressPressure: (paused, sample) => pressure.push({ paused, ...sample }),
+    });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+    const serve = await servePromise;
+    try {
+        const tags: Buffer[] = [];
+        for (let i = 0; i < 8001; i++)
+            tags.push(flvTag(9, 0, avcTagData(2, 1,
+                lenPrefixed(Buffer.from([0x41, i >>> 8, i & 0xff])))));
+        flv.write(Buffer.concat(tags));
+        const deadline = Date.now() + 1000;
+        while (serve.alive && Date.now() < deadline)
+            await new Promise(r => setTimeout(r, 5));
+        assert.equal(serve.alive, false, 'hard overflow did not rebuild the generation');
+        assert.equal(flv.destroyed, true, 'hard overflow retained the FLV pipeline');
+        assert.equal(pressure[0]?.paused, true);
+        assert.equal(pressure.at(-1)?.paused, false, 'hard restart left camera ingress paused');
+        assert.ok(pressure.at(-1)!.maxQueued > 8000);
+    } finally {
         serve.destroy();
     }
 });

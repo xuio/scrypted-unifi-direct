@@ -3,6 +3,7 @@ import { randomBytes } from 'crypto';
 import { performance } from 'perf_hooks';
 import type { Readable } from 'stream';
 import { RtspSession, RtspServeHandle, SdpInfo } from './rtsp-session';
+import type { LatestKeyframe } from './rtsp-session';
 import { ByteQueue } from './byte-queue';
 import { dbg } from './debug';
 
@@ -198,22 +199,41 @@ export class RtpTrack {
     private sent = false;
     constructor(private pt: number) { }
 
-    /** Build one RTP packet: 12-byte header + optional prefix + payload slice.
-     *  Single exact-size allocation; no intermediate concats. */
-    build(ts: number, marker: boolean, prefix: Buffer | undefined, payload: Buffer, start = 0, end = payload.length): Buffer {
-        const plen = end - start;
-        const buf = Buffer.allocUnsafe(12 + (prefix ? prefix.length : 0) + plen);
+    private allocate(ts: number, marker: boolean, payloadLength: number): Buffer {
+        const buf = Buffer.allocUnsafe(12 + payloadLength);
         buf[0] = 0x80;                                   // V=2
         buf[1] = (marker ? 0x80 : 0) | this.pt;
         buf.writeUInt16BE(this.seq, 2);
         this.seq = (this.seq + 1) & 0xffff;
         buf.writeUInt32BE(ts % 0x100000000, 4);
         buf.writeUInt32BE(this.ssrc, 8);
+        this.packets++;
+        this.octets = (this.octets + payloadLength) >>> 0;   // payload octets (RFC 3550)
+        return buf;
+    }
+
+    /** Build one RTP packet: 12-byte header + optional prefix + payload slice.
+     *  Single exact-size allocation; no intermediate concats. */
+    build(ts: number, marker: boolean, prefix: Buffer | undefined, payload: Buffer, start = 0, end = payload.length): Buffer {
+        const plen = end - start;
+        const prefixLength = prefix?.length ?? 0;
+        const buf = this.allocate(ts, marker, prefixLength + plen);
         let o = 12;
         if (prefix) { prefix.copy(buf, o); o += prefix.length; }
         payload.copy(buf, o, start, end);
-        this.packets++;
-        this.octets = (this.octets + (o - 12) + plen) >>> 0;   // payload octets (RFC 3550)
+        return buf;
+    }
+
+    /** FU-A specialization: write the two RFC 6184 fragmentation bytes straight
+     *  into the final RTP allocation instead of allocating a tiny prefix Buffer
+     *  for every fragment of a large IDR. */
+    buildFuA(ts: number, marker: boolean, indicator: number, header: number,
+        payload: Buffer, start: number, end: number): Buffer {
+        const plen = end - start;
+        const buf = this.allocate(ts, marker, 2 + plen);
+        buf[12] = indicator;
+        buf[13] = header;
+        payload.copy(buf, 14, start, end);
         return buf;
     }
 
@@ -274,11 +294,8 @@ export function packetizeH264(track: RtpTrack, params: VideoParams, nals: Buffer
         let off = 1;
         while (off < nal.length) {
             const end = Math.min(off + (MAX_PAYLOAD - 2), nal.length);
-            const fu = Buffer.from([
-                indicator,
-                (off === 1 ? 0x80 : 0) | (end === nal.length ? 0x40 : 0) | type,
-            ]);
-            out.push(track.build(ts, last && end === nal.length, fu, nal, off, end));
+            const header = (off === 1 ? 0x80 : 0) | (end === nal.length ? 0x40 : 0) | type;
+            out.push(track.buildFuA(ts, last && end === nal.length, indicator, header, nal, off, end));
             off = end;
         }
     }
@@ -303,6 +320,49 @@ export function packetizeAac(track: RtpTrack, frame: Buffer, ts: number): Buffer
         out.push(track.build(ts, end === frame.length, au, frame, off, end));
     }
     return out;
+}
+
+/** Reconstruct the H.264 access unit retained by the muxer. The input packets
+ *  are the exact immutable RTP buffers produced for one IDR (including the
+ *  in-band SPS/PPS); no parser/ByteQueue views survive into this path. */
+export function rtpKeyframeToAnnexB(packets: readonly Buffer[]): Buffer {
+    const parts: Buffer[] = [];
+    let fuOpen = false;
+    for (const packet of packets) {
+        if (packet.length <= 12) continue;
+        const payload = packet.subarray(12);
+        const nalType = payload[0] & 0x1f;
+        if (nalType > 0 && nalType < 24) {
+            fuOpen = false;
+            parts.push(ANNEXB_SC, payload);
+            continue;
+        }
+        if (nalType !== 28 || payload.length < 3) continue;
+        const fuHeader = payload[1];
+        if (fuHeader & 0x80) {
+            // Restore the original NAL header from FU indicator F/NRI bits and
+            // the FU header's type. This one-byte allocation happens only when a
+            // snapshot actually requests the cached keyframe.
+            parts.push(ANNEXB_SC, Buffer.from([(payload[0] & 0xe0) | (fuHeader & 0x1f)]));
+            fuOpen = true;
+        } else if (!fuOpen) {
+            continue;   // malformed/incomplete retained burst
+        }
+        parts.push(payload.subarray(2));
+        if (fuHeader & 0x40) fuOpen = false;
+    }
+    return Buffer.concat(parts);
+}
+
+/** Latest-keyframe holder whose only steady-state work is retaining the RTP
+ *  packet array already created for live egress. Annex-B is built and cached on
+ *  the first snapshot request, never on ordinary ingest or status reads. */
+export class LazyRtpKeyframe implements LatestKeyframe {
+    private cached: Buffer | undefined;
+    constructor(readonly ts: number, private readonly packets: readonly Buffer[]) { }
+    annexb(): Buffer {
+        return this.cached ??= rtpKeyframeToAnnexB(this.packets);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +413,99 @@ export function buildAudioSdp(a: AudioParams): SdpInfo {
     return { sdp: lines.join('\r\n') + '\r\n', audioTrack: 'trackID=0' };
 }
 
+/** A pressure transition emitted by the native egress pacer. This is deliberately
+ * callback-only rather than part of RtspServeHandle's public surface: DirectStream
+ * needs it while the generation is alive, and tests need deterministic counters,
+ * but clients of the RTSP URL should not depend on relay internals. */
+export interface EgressPressureSample {
+    queued: number;
+    maxQueued: number;
+    pauseCount: number;
+    resumeCount: number;
+}
+
+const PACED_KF = 1;
+const PACED_MARKER = 2;
+const PACED_KF_MARKER = 4;
+
+/**
+ * Allocation-light FIFO for paced RTP packets.
+ *
+ * The old representation allocated one `{ control, packet, due, ... }` wrapper
+ * for every RTP fragment (roughly 420 wrappers for a representative 500 KB IDR).
+ * Track/control is already implicit in the separate audio/video queues, so keep
+ * the remaining scalar fields in parallel arrays and clear packet references as
+ * soon as they are shifted. This preserves the existing head-index + rare-slice
+ * compaction invariant without pooling mutable objects that could accidentally be
+ * retained by GOP replay or an asynchronous socket write.
+ *
+ * Exported for invariant tests only; not part of the plugin API.
+ */
+export class PacedQueue {
+    private packets: (Buffer | undefined)[] = [];
+    private dues: number[] = [];
+    private flags: number[] = [];
+    private head = 0;
+
+    get length() { return this.packets.length - this.head; }
+
+    push(packet: Buffer, due: number, keyframeStart: boolean, marker: boolean, keyframeMarker: boolean) {
+        this.packets.push(packet);
+        this.dues.push(due);
+        this.flags.push((keyframeStart ? PACED_KF : 0)
+            | (marker ? PACED_MARKER : 0)
+            | (keyframeMarker ? PACED_KF_MARKER : 0));
+    }
+
+    frontPacket(): Buffer {
+        const packet = this.packets[this.head];
+        if (!packet) throw new Error('paced queue is empty');
+        return packet;
+    }
+
+    frontDue(): number {
+        if (!this.length) throw new Error('paced queue is empty');
+        return this.dues[this.head];
+    }
+
+    frontIsKeyframeStart() { return !!(this.flags[this.head] & PACED_KF); }
+    frontIsMarker() { return !!(this.flags[this.head] & PACED_MARKER); }
+    frontIsKeyframeMarker() { return !!(this.flags[this.head] & PACED_KF_MARKER); }
+
+    shift() {
+        if (!this.length) throw new Error('paced queue is empty');
+        // Release the potentially-large RTP buffer before the rare compaction.
+        this.packets[this.head] = undefined;
+        this.head++;
+        if (this.head >= 2048 && this.head * 2 >= this.packets.length) {
+            this.packets = this.packets.slice(this.head);
+            this.dues = this.dues.slice(this.head);
+            this.flags = this.flags.slice(this.head);
+            this.head = 0;
+        }
+    }
+
+    clear() {
+        this.packets = [];
+        this.dues = [];
+        this.flags = [];
+        this.head = 0;
+    }
+
+    /** Iterate without materializing a snapshot array. Used only for the one-time
+     * bootstrap handoff; the steady-state enqueue/drain path remains callback-free. */
+    forEachRemaining(fn: (due: number, keyframeMarker: boolean, marker: boolean) => void) {
+        for (let i = this.head; i < this.packets.length; i++)
+            fn(this.dues[i], !!(this.flags[i] & PACED_KF_MARKER), !!(this.flags[i] & PACED_MARKER));
+    }
+
+    findLastMarkerDue(): number | undefined {
+        for (let i = this.flags.length - 1; i >= this.head; i--)
+            if (this.flags[i] & PACED_MARKER) return this.dues[i];
+        return undefined;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Serve
 // ---------------------------------------------------------------------------
@@ -375,6 +528,9 @@ export async function startNativeServe(opts: {
     sdpTimeoutMs?: number;
     /** How long past the video config to wait for the AAC config. */
     audioGraceMs?: number;
+    /** Pause/resume the owning camera ingress when the pacer approaches its hard
+     * queue bound. The callback must be cheap and must never throw into media. */
+    onEgressPressure?: (paused: boolean, sample: EgressPressureSample) => void;
 }): Promise<RtspServeHandle> {
     const { flv, hasAudio } = opts;
 
@@ -391,7 +547,7 @@ export async function startNativeServe(opts: {
     let audioBroken = false;      // audio is best-effort; once broken, video-only
     let audioServed = false;      // audio made it into the SDP
     let audioTs: number | undefined;   // synthesized AAC RTP clock (exact frameSamples/frame)
-    let latestKeyframe: { ts: number; annexb: Buffer } | undefined;   // for snapshots
+    let latestKeyframe: LatestKeyframe | undefined;   // lazy Annex-B for snapshots
     let onVideoParams: (() => void) | undefined;
     let onAudioParams: (() => void) | undefined;
 
@@ -409,9 +565,10 @@ export async function startNativeServe(opts: {
     let gop: { control: string; packet: Buffer }[] = [];
     let gopBytes = 0;
     let gopOverflow = false;
-    const gopAppend = (control: string, pkts: Buffer[]) => {
+    const gopAppend = (control: string, packet: Buffer) => {
         if (gopOverflow) return;
-        for (const packet of pkts) { gop.push({ control, packet }); gopBytes += packet.length; }
+        gop.push({ control, packet });
+        gopBytes += packet.length;
         if (gopBytes > MAX_GOP_BYTES) {
             dbg('native-rtsp gop buffer overflow; replay disabled until next keyframe');
             gop = []; gopBytes = 0; gopOverflow = true;
@@ -448,58 +605,67 @@ export async function startNativeServe(opts: {
     const MAX_LATE_MS = 2000;
     const MAX_FUTURE_MS = 2000;
     const MAX_QUEUE = 8000;
-    type Paced = {
-        control: string;
-        packet: Buffer;
-        due: number;
-        kf: boolean;             // first packet of a keyframe: reset GOP history
-        marker: boolean;         // last packet of a complete access unit
-        keyframeMarker: boolean; // last packet of a complete keyframe
-    };
+    // One representative 500 KB IDR is ~420 RTP packets. Pause at roughly ten
+    // such bursts (and resume at half that) so ordinary GOP variance never
+    // throttles the camera, while recoverable host pressure is arrested at half
+    // the existing corruption-safe hard restart bound.
+    const SOFT_QUEUE_HIGH = 4000;
+    const SOFT_QUEUE_LOW = 2000;
     // Keep one due-ordered FIFO per RTP clock. FLV tags from the two tracks can
     // arrive in either order at the same timestamp; a single append-only queue
     // lets an AAC packet at T block video packets intentionally spread over
     // T-frameInterval..T, collapsing the IDR back into a microburst.
-    let videoEgress: Paced[] = [];
-    let audioEgress: Paced[] = [];
-    let videoHead = 0;
-    let audioHead = 0;
+    const videoEgress = new PacedQueue();
+    const audioEgress = new PacedQueue();
     let epoch = 0;                  // monotonic ms of media-time 0; sendMono = epoch + due
     let drainTimer: any;
     let pendingJoinSr = false;      // a client PLAYed before any packet was sent (cold start); send its SR once draining starts
     let restartRequested = false;
     let previousVideoMediaMs: number | undefined;
     let videoFrameIntervalMs = 1000 / 30;
+    let pressurePaused = false;
+    let pressureMaxQueued = 0;
+    let pressurePauseCount = 0;
+    let pressureResumeCount = 0;
 
-    const queued = () => (videoEgress.length - videoHead) + (audioEgress.length - audioHead);
-    const queueFront = () => {
-        const v = videoEgress[videoHead];
-        const a = audioEgress[audioHead];
+    const queued = () => videoEgress.length + audioEgress.length;
+    const queueFront = (): PacedQueue => {
+        const v = videoEgress.length ? videoEgress : undefined;
+        const a = audioEgress.length ? audioEgress : undefined;
+        if (!v && !a) throw new Error('egress queue is empty');
         // Video wins a tie so a keyframe resets GOP history before same-time AAC.
-        return !a || (v && v.due <= a.due) ? v : a;
-    };
-    const queueShift = () => {
-        const front = queueFront();
-        if (front.control === 'trackID=0') {
-            videoHead++;
-            if (videoHead >= 2048 && videoHead * 2 >= videoEgress.length) {
-                videoEgress = videoEgress.slice(videoHead);
-                videoHead = 0;
-            }
-        } else {
-            audioHead++;
-            if (audioHead >= 2048 && audioHead * 2 >= audioEgress.length) {
-                audioEgress = audioEgress.slice(audioHead);
-                audioHead = 0;
-            }
-        }
-        return front;
+        return !a || (v && v.frontDue() <= a.frontDue()) ? v! : a;
     };
     const clearEgress = () => {
-        videoEgress = [];
-        audioEgress = [];
-        videoHead = 0;
-        audioHead = 0;
+        videoEgress.clear();
+        audioEgress.clear();
+    };
+    const emitPressure = (paused: boolean) => {
+        try {
+            opts.onEgressPressure?.(paused, {
+                queued: queued(),
+                maxQueued: pressureMaxQueued,
+                pauseCount: pressurePauseCount,
+                resumeCount: pressureResumeCount,
+            });
+        } catch (e) {
+            dbg('native-rtsp egress pressure callback failed:', (e as Error)?.message);
+        }
+    };
+    const updatePressure = () => {
+        const n = queued();
+        if (n > pressureMaxQueued) pressureMaxQueued = n;
+        if (!pressurePaused && n >= SOFT_QUEUE_HIGH) {
+            pressurePaused = true;
+            pressurePauseCount++;
+            dbg('native-rtsp soft-pausing camera ingress:', n, 'queued packets');
+            emitPressure(true);
+        } else if (pressurePaused && n <= SOFT_QUEUE_LOW) {
+            pressurePaused = false;
+            pressureResumeCount++;
+            dbg('native-rtsp resuming camera ingress:', n, 'queued packets; peak', pressureMaxQueued);
+            emitPressure(false);
+        }
     };
     const requestRestart = (reason: string) => {
         if (dead || restartRequested) return;
@@ -508,6 +674,7 @@ export async function startNativeServe(opts: {
         clearTimeout(drainTimer);
         drainTimer = undefined;
         clearEgress();
+        updatePressure();
         // This can be requested while attaching the FLV data listener, before the
         // cleanup closure below is assigned. Defer one microtask so startup has
         // completed its synchronous declarations.
@@ -515,7 +682,8 @@ export async function startNativeServe(opts: {
     };
 
     const enqueue = (control: string, pkts: Buffer[], mediaMs: number, keyframe: boolean) => {
-        const previousFrontDue = queued() ? queueFront().due : undefined;
+        if (restartRequested) return;
+        const previousFrontDue = queued() ? queueFront().frontDue() : undefined;
         const n = pkts.length;
         // Spread a large AU *before* its media deadline and finish its marker at
         // mediaMs. Crucially, cap the window below the observed frame interval:
@@ -528,14 +696,14 @@ export async function startNativeServe(opts: {
         const firstDue = mediaMs - spread;
         const target = control === 'trackID=0' ? videoEgress : audioEgress;
         for (let i = 0; i < n; i++)
-            target.push({
-                control,
-                packet: pkts[i],
-                due: firstDue + (spread && n > 1 ? spread * i / (n - 1) : 0),
-                kf: keyframe && i === 0,
-                marker: i === n - 1,
-                keyframeMarker: keyframe && i === n - 1,
-            });
+            target.push(
+                pkts[i],
+                firstDue + (spread && n > 1 ? spread * i / (n - 1) : 0),
+                keyframe && i === 0,
+                i === n - 1,
+                keyframe && i === n - 1,
+            );
+        updatePressure();
         if (queued() > MAX_QUEUE) {
             // Continuing after arbitrary packet drops would leave every decoder
             // corrupt until the next IDR. A clean generation rebuild is bounded,
@@ -547,7 +715,7 @@ export async function startNativeServe(opts: {
         // (most notably AAC@T followed by an IDR spread over T-28..T). Re-arm to
         // the new cross-track minimum or the earlier packets still wake at T and
         // collapse into the very burst this pacer is meant to prevent.
-        if (drainTimer && previousFrontDue !== undefined && queueFront().due < previousFrontDue) {
+        if (drainTimer && previousFrontDue !== undefined && queueFront().frontDue() < previousFrontDue) {
             clearTimeout(drainTimer);
             drainTimer = undefined;
         }
@@ -559,13 +727,13 @@ export async function startNativeServe(opts: {
         if (!queued() || restartRequested) return;
         const now = performance.now();
         const front = queueFront();
-        if (!epoch) epoch = now - front.due + EGRESS_DELAY_MS;
-        const drift = (epoch + front.due) - now;
+        if (!epoch) epoch = now - front.frontDue() + EGRESS_DELAY_MS;
+        const drift = (epoch + front.frontDue()) - now;
         if (drift > MAX_FUTURE_MS) {
             // Encoder timestamp reset/jump. Waiting seconds while valid packets
             // arrive is a frozen live view; re-anchor this generation promptly.
             dbg('native-rtsp forward timestamp discontinuity:', Math.round(drift), 'ms');
-            epoch = now - front.due + EGRESS_DELAY_MS;
+            epoch = now - front.frontDue() + EGRESS_DELAY_MS;
         } else if (drift < -MAX_LATE_MS) {
             // A multi-second event-loop/host stall cannot be caught up at realtime
             // without making that delay permanent. Rebuild from a fresh keyframe.
@@ -575,14 +743,22 @@ export async function startNativeServe(opts: {
         const batch: { control: string; packet: Buffer }[] = [];
         const audioOut: Buffer[] = [];
         let lastVideoTs: number | undefined, lastAudioTs: number | undefined;
-        while (queued() && epoch + queueFront().due <= now) {
-            const it = queueShift();
-            if (it.kf) { gop = []; gopBytes = 0; gopOverflow = false; }   // GOP history resets at the keyframe boundary, at send time
-            if (it.control !== 'trackID=1' || gop.length) gopAppend(it.control, [it.packet]);
-            if (it.control === 'trackID=1') { lastAudioTs = it.packet.readUInt32BE(4); audioOut.push(it.packet); }
-            else lastVideoTs = it.packet.readUInt32BE(4);
-            batch.push({ control: it.control, packet: it.packet });
+        while (queued() && epoch + queueFront().frontDue() <= now) {
+            const queue = queueFront();
+            const control = queue === videoEgress ? 'trackID=0' : 'trackID=1';
+            const packet = queue.frontPacket();
+            const keyframeStart = queue.frontIsKeyframeStart();
+            queue.shift();
+            if (keyframeStart) { gop = []; gopBytes = 0; gopOverflow = false; }   // GOP history resets at the keyframe boundary, at send time
+            if (control !== 'trackID=1' || gop.length) gopAppend(control, packet);
+            if (control === 'trackID=1') { lastAudioTs = packet.readUInt32BE(4); audioOut.push(packet); }
+            else lastVideoTs = packet.readUInt32BE(4);
+            // This wrapper is the synchronous RtspSession fanout contract. The
+            // per-packet PACER wrapper has been removed; no mutable send object is
+            // retained across drains or asynchronous writes.
+            batch.push({ control, packet });
         }
+        updatePressure();
         // audio tap: deliver at egress time, isolated from the media path.
         if (audioOut.length && audioSubs.size)
             for (const sub of audioSubs)
@@ -613,12 +789,12 @@ export async function startNativeServe(opts: {
         if (drainTimer || !queued() || restartRequested) return;
         const now = performance.now();
         const front = queueFront();
-        if (!epoch) epoch = now - front.due + EGRESS_DELAY_MS;
-        if ((epoch + front.due) - now > MAX_FUTURE_MS) {
+        if (!epoch) epoch = now - front.frontDue() + EGRESS_DELAY_MS;
+        if ((epoch + front.frontDue()) - now > MAX_FUTURE_MS) {
             dbg('native-rtsp forward timestamp discontinuity before drain');
-            epoch = now - front.due + EGRESS_DELAY_MS;
+            epoch = now - front.frontDue() + EGRESS_DELAY_MS;
         }
-        drainTimer = setTimeout(drain, Math.max(0, Math.min((epoch + front.due) - now, 1000)));
+        drainTimer = setTimeout(drain, Math.max(0, Math.min((epoch + front.frontDue()) - now, 1000)));
     };
 
     const handleVideoTag = (tsMs: number, d: Buffer) => {
@@ -650,9 +826,14 @@ export async function startNativeServe(opts: {
         if (cts & 0x800000) cts -= 0x1000000;
         const nals = splitNals(d, 5, videoParams.nalLen);
         if (!nals.length) return;
-        // Cache the freshest keyframe (decodable Annex-B AU) for instant snapshots,
-        // regardless of whether anyone is streaming.
-        if (frameType === 1) latestKeyframe = { ts: Date.now(), annexb: toAnnexB(videoParams, nals) };
+        // FLV frameType is only metadata. Confirm an independently decodable
+        // H.264 IDR (NAL type 5) before replacing snapshot/GOP bootstrap state;
+        // otherwise a mislabeled intra frame can make the next client black.
+        const isKeyframe = nals.some(nal => (nal[0] & 0x1f) === 5);
+        // Sample freshness at IDR arrival, before packetization. The access unit
+        // itself is retained below as immutable muxer-owned RTP buffers and only
+        // converted to Annex-B if a snapshot consumer asks for it.
+        const keyframeArrival = isKeyframe ? Date.now() : undefined;
         const mediaMs = Math.max(0, tsMs + cts);
         if (previousVideoMediaMs !== undefined) {
             const delta = mediaMs - previousVideoMediaMs;
@@ -662,11 +843,13 @@ export async function startNativeServe(opts: {
         previousVideoMediaMs = mediaMs;
         const ts = mediaMs * (VIDEO_CLOCK / 1000);
         const pkts: Buffer[] = [];
-        packetizeH264(videoTrack, videoParams, nals, ts, frameType === 1, pkts);
+        packetizeH264(videoTrack, videoParams, nals, ts, isKeyframe, pkts);
+        if (keyframeArrival !== undefined)
+            latestKeyframe = new LazyRtpKeyframe(keyframeArrival, pkts);
         // Hand off to the egress pacer, which schedules the send by media time
         // and maintains the GOP replay buffer at send time (reset at the keyframe
         // boundary). Runs even with no clients — the buffer the first joiner needs.
-        enqueue('trackID=0', pkts, mediaMs, frameType === 1);
+        enqueue('trackID=0', pkts, mediaMs, isKeyframe);
     };
 
     const handleAudioTag = (tsMs: number, d: Buffer) => {
@@ -723,6 +906,7 @@ export async function startNativeServe(opts: {
 
     const parser = new FlvTagParser((type, tsMs, data) => {
         try {
+            if (restartRequested) return;
             if (type === 9) handleVideoTag(tsMs, data);
             else if (type === 8 && hasAudio && !audioBroken) handleAudioTag(tsMs, data);
             // type 18 (script data) ignored.
@@ -761,6 +945,7 @@ export async function startNativeServe(opts: {
         clearInterval(stallTimer);
         clearTimeout(drainTimer);
         clearEgress();
+        updatePressure();
         flv.removeListener('data', feed);
         try { server?.close(); } catch { }
         for (const s of sessions) s.close();
@@ -816,20 +1001,23 @@ export async function startNativeServe(opts: {
     // normal frame cadence without weakening the smoothing reserve.
     clearTimeout(drainTimer);
     drainTimer = undefined;
-    const queuedVideo = videoEgress.slice(videoHead);
-    const newestVideoMarkerDue = [...queuedVideo].reverse().find(it => it.marker)?.due;
+    const newestVideoMarkerDue = videoEgress.findLastMarkerDue();
     // Choose only a complete access-unit boundary. A representative large IDR is
     // spread from roughly T-28..T; using the first packet as the backlog boundary
     // can split that IDR and replay an undecodable prefix to a new client.
     let handoffDue: number | undefined;
     if (newestVideoMarkerDue !== undefined) {
         const target = newestVideoMarkerDue - EGRESS_DELAY_MS;
-        const completeKeyframe = queuedVideo.find(it => it.keyframeMarker && it.due <= target);
-        if (completeKeyframe) {
-            for (const it of queuedVideo) {
-                if (it.marker && it.due >= completeKeyframe.due && it.due <= target)
-                    handoffDue = it.due;
-            }
+        let completeKeyframeDue: number | undefined;
+        videoEgress.forEachRemaining((due, keyframeMarker) => {
+            if (completeKeyframeDue === undefined && keyframeMarker && due <= target)
+                completeKeyframeDue = due;
+        });
+        if (completeKeyframeDue !== undefined) {
+            videoEgress.forEachRemaining((due, _keyframeMarker, marker) => {
+                if (marker && due >= completeKeyframeDue! && due <= target)
+                    handoffDue = due;
+            });
         }
     }
     // If less than one reserve is available, retain and pace the entire partial
@@ -837,18 +1025,23 @@ export async function startNativeServe(opts: {
     // the exact join freeze this handoff is meant to remove. DirectStream's 800 ms
     // settle normally supplies a full reserve; this fallback favors fast first
     // video over adding up to another 450 ms to an already-cold camera start.
-    while (queued() && handoffDue !== undefined && queueFront().due <= handoffDue) {
-        const it = queueShift();
-        if (it.kf) { gop = []; gopBytes = 0; gopOverflow = false; }
-        if (it.control !== 'trackID=1' || gop.length) gopAppend(it.control, [it.packet]);
+    while (queued() && handoffDue !== undefined && queueFront().frontDue() <= handoffDue) {
+        const queue = queueFront();
+        const control = queue === videoEgress ? 'trackID=0' : 'trackID=1';
+        const packet = queue.frontPacket();
+        const keyframeStart = queue.frontIsKeyframeStart();
+        queue.shift();
+        if (keyframeStart) { gop = []; gopBytes = 0; gopOverflow = false; }
+        if (control !== 'trackID=1' || gop.length) gopAppend(control, packet);
     }
+    updatePressure();
     if (queued()) {
         // The first retained packet is due now. Subsequent packets keep their
         // media spacing and replenish GOP history before/while the listener comes
         // up. With a partial backlog this starts with a proportionally smaller
         // reserve, which is preferable to either delaying the first IDR or
         // inserting a deterministic pause before the next live frame.
-        epoch = performance.now() - queueFront().due;
+        epoch = performance.now() - queueFront().frontDue();
         scheduleDrain();
     }
 

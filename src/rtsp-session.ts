@@ -11,6 +11,16 @@ export interface SdpInfo {
     audioTrack?: string;
 }
 
+/** A keyframe retained as immutable muxer-owned RTP packets. Annex-B assembly is
+ *  intentionally lazy: status reads need only `ts`, while snapshot consumers pay
+ *  the full access-unit allocation once, on first decode. */
+export interface LatestKeyframe {
+    /** Wall-clock arrival time of the IDR FLV tag. */
+    readonly ts: number;
+    /** Materialize and cache a self-contained SPS/PPS/IDR Annex-B access unit. */
+    annexb(): Buffer;
+}
+
 /**
  * Handle returned by a serve implementation. Scrypted connects OUT to `url` like
  * any native RTSP camera.
@@ -26,11 +36,11 @@ export interface RtspServeHandle {
      */
     readonly alive: boolean;
     /**
-     * The most recent decoded-ready keyframe as an Annex-B H.264 access unit
-     * (SPS + PPS + IDR), for instant snapshots without opening a video stream.
-     * undefined until the first keyframe has been muxed.
+     * The most recent decoded-ready keyframe, retained in muxer-owned form for
+     * instant snapshots without opening another stream. Its Annex-B access unit
+     * (SPS + PPS + IDR) is materialized lazily. Undefined until the first IDR.
      */
-    latestKeyframe(): { ts: number; annexb: Buffer } | undefined;
+    latestKeyframe(): LatestKeyframe | undefined;
     /** AAC parameters of the served audio track (undefined when video-only). */
     audioParams(): { rate: number; channels: number; config: Buffer } | undefined;
     /**

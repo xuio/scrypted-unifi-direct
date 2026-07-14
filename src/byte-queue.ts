@@ -11,9 +11,15 @@
  * Used by both the extendedFlv detrailer and the standard-FLV tag parser.
  */
 export class ByteQueue {
-    private store = Buffer.allocUnsafe(1 << 20);
+    private store: Buffer;
     private head = 0;
     private tail = 0;
+
+    constructor(private readonly initialCapacity = 1 << 20) {
+        if (!Number.isSafeInteger(initialCapacity) || initialCapacity < 64)
+            throw new Error('ByteQueue initialCapacity must be an integer >= 64');
+        this.store = Buffer.allocUnsafe(initialCapacity);
+    }
 
     get length() { return this.tail - this.head; }
 
@@ -45,7 +51,8 @@ export class ByteQueue {
             this.head = this.tail = 0;
             // shed an oversized store once drained, so one giant record can't pin
             // memory for the stream's lifetime.
-            if (this.store.length > (4 << 20)) this.store = Buffer.allocUnsafe(1 << 20);
+            if (this.store.length > this.initialCapacity * 4)
+                this.store = Buffer.allocUnsafe(this.initialCapacity);
         }
     }
 }

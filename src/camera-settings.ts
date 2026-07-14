@@ -92,7 +92,7 @@ export const PARITY_FIELDS: FieldDef[] = [
     {
         key: 'video.keyframeInterval', title: 'Keyframe interval (s)', group: 'Video', type: 'integer',
         paths: ['av.video.<track>.nMultiplier'], range: [1, 10],
-        description: 'Seconds between keyframes. Use 4s for Scrypted/native UniFi parity and recording compatibility. 8s can make the camera encoder’s keyframe quality pulse occur less often on detailed scenes, but increases recovery time after packet loss and can exceed normal prebuffer/sync windows. GOP replay keeps ordinary live-view starts quick; it does not add the interval as steady-state latency.',
+        description: 'Seconds between keyframes. This plugin applies the value to every camera stream so high and medium clients have the same startup/recovery behavior. 1s starts and recovers fastest; longer intervals reduce IDR frequency and can make the encoder’s keyframe quality pulse occur less often on detailed scenes. GOP replay helps ordinary joins, but a client that rejects a damaged/cut keyframe must still wait for the next one.',
     },
     // Adaptive-bitrate floors. The camera's autoBitrate silently throttles a
     // low-"motion" scene (e.g. rippling water the detector ignores) down toward
@@ -235,6 +235,17 @@ export function writeField(field: FieldDef, value: any, track: string): any {
     return partial;
 }
 
+/** Build one camera-API partial for the same field on multiple encoder tracks.
+ * Used for GOP length: a viewer may choose high or medium independently of the
+ * configured primary channel, and leaving either track on a long GOP recreates
+ * the client-start tail this setting is intended to control. */
+export function writeFieldForTracks(field: FieldDef, value: any, tracks: Iterable<string>): any {
+    const partial = {};
+    for (const track of new Set(tracks))
+        deepMerge(partial, writeField(field, value, track));
+    return partial;
+}
+
 /**
  * Fields that UniFi Protect does NOT set over the management channel (proven
  * absent from the Protect backend) — these stay on the camera's local HTTP API:
@@ -262,7 +273,7 @@ const MGMT_HTTP_ONLY = new Set([
  * undefined when the field isn't mgmt-settable → caller falls back to HTTP.
  * Payloads are partials (single changed key); the camera merges by key.
  */
-export function buildMgmtSetting(field: FieldDef, value: any, track: string): { fn: string; payload: any } | undefined {
+export function buildMgmtSetting(field: FieldDef, value: any, _track: string): { fn: string; payload: any } | undefined {
     if (MGMT_HTTP_ONLY.has(field.key)) return undefined;
     const v = coerceValue(field, value);
     const k = field.key;
@@ -271,11 +282,6 @@ export function buildMgmtSetting(field: FieldDef, value: any, track: string): { 
         return { fn: 'ChangeIspSettings', payload: irLedToCamera(String(v)) };
     if (k.startsWith('isp.'))
         return { fn: 'ChangeIspSettings', payload: { [k.slice(4)]: v } };
-
-    if (k === 'video.fps') return { fn: 'ChangeVideoSettings', payload: { video: { [track]: { fps: v } } } };
-    if (k === 'video.isCbr') return { fn: 'ChangeVideoSettings', payload: { video: { [track]: { isCbr: v } } } };
-    if (k === 'video.bitrate') return { fn: 'ChangeVideoSettings', payload: { video: { [track]: { bitRateVbrMax: v } } } };
-    if (k === 'video.keyframeInterval') return { fn: 'ChangeVideoSettings', payload: { video: { [track]: { nMultiplier: v } } } };
 
     if (k === 'osd.overlayLocation') return { fn: 'ChangeOsdSettings', payload: { overlayLocation: v } };
     if (k.startsWith('osd.')) {
