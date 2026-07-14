@@ -243,18 +243,20 @@ def parse_framecrc_metadata(output: str) -> dict[str, Any]:
 
 def parse_ffmpeg_audio_metadata(output: str) -> dict[str, Any]:
     """Extract source codec details from FFmpeg's human-readable stream lines."""
-    metadata: dict[str, Any] = {}
     for line in output.splitlines():
         match = AUDIO_STREAM_RE.search(line)
         if not match:
             continue
         codec, profile = match.groups()
-        metadata.setdefault("codec", codec.lower())
+        metadata: dict[str, Any] = {"codec": codec.lower()}
         if profile:
-            metadata.setdefault("codec_profile", profile.strip())
+            metadata["codec_profile"] = profile.strip()
         bitrate = AUDIO_BITRATE_RE.search(line[match.end():])
         if bitrate:
-            metadata.setdefault("declared_bitrate_bps", round(float(bitrate.group(1)) * 1000))
+            metadata["declared_bitrate_bps"] = round(float(bitrate.group(1)) * 1000)
+        break
+    else:
+        return {}
     profile = metadata.get("codec_profile")
     if metadata.get("codec") == "aac" and isinstance(profile, str):
         object_type = AAC_OBJECT_TYPES.get(profile.casefold().replace(" ", ""))
@@ -1061,6 +1063,14 @@ def self_test() -> None:
     }
     assert parse_ffmpeg_audio_metadata("Stream #0:0: Audio: aac, 16000 Hz, mono\n") == {
         "codec": "aac",
+    }
+    assert parse_ffmpeg_audio_metadata(
+        "Stream #0:0: Audio: aac (LC), 32000 Hz, mono, fltp\n"
+        "Stream #0:0: Audio: pcm_s16le, 32000 Hz, mono, s16, 512 kb/s\n"
+    ) == {
+        "codec": "aac",
+        "codec_profile": "LC",
+        "aac_object_type": 2,
     }
     assert numeric_summary([]) == {"samples": 0, "min": None, "median": None, "max": None}
     assert timestamp_anomalies(frames) == {
