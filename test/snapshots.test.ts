@@ -1,6 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { isUsableJpeg, jpegDimensions, SnapshotManager, SnapshotSource } from '../src/snapshots';
+import {
+    isUsableJpeg,
+    jpegDimensions,
+    SnapshotManager,
+    SnapshotRequestTrace,
+    SnapshotSource,
+} from '../src/snapshots';
 
 function jpeg(fill: number, size = 4000, width = 640, height = 360) {
     const ret = Buffer.alloc(size, fill);
@@ -144,7 +150,7 @@ test('SnapshotManager resize cache is keyed by requested size and source-frame i
     const manager = new SnapshotManager(source(), {
         resizeJpeg: async () => jpeg(++calls + 10, 4000, 320, 180),
     });
-    const options = { picture: { width: 320, height: 180 } } as any;
+    const options = { reason: 'event', picture: { width: 320, height: 180 } } as any;
     const frameA = { ts: 1, jpeg: jpeg(1) };
     // Distinct frames can complete in the same millisecond; timestamp equality
     // must never alias their resized output.
@@ -158,6 +164,69 @@ test('SnapshotManager resize cache is keyed by requested size and source-frame i
     const b = await manager.resizeFor(frameB, options);
     assert.equal(calls, 2, 'new source frame reused an old resized variant');
     assert.notStrictEqual(b, a1);
+});
+
+test('periodic exact-size previews return stale immediately and refresh once in the background', async () => {
+    let finishRefresh!: (value: Buffer) => void;
+    const refresh = new Promise<Buffer>(resolve => { finishRefresh = resolve; });
+    let calls = 0;
+    const sizedA = jpeg(11, 4000, 320, 180);
+    const sizedB = jpeg(12, 4000, 320, 180);
+    const manager = new SnapshotManager(source(), {
+        resizeJpeg: async () => ++calls === 1 ? sizedA : refresh,
+    });
+    const options = { reason: 'periodic', picture: { width: 320, height: 180 } } as any;
+    const frameA = { ts: 1, jpeg: jpeg(1) };
+    const frameB = { ts: 2, jpeg: jpeg(2) };
+
+    assert.strictEqual(await manager.resizeFor(frameA, options), sizedA);
+    const trace: SnapshotRequestTrace = {};
+    assert.strictEqual(await manager.resizeFor(frameB, options, trace), sizedA);
+    assert.equal(trace.resizePath, 'stale-cache');
+    assert.strictEqual(await manager.resizeFor(frameB, options), sizedA);
+    assert.equal(calls, 2, 'concurrent stale previews launched duplicate refreshes');
+
+    const background = (manager as any).resizing.get('320x180').promise as Promise<Buffer>;
+    finishRefresh(sizedB);
+    assert.strictEqual(await background, sizedB);
+    assert.strictEqual(await manager.resizeFor(frameB, options), sizedB);
+    assert.equal(calls, 2);
+});
+
+test('periodic stale preview does not compete with a fresh same-frame event resize', async () => {
+    let finishEvent!: (value: Buffer) => void;
+    const eventResize = new Promise<Buffer>(resolve => { finishEvent = resolve; });
+    let calls = 0;
+    const sizedA = jpeg(13, 4000, 320, 180);
+    const sizedB = jpeg(14, 4000, 320, 180);
+    const manager = new SnapshotManager(source(), {
+        resizeJpeg: async () => ++calls === 1 ? sizedA : eventResize,
+    });
+    const frameA = { ts: 1, jpeg: jpeg(1) };
+    const frameB = { ts: 2, jpeg: jpeg(2) };
+    const picture = { width: 320, height: 180 };
+
+    await manager.resizeFor(frameA, { reason: 'periodic', picture } as any);
+    let eventSettled = false;
+    const event = manager.resizeFor(frameB, { reason: 'event', picture } as any)
+        .then(value => { eventSettled = true; return value; });
+    await Promise.resolve();
+
+    const trace: SnapshotRequestTrace = {};
+    assert.strictEqual(
+        await manager.resizeFor(frameB, { reason: 'periodic', picture } as any, trace),
+        sizedA,
+    );
+    assert.equal(trace.resizePath, 'stale-cache');
+    assert.equal(eventSettled, false, 'event inherited a cached periodic image');
+    assert.equal(calls, 2, 'periodic refresh duplicated the same-frame event conversion');
+
+    finishEvent(sizedB);
+    assert.strictEqual(await event, sizedB);
+    assert.strictEqual(
+        await manager.resizeFor(frameB, { reason: 'periodic', picture } as any),
+        sizedB,
+    );
 });
 
 test('SnapshotManager never returns invalid native bytes and recovers with last-good', async () => {
@@ -258,7 +327,10 @@ test('resize always closes the Scrypted image resource on success and failure', 
 
     assert.ok(isUsableJpeg(await manager.resizeFor({ ts: 1, jpeg: jpeg(1) }, options)));
     fail = true;
-    assert.ok(isUsableJpeg(await manager.resizeFor({ ts: 2, jpeg: jpeg(2) }, options)));
+    const stale = manager.resizeFor({ ts: 2, jpeg: jpeg(2) }, options);
+    const background = (manager as any).resizing.get('320x180').promise as Promise<Buffer>;
+    assert.ok(isUsableJpeg(await stale));
+    assert.ok(isUsableJpeg(await background));
     assert.equal(closes, 2);
 });
 

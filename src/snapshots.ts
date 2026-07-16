@@ -118,7 +118,7 @@ export interface SnapshotRequestTrace {
     captureSource?: SnapshotCaptureSource;
     captureError?: string;
     resizePath?: 'original' | 'cache' | 'join' | 'image-worker' | 'injected-primary'
-        | 'cached-fallback' | 'ffmpeg-fallback' | 'deadline-cache'
+        | 'stale-cache' | 'cached-fallback' | 'ffmpeg-fallback' | 'deadline-cache'
         | 'deadline-ffmpeg-fallback' | 'last-good' | 'native';
     resizeError?: string;
     deadlineError?: string;
@@ -375,8 +375,10 @@ export class SnapshotManager {
         return holder.promise;
     }
 
-    /** Normalize a snapshot frame to the exact requested picture size. Caches
-     * per size against the source frame. */
+    /** Normalize a snapshot frame to the exact requested picture size. Periodic
+     * previews use stale-while-revalidate for the final sized JPEG too, so a
+     * source-frame refresh never puts image-worker latency back on HomeKit's
+     * request path. Events still await a resize of their fresh source frame. */
     async resizeFor(
         frame: SnapFrame,
         options?: RequestPictureOptions,
@@ -396,14 +398,41 @@ export class SnapshotManager {
             return hit.jpeg;
         }
 
+        const active = this.resizing.get(key);
+        if (!event && hit && this.matchesRequestedSize(hit.jpeg, options)) {
+            // The source-frame cache already refreshes in the background. Keep
+            // the exact-size cache on the same contract: deliver known-good
+            // bytes immediately and prepare this source frame for the next poll.
+            // A same-frame event resize is also suitable for the shared cache,
+            // so do not compete with it or suppress its guarded late cache write.
+            if (!active || active.srcId !== srcId) {
+                const refresh = this.startResize(frame, options!, key, srcId, event, hit);
+                refresh.catch(() => { });
+            }
+            if (trace) trace.resizePath = 'stale-cache';
+            return hit.jpeg;
+        }
+
         // Coalesce only requests for the same frame and freshness contract. A
         // fresh event must never inherit an older periodic frame's resize.
-        const active = this.resizing.get(key);
         if (active && active.srcId === srcId && active.event === event) {
             if (trace) trace.resizePath = 'join';
             return active.promise;
         }
 
+        return this.startResize(frame, options!, key, srcId, event, hit, trace);
+    }
+
+    private startResize(
+        frame: SnapFrame,
+        options: RequestPictureOptions,
+        key: string,
+        srcId: number,
+        event: boolean,
+        hit: { srcId: number; jpeg: Buffer } | undefined,
+        trace?: SnapshotRequestTrace,
+    ): Promise<Buffer> {
+        const w = options.picture?.width, h = options.picture?.height;
         const generation = this.generation;
         const operation = ++this.nextResizeOperation;
         this.latestResizeOperation.set(key, operation);
@@ -417,7 +446,7 @@ export class SnapshotManager {
         };
         const raw = (async () => {
             if (this.options.resizeJpeg)
-                return this.options.resizeJpeg(frame.jpeg, options!, this.src.sourceId());
+                return this.options.resizeJpeg(frame.jpeg, options, this.src.sourceId());
             if (this.options.loadImage) {
                 image = await this.options.loadImage(frame.jpeg, this.src.sourceId());
             } else {
@@ -446,12 +475,12 @@ export class SnapshotManager {
 
         const resizeTimeout = Math.max(10, Math.min(
             this.options.resizeTimeoutMs ?? RESIZE_TIMEOUT_MS,
-            options?.timeout || Number.POSITIVE_INFINITY,
+            options.timeout || Number.POSITIVE_INFINITY,
         ));
         const promise = (async () => {
             try {
                 const out = await withTimeout(raw, resizeTimeout, 'snapshot resize');
-                this.rememberResized(key, srcId, out, generation, operation, options!);
+                this.rememberResized(key, srcId, out, generation, operation, options);
                 if (trace) trace.resizePath = this.options.resizeJpeg ? 'injected-primary' : 'image-worker';
                 return out;
             } catch (e) {
@@ -466,7 +495,7 @@ export class SnapshotManager {
                 if (!event && hit && this.matchesRequestedSize(hit.jpeg, options)) {
                     // Retag the exact fallback for this source frame so every poll
                     // does not retry the same unhealthy converter.
-                    this.rememberResized(key, srcId, hit.jpeg, generation, operation, options!);
+                    this.rememberResized(key, srcId, hit.jpeg, generation, operation, options);
                     if (trace) trace.resizePath = 'cached-fallback';
                     return hit.jpeg;
                 }
@@ -481,8 +510,8 @@ export class SnapshotManager {
                     catch { /* current validated frame remains usable */ }
                 }
                 try {
-                    const normalized = await this.normalizeFallbackJpeg(fallback, options!);
-                    this.rememberResized(key, srcId, normalized, generation, operation, options!);
+                    const normalized = await this.normalizeFallbackJpeg(fallback, options);
+                    this.rememberResized(key, srcId, normalized, generation, operation, options);
                     if (trace) trace.resizePath = 'ffmpeg-fallback';
                     return normalized;
                 } catch (fallbackError) {
