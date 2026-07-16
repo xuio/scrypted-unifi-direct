@@ -51,14 +51,15 @@ normal prebuffer or another real consumer may legitimately keep that source
 warm. Add `--trace` to include sanitized signaling, ICE, RTP, decode, PLI, and
 NACK diagnostics alongside the default phase summary.
 
-## HomeKit/HAP first-decoded-frame benchmark
+## HomeKit/HAP startup benchmark
 
 `homekit-startup.js` uses [go2rtc](https://github.com/AlexxIT/go2rtc) as an
-open-source HAP controller. For every sample it starts a fresh controller,
-performs Pair Verify and HomeKit RTP setup, and asks FFmpeg to decode exactly one
-video frame from go2rtc's local RTSP output. The timer excludes go2rtc process
-startup but includes HAP connection, negotiation, SRTP arrival, RTSP relay, and
-first-frame decode.
+open-source HAP controller. For every sample it starts a fresh controller and
+performs Pair Verify plus HomeKit RTP setup. The default `--oracle auto` mode
+uses direct HAP `START` to complete SPS/PPS/IDR timing when the binary exposes
+the safe `HKVAL` validation markers. It still waits for FFmpeg to decode one
+frame and verifies its dimensions as a secondary oracle. With a stock binary,
+the runner automatically falls back to decoded-frame timing.
 
 Prerequisites:
 
@@ -77,6 +78,7 @@ node scripts/homekit-startup.js \
   --go2rtc /path/to/go2rtc \
   --ffmpeg /path/to/ffmpeg \
   --source-file /secure/path/kamera-teich.hap-url \
+  --label 'Kamera Teich' \
   --profile high --profile medium --runs 5 \
   | tee /tmp/unifi-homekit-startup.jsonl
 ```
@@ -88,6 +90,62 @@ go2rtc version plus the first decoded frame's `width` and `height`, obtained fro
 FFmpeg's post-decode `showinfo` filter. High must decode exactly 1920x1080 and
 medium exactly 1280x720. A wrong resolution is reported on the sample and fails
 the run, preventing both profiles from silently benchmarking the same stream.
+For a dedicated validation accessory that deliberately forces a native stream,
+override the oracle without weakening it, for example
+`--expect high=2688x1512` or `--expect medium=1280x720`. `--label` adds only the
+supplied safe display name to each JSON record; pairing material is still never
+printed.
+
+### Direct-HAP versus stock-relay timing
+
+Stock go2rtc is sufficient for the decoded-frame oracle, but that number includes
+its local RTSP relay and FFmpeg probe/decode startup. It can be several seconds
+later than the moment a complete decoder-usable IDR has arrived over HomeKit
+SRTP. Large pre-PLAY IDRs can also cross go2rtc 1.9.14's stock 1 MiB RTSP
+consumer buffer and distort this downstream measurement. Do not tune Scrypted's
+HomeKit replay rate from decoded-frame latency alone.
+
+For calibrated work, build the pinned diagnostic patch documented in
+[`scripts/validation/README.md`](validation/README.md). It provides:
+
+- numeric/boolean `HKVAL` phases for Pair Verify, media capabilities, stream
+  start, first video RTP, complete usable IDR, and first RTSP flush;
+- a client-side H264 milestone that requires SPS, PPS, and a marker-terminated
+  IDR;
+- validation-only buffering that never interleaves RTP before RTSP PLAY when an
+  IDR exceeds 1 MiB;
+- optional `skip_mdns=1` for a private paired URL whose host is already a stable
+  literal IP.
+
+`--oracle usable-idr` is the fast primary mode for repeated calibrated samples;
+it stops as soon as the direct HAP milestone arrives and therefore does not
+produce decoded dimensions. Run at least one `--oracle decoded-frame` sample per
+profile/rate as the secondary resolution check. `--oracle auto` combines both in
+one slower sample and reports usable-IDR as primary whenever all samples expose
+the marker. The patched binary, paired source, and `skip_mdns=1` URL are
+validation artifacts only—not production runtime dependencies.
+
+Use `--oracle audio-summary` to keep the HAP stream open until the instrumented
+controller emits its bounded pre-timekeeper audio summary. It reports negotiated
+clock/channels/packet time, raw RTP sequence and timestamp continuity, Opus TOC
+packet durations, arrival cadence, parse failures, and stalls. These values are
+captured directly at HomeKit SRTP ingress, before go2rtc's stock audio
+`timekeeper` can drop packets or rewrite timestamps.
+
+### Applying a measured replay policy
+
+`set-homekit-replay-bootstrap.js` is intentionally scoped to the four known
+production camera IDs and names. It verifies every HomeKit setting and choice
+before the first write. Without `--apply` it is read-only. On an apply/readback
+failure, it restores and verifies every camera touched by that invocation.
+
+```sh
+node scripts/set-homekit-replay-bootstrap.js \
+  --host scrypted.example:10443 \
+  --value 'Adaptive (High auto / Medium 8 Mbit/s)'
+
+# Repeat with --apply only after reviewing the complete preflight.
+```
 
 ## HomeKit preview snapshot stress test
 
