@@ -375,6 +375,10 @@ export class SnapshotManager {
     // resized frame under the new timestamp.
     private resized = new Map<string, { srcId: number; jpeg: Buffer }>();
     private resizing = new Map<string, { srcId: number; event: boolean; promise: Promise<Buffer> }>();
+    /** Exact sizes requested by periodic preview consumers. When a stale source
+     * refresh succeeds, rebuild every known variant immediately so the next
+     * HomeKit grid poll does not spend another cycle on the old sized JPEG. */
+    private previewVariants = new Map<string, RequestPictureOptions>();
     private latestResizeOperation = new Map<string, number>();
     private nextResizeOperation = 0;
     private externalFrameIds = new WeakMap<SnapFrame, number>();
@@ -403,6 +407,7 @@ export class SnapshotManager {
         this.lastGood = undefined;
         this.nativePreview = undefined;
         this.resized.clear();
+        this.previewVariants.clear();
         this.externalFrameIds = new WeakMap();
         this.visuallyVerified = new WeakSet();
     }
@@ -434,7 +439,7 @@ export class SnapshotManager {
                 trace.captureSource = cached.source;
             }
             if (age >= ttl && !this.inflight.has(lane)) {
-                const refresh = this.startCapture(lane);
+                const refresh = this.startCapture(lane, lane === 'preview' ? cached : undefined);
                 refresh.promise.catch(() => { });   // errors keep the stale frame
             }
             return cached;
@@ -462,7 +467,7 @@ export class SnapshotManager {
         this.ensureNativePreview(true);
     }
 
-    private startCapture(lane: CaptureLane) {
+    private startCapture(lane: CaptureLane, stalePreview?: SnapFrame) {
         const generation = this.generation;
         const holder: {
             generation: number;
@@ -473,6 +478,17 @@ export class SnapshotManager {
         holder.promise = this.captureJpeg(generation, lane, (source, error) => {
             holder.recoverySource = source;
             holder.captureError = error;
+        }).then(async frame => {
+            // The stale request itself already returned its old exact-size
+            // bytes. Once a genuinely newer, cache-admitted preview source is
+            // ready, prepare every known exact size before the next poll.
+            if (stalePreview
+                && generation === this.generation
+                && this.previewCache === frame
+                && this.frameId(frame) !== this.frameId(stalePreview)) {
+                await this.refreshPreviewVariants(frame, generation);
+            }
+            return frame;
         }).finally(() => {
             if (this.inflight.get(lane) === holder) this.inflight.delete(lane);
         });
@@ -493,6 +509,53 @@ export class SnapshotManager {
     private resizedKey(options?: RequestPictureOptions) {
         const w = options?.picture?.width, h = options?.picture?.height;
         return w || h ? `${w || ''}x${h || ''}` : undefined;
+    }
+
+    private rememberPreviewVariant(key: string, options: RequestPictureOptions) {
+        const width = options.picture?.width;
+        const height = options.picture?.height;
+        const remembered: RequestPictureOptions = {
+            reason: 'periodic',
+            periodicRequest: true,
+            picture: { width, height },
+        };
+        // Refresh insertion order so the bounded map behaves like a tiny LRU;
+        // a frequently polled HomeKit size must not be evicted by one-off sizes.
+        this.previewVariants.delete(key);
+        this.previewVariants.set(key, remembered);
+        if (this.previewVariants.size > 8)
+            this.previewVariants.delete(this.previewVariants.keys().next().value!);
+    }
+
+    private async refreshPreviewVariants(frame: SnapFrame, generation: number): Promise<void> {
+        if (generation !== this.generation || this.previewCache !== frame) return;
+        const srcId = this.frameId(frame);
+        const refreshes: Promise<unknown>[] = [];
+        for (const [key, options] of this.previewVariants) {
+            if (generation !== this.generation || this.previewCache !== frame) break;
+            const hit = this.resized.get(key);
+            if (hit?.srcId === srcId && this.matchesRequestedSize(hit.jpeg, options)) continue;
+
+            const active = this.resizing.get(key);
+            if (active?.srcId === srcId) {
+                refreshes.push(active.promise.catch(error =>
+                    dbg('snapshot proactive resize failed', this.src.tag(), key,
+                        (error as Error)?.message)));
+                continue;
+            }
+
+            refreshes.push(this.startResize(
+                frame,
+                options,
+                key,
+                srcId,
+                false,
+                hit,
+            ).catch(error =>
+                dbg('snapshot proactive resize failed', this.src.tag(), key,
+                    (error as Error)?.message)));
+        }
+        await Promise.all(refreshes);
     }
 
     private matchesRequestedSize(jpeg: Buffer, options?: RequestPictureOptions) {
@@ -670,6 +733,7 @@ export class SnapshotManager {
         const key = this.resizedKey(options)!;
         const srcId = this.frameId(frame);
         const event = options?.reason === 'event';
+        if (!event) this.rememberPreviewVariant(key, options!);
         const hit = this.resized.get(key);
         if (hit && hit.srcId === srcId && this.matchesRequestedSize(hit.jpeg, options)) {
             if (trace) trace.resizePath = 'cache';

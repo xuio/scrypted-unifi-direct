@@ -193,6 +193,168 @@ test('periodic exact-size previews return stale immediately and refresh once in 
     assert.equal(calls, 2);
 });
 
+test('stale preview source refresh proactively rebuilds every known exact-size variant', async () => {
+    let now = 0;
+    let captures = 0;
+    let finishSourceRefresh!: (value: Buffer) => void;
+    const sourceRefresh = new Promise<Buffer>(resolve => { finishSourceRefresh = resolve; });
+    const sourceA = jpeg(21);
+    const sourceB = jpeg(22);
+    const sizedA320 = jpeg(23, 4000, 320, 180);
+    const sizedA1280 = jpeg(24, 4000, 1280, 720);
+    const sizedB320 = jpeg(25, 4000, 320, 180);
+    const sizedB1280 = jpeg(26, 4000, 1280, 720);
+    const resizeInputs: Array<{ source: Buffer; width: number; height: number }> = [];
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 100,
+        mjpgSnapshot: async () => ++captures === 1 ? sourceA : sourceRefresh,
+    }), {
+        now: () => now,
+        resizeJpeg: async (input, options) => {
+            const width = options.picture!.width!;
+            const height = options.picture!.height!;
+            resizeInputs.push({ source: input, width, height });
+            if (input === sourceA && width === 320) return sizedA320;
+            if (input === sourceA && width === 1280) return sizedA1280;
+            if (input === sourceB && width === 320) return sizedB320;
+            if (input === sourceB && width === 1280) return sizedB1280;
+            throw new Error('unexpected proactive resize input');
+        },
+    });
+    const periodic320 = { reason: 'periodic', picture: { width: 320, height: 180 } } as any;
+    const periodic1280 = { reason: 'periodic', picture: { width: 1280, height: 720 } } as any;
+
+    assert.strictEqual(await manager.getPicture(periodic320), sizedA320);
+    assert.strictEqual(await manager.getPicture(periodic1280), sizedA1280);
+    assert.equal(captures, 1);
+    assert.equal(resizeInputs.length, 2);
+
+    now = 200;
+    assert.strictEqual(
+        await manager.getPicture(periodic320),
+        sizedA320,
+        'the stale poll should remain zero-work',
+    );
+    assert.equal(captures, 2);
+    assert.equal(resizeInputs.length, 2, 'source refresh incorrectly blocked the stale request');
+
+    const background = (manager as any).inflight.get('preview').promise as Promise<unknown>;
+    finishSourceRefresh(sourceB);
+    await background;
+
+    assert.deepEqual(
+        resizeInputs.slice(2).map(({ source, width, height }) => ({
+            fresh: source === sourceB,
+            width,
+            height,
+        })).sort((a, b) => a.width - b.width),
+        [
+            { fresh: true, width: 320, height: 180 },
+            { fresh: true, width: 1280, height: 720 },
+        ],
+    );
+    assert.strictEqual(await manager.getPicture(periodic320), sizedB320);
+    assert.strictEqual(await manager.getPicture(periodic1280), sizedB1280);
+    assert.equal(resizeInputs.length, 4, 'next poll had to perform an on-demand resize');
+});
+
+test('proactive preview resize never satisfies an in-flight event snapshot', async () => {
+    let now = 0;
+    let captures = 0;
+    let finishPreviewRefresh!: (value: Buffer) => void;
+    let finishEventCapture!: (value: Buffer) => void;
+    const previewRefresh = new Promise<Buffer>(resolve => { finishPreviewRefresh = resolve; });
+    const eventCapture = new Promise<Buffer>(resolve => { finishEventCapture = resolve; });
+    const sourceA = jpeg(27);
+    const sourceB = jpeg(28);
+    const eventSource = jpeg(29);
+    const sizedA = jpeg(30, 4000, 320, 180);
+    const sizedB = jpeg(31, 4000, 320, 180);
+    const sizedEvent = jpeg(32, 4000, 320, 180);
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 100,
+        mjpgSnapshot: async () => {
+            captures++;
+            if (captures === 1) return sourceA;
+            if (captures === 2) return previewRefresh;
+            if (captures === 3) return eventCapture;
+            throw new Error('unexpected camera capture');
+        },
+    }), {
+        now: () => now,
+        resizeJpeg: async input => {
+            if (input === sourceA) return sizedA;
+            if (input === sourceB) return sizedB;
+            if (input === eventSource) return sizedEvent;
+            throw new Error('unexpected resize source');
+        },
+    });
+    const picture = { width: 320, height: 180 };
+
+    assert.strictEqual(await manager.getPicture({ reason: 'periodic', picture }), sizedA);
+    now = 200;
+    assert.strictEqual(await manager.getPicture({ reason: 'periodic', picture }), sizedA);
+    const previewBackground = (manager as any).inflight.get('preview').promise as Promise<unknown>;
+
+    let eventSettled = false;
+    const event = manager.getPicture({ reason: 'event', picture })
+        .then(value => { eventSettled = true; return value; });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(captures, 3, 'event joined the older periodic camera request');
+
+    finishPreviewRefresh(sourceB);
+    await previewBackground;
+    assert.equal(eventSettled, false, 'proactive periodic work completed the event request');
+
+    finishEventCapture(eventSource);
+    assert.strictEqual(await event, sizedEvent);
+});
+
+test('reset during stale source refresh prevents obsolete proactive resize work', async () => {
+    let now = 0;
+    let captures = 0;
+    let finishObsoleteRefresh!: (value: Buffer) => void;
+    const obsoleteRefresh = new Promise<Buffer>(resolve => { finishObsoleteRefresh = resolve; });
+    const sourceA = jpeg(33);
+    const sourceB = jpeg(34);
+    const sourceC = jpeg(35);
+    const sizedA = jpeg(36, 4000, 320, 180);
+    const sizedC = jpeg(37, 4000, 320, 180);
+    const resizeInputs: Buffer[] = [];
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 100,
+        mjpgSnapshot: async () => {
+            captures++;
+            if (captures === 1) return sourceA;
+            if (captures === 2) return obsoleteRefresh;
+            if (captures === 3) return sourceC;
+            throw new Error('unexpected camera capture');
+        },
+    }), {
+        now: () => now,
+        resizeJpeg: async input => {
+            resizeInputs.push(input);
+            if (input === sourceA) return sizedA;
+            if (input === sourceC) return sizedC;
+            throw new Error('obsolete source reached resize');
+        },
+    });
+    const options = { reason: 'periodic', picture: { width: 320, height: 180 } } as any;
+
+    assert.strictEqual(await manager.getPicture(options), sizedA);
+    now = 200;
+    assert.strictEqual(await manager.getPicture(options), sizedA);
+    const background = (manager as any).inflight.get('preview').promise as Promise<unknown>;
+
+    manager.reset();
+    finishObsoleteRefresh(sourceB);
+    await background;
+    assert.deepEqual(resizeInputs, [sourceA], 'obsolete refresh launched a proactive resize after reset');
+
+    assert.strictEqual(await manager.getPicture(options), sizedC);
+    assert.deepEqual(resizeInputs, [sourceA, sourceC]);
+});
+
 test('periodic stale preview does not compete with a fresh same-frame event resize', async () => {
     let finishEvent!: (value: Buffer) => void;
     const eventResize = new Promise<Buffer>(resolve => { finishEvent = resolve; });
