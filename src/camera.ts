@@ -33,7 +33,7 @@ import {
 } from './zones';
 import { CameraZoneManager, cameraCoordsToPoints, isFullFrameZone } from './camera-zones';
 import { DetectionEngine } from './detections';
-import { jpegDimensions, SnapshotManager, SnapshotRequestTrace } from './snapshots';
+import { inspectSnapshotVisual, jpegDimensions, SnapshotManager, SnapshotRequestTrace } from './snapshots';
 import { AUDIO_RTSP_PORT } from './audio-rtsp';
 import { dbg } from './debug';
 import type { UnifiDirectProvider } from './provider';
@@ -108,6 +108,8 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             return mediaManager.convertMediaObjectToBuffer(mo, 'image/jpeg');
         },
         mjpgSnapshot: () => this.getClient().getSnapshot(),
+    }, {
+        inspectJpeg: inspectSnapshotVisual,
     });
 
     constructor(public provider: UnifiDirectProvider, nativeId: string) {

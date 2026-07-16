@@ -36,6 +36,9 @@ const FALLBACK_RESIZE_TIMEOUT_MS = 800;
  * keyframe snapshots are healthy. It is the zero-work escape hatch when an
  * image converter or unrelated full-resolution caller is busy. */
 const NATIVE_PREVIEW_REFRESH_MS = 30_000;
+/** A disconnected camera should not receive one speculative `/snap.jpeg`
+ * request per HomeKit tile poll. Demand captures still bypass this backoff. */
+const NATIVE_WARM_BACKOFF_MS = [1_000, 2_000, 4_000, 8_000, 15_000, 30_000];
 /** HomeKit does not currently pass RequestPictureOptions.timeout. Bound the
  * complete preview path anyway so HAP always receives bytes before iOS gives up. */
 const PREVIEW_REQUEST_TIMEOUT_MS = 4000;
@@ -52,6 +55,160 @@ const KEYFRAME_SNAPSHOT_MAX_AGE_MS = 10_000;
 const JPEG_SOI_0 = 0xff;
 const JPEG_SOI_1 = 0xd8;
 const JPEG_EOI_1 = 0xd9;
+const VISUAL_PROBE_WIDTH = 64;
+const VISUAL_PROBE_HEIGHT = 64;
+const VISUAL_PROBE_BYTES = VISUAL_PROBE_WIDTH * VISUAL_PROBE_HEIGHT;
+const VISUAL_PROBE_TIMEOUT_MS = 700;
+
+export interface SnapshotVisualMetrics {
+    mean: number;
+    p99: number;
+    darkFraction: number;
+    stddev: number;
+    meanGradient: number;
+}
+
+class SnapshotVisualProbeError extends Error {
+    constructor(message: string, readonly unavailable: boolean) {
+        super(message);
+        this.name = 'SnapshotVisualProbeError';
+    }
+}
+
+/** Match the deliberately conservative black-frame classifier used by the
+ * headless HomeKit harness. A genuinely dark night scene still contains sensor
+ * texture and edges; a decoder/camera blank is almost uniformly at digital
+ * black. */
+export function isVisuallyBlankSnapshot(metrics: SnapshotVisualMetrics): boolean {
+    return metrics.p99 <= 16
+        && metrics.darkFraction >= 0.995
+        && metrics.stddev <= 2
+        && metrics.meanGradient <= 2;
+}
+
+export function visualMetricsFromGray(gray: Buffer): SnapshotVisualMetrics {
+    if (gray.length !== VISUAL_PROBE_BYTES)
+        throw new Error(`snapshot visual probe returned ${gray.length} bytes`);
+    let sum = 0;
+    let dark = 0;
+    for (const value of gray) {
+        sum += value;
+        if (value < 16) dark++;
+    }
+    const mean = sum / gray.length;
+    let variance = 0;
+    let gradient = 0;
+    let gradientSamples = 0;
+    for (let y = 0; y < VISUAL_PROBE_HEIGHT; y++) {
+        for (let x = 0; x < VISUAL_PROBE_WIDTH; x++) {
+            const index = y * VISUAL_PROBE_WIDTH + x;
+            const value = gray[index];
+            variance += (value - mean) ** 2;
+            if (x) {
+                gradient += Math.abs(value - gray[index - 1]);
+                gradientSamples++;
+            }
+            if (y) {
+                gradient += Math.abs(value - gray[index - VISUAL_PROBE_WIDTH]);
+                gradientSamples++;
+            }
+        }
+    }
+    const sorted = [...gray].sort((a, b) => a - b);
+    return {
+        mean,
+        p99: sorted[Math.ceil(sorted.length * 0.99) - 1],
+        darkFraction: dark / gray.length,
+        stddev: Math.sqrt(variance / gray.length),
+        meanGradient: gradientSamples ? gradient / gradientSamples : 0,
+    };
+}
+
+let ffmpegPathPromise: Promise<string> | undefined;
+function snapshotFfmpegPath(): Promise<string> {
+    if (!ffmpegPathPromise) {
+        const pending = Promise.resolve(scryptedMedia().mediaManager.getFFmpegPath());
+        ffmpegPathPromise = pending;
+        pending.catch(() => {
+            if (ffmpegPathPromise === pending) ffmpegPathPromise = undefined;
+        });
+    }
+    return ffmpegPathPromise;
+}
+
+/** Decode a tiny grayscale oracle from the exact JPEG that would be cached or
+ * served. This is intentionally independent of the Scrypted image worker: a
+ * worker producing a valid-but-blank JPEG must not certify its own output. */
+export async function inspectSnapshotVisual(
+    jpeg: Buffer,
+    timeoutMs = VISUAL_PROBE_TIMEOUT_MS,
+): Promise<SnapshotVisualMetrics> {
+    if (!isUsableJpeg(jpeg)) throw new Error('snapshot visual probe received invalid jpeg');
+    const started = Date.now();
+    const pathRequest = snapshotFfmpegPath();
+    let ffmpegPath: string;
+    try {
+        ffmpegPath = await withTimeout(
+            pathRequest,
+            Math.max(1, timeoutMs),
+            'snapshot visual probe ffmpeg path',
+        );
+    } catch (error) {
+        // A remote media-manager lookup may itself wedge. Do not let one
+        // unresolved promise poison visual checks for every camera forever.
+        if (ffmpegPathPromise === pathRequest) ffmpegPathPromise = undefined;
+        throw new SnapshotVisualProbeError((error as Error)?.message || String(error), true);
+    }
+    const remaining = Math.floor(timeoutMs - (Date.now() - started));
+    if (remaining <= 0)
+        throw new SnapshotVisualProbeError(
+            `snapshot visual probe timed out after ${timeoutMs}ms before decode`,
+            true,
+        );
+    return new Promise<SnapshotVisualMetrics>((resolve, reject) => {
+        let settled = false;
+        const cp = spawn(ffmpegPath, [
+            '-hide_banner', '-loglevel', 'error',
+            '-f', 'mjpeg', '-i', 'pipe:0',
+            '-frames:v', '1',
+            '-vf', `scale=${VISUAL_PROBE_WIDTH}:${VISUAL_PROBE_HEIGHT}:flags=area,format=gray`,
+            '-f', 'rawvideo', 'pipe:1',
+        ], { stdio: ['pipe', 'pipe', 'ignore'] });
+        const chunks: Buffer[] = [];
+        const finish = (error?: Error, metrics?: SnapshotVisualMetrics) => {
+            if (settled) return;
+            settled = true;
+            clearTimeout(timer);
+            error ? reject(error) : resolve(metrics!);
+        };
+        const timer = setTimeout(() => {
+            try { cp.kill('SIGKILL'); } catch { }
+            finish(new SnapshotVisualProbeError(
+                `snapshot visual probe timed out after ${timeoutMs}ms`,
+                true,
+            ));
+        }, remaining);
+        cp.stdout.on('data', data => chunks.push(data));
+        cp.on('error', error => finish(new SnapshotVisualProbeError(error.message, true)));
+        cp.on('close', code => {
+            if (code !== 0) return finish(new SnapshotVisualProbeError(
+                `snapshot visual probe exited ${code}`,
+                false,
+            ));
+            const gray = Buffer.concat(chunks);
+            try {
+                finish(undefined, visualMetricsFromGray(gray));
+            } catch (error) {
+                finish(new SnapshotVisualProbeError(
+                    (error as Error)?.message || String(error),
+                    false,
+                ));
+            }
+        });
+        cp.stdin.on('error', () => { });
+        cp.stdin.end(jpeg);
+    });
+}
 
 /** Cheap structural validation before bytes are ever labelled image/jpeg.
  *  EOI may be followed by a small amount of transport whitespace/padding. */
@@ -106,6 +263,19 @@ export type SnapFrame = {
 
 export type CaptureLane = 'preview' | 'event' | 'full';
 
+type NativeWarmAttempt = {
+    generation: number;
+    pending: number;
+    succeeded: boolean;
+};
+
+type NativePreviewInflight = {
+    generation: number;
+    promise: Promise<SnapFrame>;
+    warmAttempt?: NativeWarmAttempt;
+    warmLogAttached?: boolean;
+};
+
 /** Mutable, request-local diagnostics populated without adding another image
  * conversion to the latency-sensitive HomeKit path. The owning camera logs one
  * correlated record after the request completes. */
@@ -133,10 +303,14 @@ export interface SnapshotManagerOptions {
     resizeTimeoutMs?: number;
     fallbackResizeTimeoutMs?: number;
     previewTimeoutMs?: number;
+    visualProbeTimeoutMs?: number;
     decodeKeyframeToJpeg?: (annexb: Buffer) => Promise<Buffer>;
     resizeJpeg?: (jpeg: Buffer, options: RequestPictureOptions, sourceId: string | undefined) => Promise<Buffer>;
     fallbackResizeJpeg?: (jpeg: Buffer, options: RequestPictureOptions) => Promise<Buffer>;
     loadImage?: (jpeg: Buffer, sourceId: string | undefined) => Promise<Image>;
+    inspectJpeg?: (jpeg: Buffer, timeoutMs?: number) => Promise<SnapshotVisualMetrics>;
+    getFfmpegPath?: () => Promise<string>;
+    spawnFfmpeg?: typeof spawn;
 }
 
 function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
@@ -191,7 +365,9 @@ export class SnapshotManager {
     }>();
     private nativePreview?: SnapFrame;
     private nativePreviewGeneration = 0;
-    private nativePreviewInflight?: { generation: number; promise: Promise<SnapFrame> };
+    private nativePreviewInflight?: NativePreviewInflight;
+    private nativeWarmFailures = 0;
+    private nativeWarmRetryAt = 0;
 
     // Cache of resized variants, keyed by "WxH" and tied to the SOURCE FRAME's
     // monotonic identity so a burst of same-size requests re-uses one resize — and
@@ -202,6 +378,8 @@ export class SnapshotManager {
     private latestResizeOperation = new Map<string, number>();
     private nextResizeOperation = 0;
     private externalFrameIds = new WeakMap<SnapFrame, number>();
+    private visuallyVerified = new WeakSet<Buffer>();
+    private nextVisualProbeWarningAt = 0;
 
     private now() { return this.options.now?.() ?? Date.now(); }
 
@@ -216,6 +394,8 @@ export class SnapshotManager {
         this.resizing.clear();
         this.latestResizeOperation.clear();
         this.nativePreviewInflight = undefined;
+        this.nativeWarmFailures = 0;
+        this.nativeWarmRetryAt = 0;
     }
     /** Drop everything, including the last-good frame (camera identity changed). */
     reset() {
@@ -224,6 +404,7 @@ export class SnapshotManager {
         this.nativePreview = undefined;
         this.resized.clear();
         this.externalFrameIds = new WeakMap();
+        this.visuallyVerified = new WeakSet();
     }
 
     private lane(options?: RequestPictureOptions): CaptureLane {
@@ -278,7 +459,7 @@ export class SnapshotManager {
      * choose a full-resolution keyframe when one happens to be available. */
     warm(): void {
         if (this.src.cacheTtlMs() <= 0) return;
-        this.ensureNativePreview();
+        this.ensureNativePreview(true);
     }
 
     private startCapture(lane: CaptureLane) {
@@ -323,6 +504,49 @@ export class SnapshotManager {
             && (!height || dimensions.height === Math.round(height));
     }
 
+    private async verifyVisual(jpeg: Buffer, label: string, timeoutMs?: number): Promise<boolean> {
+        if (this.visuallyVerified.has(jpeg)) return true;
+        const inspector = this.options.inspectJpeg;
+        if (inspector) {
+            let metrics: SnapshotVisualMetrics;
+            try {
+                const budget = Math.max(1, Math.floor(
+                    timeoutMs ?? this.options.visualProbeTimeoutMs ?? VISUAL_PROBE_TIMEOUT_MS,
+                ));
+                metrics = await withTimeout(
+                    inspector(jpeg, budget),
+                    budget,
+                    'snapshot visual probe',
+                );
+            } catch (error) {
+                if (error instanceof SnapshotVisualProbeError && !error.unavailable)
+                    throw error;
+                // The visual oracle is an extra defense, not a new single point
+                // of failure. A missing/wedged ffmpeg path must not turn a valid
+                // structural JPEG into HomeKit's black error placeholder. Leave
+                // it unverified so a later request can retry the probe.
+                if (this.now() >= this.nextVisualProbeWarningAt) {
+                    this.nextVisualProbeWarningAt = this.now() + 30_000;
+                    dbg('snapshot visual probe unavailable', this.src.tag(), label,
+                        (error as Error)?.message);
+                }
+                return false;
+            }
+            if (isVisuallyBlankSnapshot(metrics)) {
+                dbg('snapshot visual blank rejected', this.src.tag(), label, {
+                    mean: Number(metrics.mean.toFixed(2)),
+                    p99: metrics.p99,
+                    darkFraction: Number(metrics.darkFraction.toFixed(4)),
+                    stddev: Number(metrics.stddev.toFixed(2)),
+                    meanGradient: Number(metrics.meanGradient.toFixed(2)),
+                });
+                throw new Error(`${label} is visually blank`);
+            }
+        }
+        this.visuallyVerified.add(jpeg);
+        return true;
+    }
+
     private rememberResized(
         key: string,
         srcId: number,
@@ -335,6 +559,9 @@ export class SnapshotManager {
             const dimensions = jpegDimensions(jpeg);
             throw new Error(`resize returned wrong dimensions (${dimensions?.width || 0}x${dimensions?.height || 0})`);
         }
+        // A fail-open visual probe may deliver this image for the current
+        // request, but it must not become a persistent exact-size fallback.
+        if (!this.visuallyVerified.has(jpeg)) return;
         if (generation !== this.generation || this.latestResizeOperation.get(key) !== operation) return;
         this.resized.set(key, { srcId, jpeg });
         if (this.resized.size > 8) this.resized.delete(this.resized.keys().next().value!);
@@ -343,9 +570,45 @@ export class SnapshotManager {
     /** Refresh the low-resolution native safety image at low frequency. It is
      * deliberately separate from the full-resolution cache: warming HomeKit
      * must not downgrade an unrelated no-size snapshot for an entire TTL. */
-    private ensureNativePreview(): void {
-        this.getNativePreview().catch(e =>
-            dbg('snapshot native warm failed', this.src.tag(), (e as Error)?.message));
+    private ensureNativePreview(force = false): void {
+        if (force) {
+            this.nativeWarmFailures = 0;
+            this.nativeWarmRetryAt = 0;
+        } else if (this.now() < this.nativeWarmRetryAt) {
+            return;
+        }
+        const promise = this.getNativePreview();
+        const holder = this.nativePreviewInflight;
+        if (!holder || holder.promise !== promise) return;
+        if (!holder.warmAttempt) {
+            holder.warmAttempt = {
+                generation: holder.generation,
+                pending: 1,
+                succeeded: false,
+            };
+        }
+        if (!holder.warmLogAttached) {
+            holder.warmLogAttached = true;
+            promise.catch(e =>
+                dbg('snapshot native warm failed', this.src.tag(), (e as Error)?.message));
+        }
+    }
+
+    private finishNativeWarmAttempt(holder: NativePreviewInflight, succeeded: boolean): void {
+        const attempt = holder.warmAttempt;
+        if (!attempt) return;
+        holder.warmAttempt = undefined;
+        attempt.succeeded ||= succeeded;
+        attempt.pending--;
+        if (attempt.pending > 0 || attempt.generation !== this.generation) return;
+        if (attempt.succeeded) {
+            this.nativeWarmFailures = 0;
+            this.nativeWarmRetryAt = 0;
+            return;
+        }
+        const index = Math.min(this.nativeWarmFailures, NATIVE_WARM_BACKOFF_MS.length - 1);
+        this.nativeWarmFailures++;
+        this.nativeWarmRetryAt = this.now() + NATIVE_WARM_BACKOFF_MS[index];
     }
 
     /** Return one fresh native still, coalescing the warm hedge with a cold
@@ -360,14 +623,29 @@ export class SnapshotManager {
             return Promise.resolve(this.nativePreview);
         if (reuseInflight && this.nativePreviewInflight?.generation === generation)
             return this.nativePreviewInflight.promise;
-        const holder = { generation, promise: undefined as unknown as Promise<SnapFrame> };
+        const inheritedWarmAttempt = !reuseInflight
+            && this.nativePreviewInflight?.generation === generation
+            ? this.nativePreviewInflight.warmAttempt
+            : undefined;
+        if (inheritedWarmAttempt) inheritedWarmAttempt.pending++;
+        const holder: NativePreviewInflight = {
+            generation,
+            promise: undefined as unknown as Promise<SnapFrame>,
+            warmAttempt: inheritedWarmAttempt,
+        };
         holder.promise = this.captureMjpgJpeg(generation).then(jpeg => {
             const frame: SnapFrame = { id: ++this.nextFrameId, ts: this.now(), jpeg, source: 'native' };
-            if (generation === this.generation && this.nativePreviewInflight === holder) {
+            this.finishNativeWarmAttempt(holder, true);
+            if (generation === this.generation
+                && this.nativePreviewInflight === holder
+                && this.visuallyVerified.has(jpeg)) {
                 this.nativePreview = frame;
                 this.nativePreviewGeneration = generation;
             }
             return frame;
+        }, error => {
+            this.finishNativeWarmAttempt(holder, false);
+            throw error;
         }).finally(() => {
             if (this.nativePreviewInflight === holder) this.nativePreviewInflight = undefined;
         });
@@ -480,6 +758,7 @@ export class SnapshotManager {
         const promise = (async () => {
             try {
                 const out = await withTimeout(raw, resizeTimeout, 'snapshot resize');
+                await this.verifyVisual(out, 'snapshot resize');
                 this.rememberResized(key, srcId, out, generation, operation, options);
                 if (trace) trace.resizePath = this.options.resizeJpeg ? 'injected-primary' : 'image-worker';
                 return out;
@@ -511,6 +790,7 @@ export class SnapshotManager {
                 }
                 try {
                     const normalized = await this.normalizeFallbackJpeg(fallback, options);
+                    await this.verifyVisual(normalized, 'snapshot exact-size fallback');
                     this.rememberResized(key, srcId, normalized, generation, operation, options);
                     if (trace) trace.resizePath = 'ffmpeg-fallback';
                     return normalized;
@@ -579,6 +859,12 @@ export class SnapshotManager {
                             Math.min(fallbackLimit, remaining),
                         );
                         if (this.matchesRequestedSize(normalized, options)) {
+                            const visualBudget = Math.floor(started + budget - Date.now());
+                            if (visualBudget <= 0)
+                                throw new Error('snapshot request deadline exhausted before visual validation');
+                            await this.verifyVisual(normalized, 'snapshot deadline fallback', visualBudget);
+                            if (Date.now() > started + budget)
+                                throw new Error('snapshot request deadline exhausted during visual validation');
                             if (trace) trace.resizePath = 'deadline-ffmpeg-fallback';
                             return normalized;
                         }
@@ -620,13 +906,19 @@ export class SnapshotManager {
         // Event requests must be current by SDK contract. Even a valid cached
         // stream keyframe can be up to one GOP old, so use a fresh native still.
         if (this.src.fullResEnabled() && lane !== 'event') {
+            const fullResTimeout = this.options.fullResTimeoutMs
+                ?? (fastPreview ? FAST_KEYFRAME_TIMEOUT_MS : FULL_RES_SNAPSHOT_TIMEOUT_MS);
+            const fullResDeadline = Date.now() + fullResTimeout;
             try {
                 const jpeg = await withTimeout(
-                    this.captureFullResJpeg(fastPreview),
-                    this.options.fullResTimeoutMs ?? (fastPreview ? FAST_KEYFRAME_TIMEOUT_MS : FULL_RES_SNAPSHOT_TIMEOUT_MS),
+                    this.captureFullResJpeg(fastPreview, fullResDeadline),
+                    fullResTimeout,
                     'full-res snapshot',
                 );
-                if (isUsableJpeg(jpeg.jpeg)) return this.remember(jpeg.jpeg, generation, lane, jpeg.source);
+                if (isUsableJpeg(jpeg.jpeg)) {
+                    await this.verifyVisual(jpeg.jpeg, `${jpeg.source} snapshot`);
+                    return this.remember(jpeg.jpeg, generation, lane, jpeg.source);
+                }
                 this.src.warn(`full-res snapshot invalid (${jpeg.jpeg.length}B), treating as broken`);
             } catch (e) {
                 dbg('full-res snapshot failed/slow', this.src.tag(), (e as Error)?.message);
@@ -666,7 +958,10 @@ export class SnapshotManager {
         source: SnapshotCaptureSource,
     ): SnapFrame {
         const frame: SnapFrame = { id: ++this.nextFrameId, ts: this.now(), jpeg, source };
-        if (generation === this.generation) {
+        // A structurally valid image is still delivered when the visual oracle
+        // is temporarily unavailable, but only certified bytes may become raw,
+        // preview, or last-good state.
+        if (generation === this.generation && this.visuallyVerified.has(jpeg)) {
             if (lane === 'preview') this.previewCache = frame;
             else if (lane === 'full') this.cache = frame;
             this.lastGood = frame;
@@ -681,6 +976,7 @@ export class SnapshotManager {
             'native snapshot',
         );
         if (!isUsableJpeg(jpeg)) throw new Error(`native snapshot returned invalid jpeg (${jpeg?.length || 0}B)`);
+        await this.verifyVisual(jpeg, 'native snapshot');
         return jpeg;
     }
 
@@ -695,6 +991,7 @@ export class SnapshotManager {
         const timeoutMs = Math.max(1, Math.floor(
             timeoutOverrideMs ?? this.options.fallbackResizeTimeoutMs ?? FALLBACK_RESIZE_TIMEOUT_MS,
         ));
+        const deadline = Date.now() + timeoutMs;
         return new Promise<Buffer>((resolve, reject) => {
             let settled = false;
             let abandoned = false;
@@ -720,15 +1017,20 @@ export class SnapshotManager {
                 }
                 const w = options.picture?.width, h = options.picture?.height;
                 if (!w && !h) return jpeg;
-                const { mediaManager } = scryptedMedia();
-                const ffmpegPath = await mediaManager.getFFmpegPath();
+                const getFfmpegPath = this.options.getFfmpegPath
+                    ?? (() => scryptedMedia().mediaManager.getFFmpegPath());
+                const ffmpegPath = await getFfmpegPath();
                 // The path lookup may itself be a remote RPC. Do not spawn a
                 // process if its caller's deadline elapsed while it was pending.
-                if (abandoned) throw new Error('snapshot fallback resize abandoned');
+                // Check wall time too: after an event-loop stall, promise
+                // continuations run before the already-overdue timeout callback.
+                if (abandoned || settled || Date.now() >= deadline)
+                    throw new Error('snapshot fallback resize abandoned');
                 const width = w && Number.isFinite(w) && w > 0 ? Math.round(w) : -2;
                 const height = h && Number.isFinite(h) && h > 0 ? Math.round(h) : -2;
                 return new Promise<Buffer>((resolveChild, rejectChild) => {
-                    const cp = child = spawn(ffmpegPath, [
+                    const spawnFfmpeg = this.options.spawnFfmpeg ?? spawn;
+                    const cp = child = spawnFfmpeg(ffmpegPath, [
                         '-hide_banner', '-loglevel', 'error',
                         '-f', 'mjpeg', '-i', 'pipe:0',
                         '-frames:v', '1', '-vf', `scale=${width}:${height}`,
@@ -763,14 +1065,20 @@ export class SnapshotManager {
      *  still fall back to spinning up the stream; preview clients may not. */
     private async captureFullResJpeg(
         fastPreview: boolean,
+        deadline: number,
     ): Promise<{ jpeg: Buffer; source: 'keyframe' | 'stream' }> {
         const kf = this.src.latestKeyframe();
         if (kf && this.now() - kf.ts < KEYFRAME_SNAPSHOT_MAX_AGE_MS) {
             try {
                 const annexb = kf.annexb();
+                const remaining = Math.floor(deadline - Date.now());
+                if (remaining <= 0) throw new Error('keyframe decode deadline exhausted');
                 const jpeg = this.options.decodeKeyframeToJpeg
                     ? await this.options.decodeKeyframeToJpeg(annexb)
-                    : await this.decodeKeyframeToJpeg(annexb, fastPreview ? 900 : 2500);
+                    : await this.decodeKeyframeToJpeg(
+                        annexb,
+                        Math.min(remaining, fastPreview ? 900 : 2500),
+                    );
                 if (isUsableJpeg(jpeg)) {
                     dbg('captureFullResJpeg', this.src.tag(), 'keyframe', jpeg.length);
                     return { jpeg, source: 'keyframe' };
@@ -787,28 +1095,63 @@ export class SnapshotManager {
 
     /** One-shot decode of an Annex-B H.264 keyframe to a JPEG via ffmpeg. */
     private async decodeKeyframeToJpeg(annexb: Buffer, timeoutMs: number): Promise<Buffer> {
-        const { mediaManager } = scryptedMedia();
-        const ffmpegPath = await mediaManager.getFFmpegPath();
+        const budget = Math.max(1, Math.floor(timeoutMs));
+        const deadline = Date.now() + budget;
         return new Promise<Buffer>((resolve, reject) => {
-            // stderr is discarded, not piped: an unread pipe fills at ~64KB and
-            // blocks ffmpeg, turning a chatty decode failure into a guaranteed
-            // wait for the SIGKILL timeout below.
-            const cp = spawn(ffmpegPath, [
-                '-hide_banner', '-loglevel', 'error',
-                '-f', 'h264', '-i', 'pipe:0', '-frames:v', '1', '-f', 'mjpeg', 'pipe:1',
-            ], { stdio: ['pipe', 'pipe', 'ignore'] });
-            const chunks: Buffer[] = [];
-            const timer = setTimeout(() => { try { cp.kill('SIGKILL'); } catch { } reject(new Error('keyframe decode timeout')); }, timeoutMs);
-            cp.stdout.on('data', d => chunks.push(d));
-            cp.on('error', e => { clearTimeout(timer); reject(e); });
-            cp.on('close', code => {
+            let settled = false;
+            let abandoned = false;
+            let child: ReturnType<typeof spawn> | undefined;
+            const finish = (error?: Error, out?: Buffer) => {
+                if (settled) return;
+                settled = true;
                 clearTimeout(timer);
-                const out = Buffer.concat(chunks);
-                if (code !== 0) return reject(new Error(`keyframe decode exited ${code}`));
-                isUsableJpeg(out) ? resolve(out) : reject(new Error(`invalid jpeg from keyframe decode (${out.length}B)`));
-            });
-            cp.stdin.on('error', () => { });
-            cp.stdin.end(annexb);
+                error ? reject(error) : resolve(out!);
+            };
+            const timer = setTimeout(() => {
+                abandoned = true;
+                try { child?.kill('SIGKILL'); } catch { }
+                finish(new Error(`keyframe decode timed out after ${budget}ms`));
+            }, budget);
+            const work = async () => {
+                const getFfmpegPath = this.options.getFfmpegPath
+                    ?? (() => scryptedMedia().mediaManager.getFFmpegPath());
+                const ffmpegPath = await getFfmpegPath();
+                // The path lookup may be a remote media-manager RPC. The outer
+                // full-resolution deadline can expire while it is pending.
+                // Promise microtasks beat overdue timers after an event-loop
+                // stall, so the timeout flag alone is insufficient here.
+                if (abandoned || settled || Date.now() >= deadline)
+                    throw new Error('keyframe decode abandoned');
+                const spawnFfmpeg = this.options.spawnFfmpeg ?? spawn;
+                return new Promise<Buffer>((resolveChild, rejectChild) => {
+                    // stderr is discarded, not piped: an unread pipe fills at
+                    // ~64KB and blocks ffmpeg.
+                    const cp = child = spawnFfmpeg(ffmpegPath, [
+                        '-hide_banner', '-loglevel', 'error',
+                        '-f', 'h264', '-i', 'pipe:0',
+                        '-frames:v', '1', '-f', 'mjpeg', 'pipe:1',
+                    ], { stdio: ['pipe', 'pipe', 'ignore'] });
+                    const chunks: Buffer[] = [];
+                    let childSettled = false;
+                    const finishChild = (error?: Error, out?: Buffer) => {
+                        if (childSettled) return;
+                        childSettled = true;
+                        error ? rejectChild(error) : resolveChild(out!);
+                    };
+                    cp.stdout.on('data', d => chunks.push(d));
+                    cp.on('error', e => finishChild(e));
+                    cp.on('close', code => {
+                        const out = Buffer.concat(chunks);
+                        if (code !== 0) return finishChild(new Error(`keyframe decode exited ${code}`));
+                        isUsableJpeg(out)
+                            ? finishChild(undefined, out)
+                            : finishChild(new Error(`invalid jpeg from keyframe decode (${out.length}B)`));
+                    });
+                    cp.stdin.on('error', () => { });
+                    cp.stdin.end(annexb);
+                });
+            };
+            work().then(out => finish(undefined, out), error => finish(error));
         });
     }
 }

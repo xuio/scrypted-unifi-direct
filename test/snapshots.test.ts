@@ -370,6 +370,133 @@ test('warm is idempotent and coalesces the first camera still', async () => {
     assert.equal(calls, 1);
 });
 
+test('failed speculative warming backs off while demand capture still retries', async () => {
+    let now = 0;
+    let calls = 0;
+    const manager = new SnapshotManager(source({
+        mjpgSnapshot: async () => {
+            calls++;
+            return Buffer.from('camera offline');
+        },
+    }), { now: () => now });
+
+    (manager as any).ensureNativePreview();
+    const firstWarm = (manager as any).nativePreviewInflight.promise as Promise<unknown>;
+    await assert.rejects(firstWarm, /invalid jpeg/);
+    assert.equal(calls, 1);
+
+    (manager as any).ensureNativePreview();
+    assert.equal(calls, 1, 'warm retried inside its one-second backoff');
+
+    await assert.rejects(
+        manager.getFrame({ reason: 'periodic', picture: { width: 320, height: 180 } }),
+        /invalid jpeg/,
+    );
+    assert.equal(calls, 2, 'a demand capture incorrectly inherited speculative backoff');
+
+    now = 1001;
+    (manager as any).ensureNativePreview();
+    const retryWarm = (manager as any).nativePreviewInflight.promise as Promise<unknown>;
+    await assert.rejects(retryWarm, /invalid jpeg/);
+    assert.equal(calls, 3);
+});
+
+test('failed event replacement preserves the speculative warm backoff when both captures fail', async () => {
+    let now = 0;
+    let calls = 0;
+    const rejectors: Array<(reason?: unknown) => void> = [];
+    const manager = new SnapshotManager(source({
+        mjpgSnapshot: async () => {
+            calls++;
+            return new Promise<Buffer>((_resolve, reject) => rejectors.push(reject));
+        },
+    }), { now: () => now });
+
+    manager.warm();
+    const warm = (manager as any).nativePreviewInflight.promise as Promise<unknown>;
+    const event = manager.getFrame({
+        reason: 'event',
+        picture: { width: 320, height: 180 },
+    });
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(calls, 2, 'event did not replace the speculative native capture');
+
+    rejectors[0](new Error('warm camera request failed'));
+    await assert.rejects(warm, /warm camera request failed/);
+    rejectors[1](new Error('event camera request failed'));
+    await assert.rejects(event, /event camera request failed/);
+
+    (manager as any).ensureNativePreview();
+    assert.equal(calls, 2, 'both failed captures lost the speculative one-second backoff');
+
+    now = 1001;
+    (manager as any).ensureNativePreview();
+    const retry = (manager as any).nativePreviewInflight.promise as Promise<unknown>;
+    assert.equal(calls, 3);
+    rejectors[2](new Error('retry failed'));
+    await assert.rejects(retry, /retry failed/);
+});
+
+test('keyframe ffmpeg path lookup is bounded and cannot spawn after the capture deadline', async () => {
+    let resolvePath!: (path: string) => void;
+    const path = new Promise<string>(resolve => { resolvePath = resolve; });
+    let spawnCalls = 0;
+    const fallback = jpeg(19);
+    const manager = new SnapshotManager(source({
+        fullResEnabled: () => true,
+        cacheTtlMs: () => 0,
+        latestKeyframe: () => ({
+            ts: 1000,
+            annexb: () => Buffer.from([0, 0, 0, 1, 0x65]),
+        }),
+        mjpgSnapshot: async () => fallback,
+    }), {
+        now: () => 1000,
+        fullResTimeoutMs: 10,
+        getFfmpegPath: async () => path,
+        spawnFfmpeg: (() => {
+            spawnCalls++;
+            throw new Error('late ffmpeg spawn');
+        }) as typeof import('child_process').spawn,
+    });
+
+    const pending = manager.getFrame({
+        reason: 'periodic',
+        picture: { width: 320, height: 180 },
+    });
+    resolvePath('/unused/ffmpeg');
+    const stalledUntil = Date.now() + 30;
+    while (Date.now() < stalledUntil) { /* reproduce microtask-before-overdue-timer ordering */ }
+
+    assert.strictEqual((await pending).jpeg, fallback);
+    assert.equal(spawnCalls, 0, 'ffmpeg spawned after the request had fallen back to the native still');
+});
+
+test('fallback resize path lookup cannot spawn after an event-loop-stalled deadline', async () => {
+    let resolvePath!: (path: string) => void;
+    const path = new Promise<string>(resolve => { resolvePath = resolve; });
+    let spawnCalls = 0;
+    const manager = new SnapshotManager(source(), {
+        getFfmpegPath: async () => path,
+        spawnFfmpeg: (() => {
+            spawnCalls++;
+            throw new Error('late ffmpeg spawn');
+        }) as typeof import('child_process').spawn,
+    });
+
+    const pending = (manager as any).normalizeFallbackJpeg(
+        jpeg(20),
+        { picture: { width: 320, height: 180 } },
+        10,
+    ) as Promise<Buffer>;
+    resolvePath('/unused/ffmpeg');
+    const stalledUntil = Date.now() + 30;
+    while (Date.now() < stalledUntil) { /* promise continuation runs before overdue timer */ }
+
+    await assert.rejects(pending, /abandoned|timed out/);
+    assert.equal(spawnCalls, 0, 'fallback ffmpeg spawned after its absolute deadline');
+});
+
 test('a preview never joins a cold full-resolution capture', async () => {
     let streamCalls = 0;
     let nativeCalls = 0;

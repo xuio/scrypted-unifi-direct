@@ -3,10 +3,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     isUsableJpeg,
+    isVisuallyBlankSnapshot,
     jpegDimensions,
     SnapshotManager,
     SnapshotRequestTrace,
     SnapshotSource,
+    visualMetricsFromGray,
 } from '../src/snapshots';
 
 /*
@@ -45,6 +47,36 @@ const PERIODIC_320 = {
     reason: 'periodic',
     picture: { width: 320, height: 180 },
 } as any;
+
+const BLANK_METRICS = {
+    mean: 0,
+    p99: 0,
+    darkFraction: 1,
+    stddev: 0,
+    meanGradient: 0,
+};
+const GOOD_METRICS = {
+    mean: 64,
+    p99: 128,
+    darkFraction: 0.05,
+    stddev: 20,
+    meanGradient: 12,
+};
+
+test('visual classifier rejects uniform black but preserves a dark scene with edges', () => {
+    const black = visualMetricsFromGray(Buffer.alloc(64 * 64));
+    assert.equal(isVisuallyBlankSnapshot(black), true);
+
+    const darkScene = Buffer.alloc(64 * 64, 8);
+    for (let y = 0; y < 64; y++) {
+        for (let x = 0; x < 64; x++) {
+            if ((x + y) % 7 === 0) darkScene[y * 64 + x] = 40;
+        }
+    }
+    const darkMetrics = visualMetricsFromGray(darkScene);
+    assert.equal(isVisuallyBlankSnapshot(darkMetrics), false);
+    assert.ok(darkMetrics.mean < 16, 'fixture stopped representing a dark scene');
+});
 
 test('decoder-valid low-complexity 320x180 JPEG is accepted', () => {
     assert.equal(REAL_JPEG_320_LOW.length, 583);
@@ -186,4 +218,182 @@ test('snapshot trace identifies last-good recovery instead of the frame original
     assert.equal(recovered.framePath, 'capture');
     assert.equal(recovered.captureSource, 'last-good');
     assert.match(recovered.captureError || '', /invalid jpeg/);
+});
+
+test('decoder-valid black keyframe is rejected in favor of a verified native still', async () => {
+    const black = Buffer.from(REAL_JPEG_640_LOW);
+    const native = Buffer.from(REAL_JPEG_640_LOW);
+    let nativeCalls = 0;
+    const manager = new SnapshotManager(source({
+        fullResEnabled: () => true,
+        cacheTtlMs: () => 0,
+        latestKeyframe: () => ({
+            ts: 1000,
+            annexb: () => Buffer.from([0, 0, 0, 1, 0x65]),
+        }),
+        mjpgSnapshot: async () => {
+            nativeCalls++;
+            return native;
+        },
+    }), {
+        now: () => 1000,
+        decodeKeyframeToJpeg: async () => black,
+        inspectJpeg: async jpeg => jpeg === black ? BLANK_METRICS : GOOD_METRICS,
+    });
+
+    const frame = await manager.getFrame(PERIODIC_320);
+    assert.strictEqual(frame.jpeg, native);
+    assert.equal(frame.source, 'native');
+    assert.equal(nativeCalls, 1);
+});
+
+test('black native refresh cannot poison preview or last-good caches', async () => {
+    const good = Buffer.from(REAL_JPEG_640_LOW);
+    const black = Buffer.from(REAL_JPEG_640_LOW);
+    let captures = 0;
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 0,
+        mjpgSnapshot: async () => ++captures === 1 ? good : black,
+    }), {
+        inspectJpeg: async jpeg => jpeg === black ? BLANK_METRICS : GOOD_METRICS,
+    });
+
+    assert.strictEqual((await manager.getFrame(PERIODIC_320)).jpeg, good);
+    const recovered = await manager.getFrame(PERIODIC_320);
+    assert.strictEqual(recovered.jpeg, good);
+    assert.equal(recovered.source, 'native');
+    assert.equal(captures, 2);
+});
+
+test('black primary resize is rejected and never admitted to the exact-size cache', async () => {
+    const sourceFrame = Buffer.from(REAL_JPEG_640_LOW);
+    const black = Buffer.from(REAL_JPEG_320_LOW);
+    const fallback = Buffer.from(REAL_JPEG_320_LOW);
+    let primaryCalls = 0;
+    let fallbackCalls = 0;
+    const manager = new SnapshotManager(source(), {
+        resizeJpeg: async () => {
+            primaryCalls++;
+            return black;
+        },
+        fallbackResizeJpeg: async () => {
+            fallbackCalls++;
+            return fallback;
+        },
+        inspectJpeg: async jpeg => jpeg === black ? BLANK_METRICS : GOOD_METRICS,
+    });
+    const frame = { ts: 1, jpeg: sourceFrame };
+
+    assert.strictEqual(await manager.resizeFor(frame, PERIODIC_320), fallback);
+    assert.strictEqual(await manager.resizeFor(frame, PERIODIC_320), fallback);
+    assert.equal(primaryCalls, 1);
+    assert.equal(fallbackCalls, 1);
+});
+
+test('event snapshots reject a black native frame instead of returning stale content', async () => {
+    const good = Buffer.from(REAL_JPEG_640_LOW);
+    const black = Buffer.from(REAL_JPEG_640_LOW);
+    let captures = 0;
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 0,
+        mjpgSnapshot: async () => ++captures === 1 ? good : black,
+    }), {
+        inspectJpeg: async jpeg => jpeg === black ? BLANK_METRICS : GOOD_METRICS,
+    });
+
+    await manager.getFrame(PERIODIC_320);
+    await assert.rejects(
+        manager.getFrame({ reason: 'event', picture: { width: 320, height: 180 } } as any),
+        /visually blank/,
+    );
+});
+
+test('visual-probe infrastructure failure is fail-open and retried later', async () => {
+    const good = Buffer.from(REAL_JPEG_640_LOW);
+    let probes = 0;
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 0,
+        mjpgSnapshot: async () => good,
+    }), {
+        inspectJpeg: async () => {
+            probes++;
+            throw new Error('ffmpeg path unavailable');
+        },
+    });
+
+    assert.strictEqual((await manager.getFrame(PERIODIC_320)).jpeg, good);
+    assert.strictEqual((await manager.getFrame(PERIODIC_320)).jpeg, good);
+    assert.equal(probes, 2, 'an unavailable probe was incorrectly marked verified');
+});
+
+test('fail-open visual delivery never becomes raw, native, or last-good cache state', async () => {
+    const candidate = Buffer.from(REAL_JPEG_640_LOW);
+    let captures = 0;
+    let probes = 0;
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 1000,
+        mjpgSnapshot: async () => {
+            captures++;
+            return candidate;
+        },
+    }), {
+        inspectJpeg: async () => {
+            probes++;
+            if (probes === 1) throw new Error('visual oracle temporarily unavailable');
+            return GOOD_METRICS;
+        },
+    });
+
+    assert.strictEqual((await manager.getFrame(PERIODIC_320)).jpeg, candidate);
+    assert.equal((manager as any).previewCache, undefined);
+    assert.equal((manager as any).cache, undefined);
+    assert.equal((manager as any).nativePreview, undefined);
+    assert.equal((manager as any).lastGood, undefined);
+
+    assert.strictEqual((await manager.getFrame(PERIODIC_320)).jpeg, candidate);
+    assert.equal(captures, 2, 'an unverified frame suppressed a fresh camera capture');
+    assert.equal(probes, 2, 'an unverified frame was not re-probed');
+    assert.ok((manager as any).previewCache);
+    assert.ok((manager as any).nativePreview);
+    assert.ok((manager as any).lastGood);
+});
+
+test('fail-open resized delivery is re-probed instead of cached', async () => {
+    const candidate = Buffer.from(REAL_JPEG_320_LOW);
+    let resizes = 0;
+    let probes = 0;
+    const manager = new SnapshotManager(source(), {
+        resizeJpeg: async () => {
+            resizes++;
+            return candidate;
+        },
+        inspectJpeg: async () => {
+            probes++;
+            if (probes === 1) throw new Error('visual oracle temporarily unavailable');
+            return GOOD_METRICS;
+        },
+    });
+    const frame = { ts: 1, jpeg: REAL_JPEG_640_LOW };
+
+    assert.strictEqual(await manager.resizeFor(frame, PERIODIC_320), candidate);
+    assert.equal((manager as any).resized.size, 0);
+    assert.strictEqual(await manager.resizeFor(frame, PERIODIC_320), candidate);
+    assert.equal(resizes, 2, 'an unverified resized image was admitted to the cache');
+    assert.equal(probes, 2);
+    assert.equal((manager as any).resized.size, 1);
+});
+
+test('a wedged visual probe cannot become an unbounded snapshot dependency', async () => {
+    const good = Buffer.from(REAL_JPEG_640_LOW);
+    const manager = new SnapshotManager(source({
+        cacheTtlMs: () => 0,
+        mjpgSnapshot: async () => good,
+    }), {
+        visualProbeTimeoutMs: 10,
+        inspectJpeg: async () => new Promise(() => { }),
+    });
+
+    const started = Date.now();
+    assert.strictEqual((await manager.getFrame(PERIODIC_320)).jpeg, good);
+    assert.ok(Date.now() - started < 100, 'visual probe exceeded its bounded fail-open budget');
 });
