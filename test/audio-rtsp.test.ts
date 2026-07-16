@@ -3,10 +3,16 @@ import assert from 'node:assert/strict';
 import net from 'net';
 import { once } from 'events';
 import { AudioRtspServer } from '../src/audio-rtsp';
-import { RtspServeHandle } from '../src/rtsp-session';
+import { RtspServeHandle, ServedAudioParams } from '../src/rtsp-session';
 
 /** Fake muxer serve handle: lets tests emit audio packets and kill the "stream". */
-function fakeHandle() {
+function fakeHandle(audioParams: ServedAudioParams = {
+    codec: 'aac',
+    rate: 16000,
+    channels: 1,
+    frameSamples: 1024,
+    config: Buffer.from([0x14, 0x08]),
+}) {
     const subs = new Set<{ fn: (pkt: Buffer) => void; onEnd?: () => void }>();
     const handle: RtspServeHandle = {
         url: 'rtsp://127.0.0.1:0/fake',
@@ -14,7 +20,7 @@ function fakeHandle() {
         clientCount: 0,
         alive: true,
         latestKeyframe: () => undefined,
-        audioParams: () => ({ rate: 16000, channels: 1, config: Buffer.from([0x14, 0x08]) }),
+        audioParams: () => audioParams,
         subscribeAudio: (fn, onEnd) => {
             const sub = { fn, onEnd };
             subs.add(sub);
@@ -99,6 +105,34 @@ test('serves audio-only SDP and relays tapped packets after PLAY', async t => {
     assert.equal(b[1], 0);
     assert.equal(b.readUInt16BE(2), pkt.length);
     assert.ok(b.subarray(4, 4 + pkt.length).equals(pkt));
+});
+
+test('stable audio endpoint identifies Opus and never labels it as AAC', async t => {
+    const fake = fakeHandle({
+        codec: 'opus',
+        rate: 48000,
+        channels: 1,
+        frameSamples: 960,
+        bitRate: 128000,
+        frameDurationMs: 20,
+    });
+    const server = await makeServer(t, async () => fake.handle);
+    const c = makeClient(server.boundPort!);
+    await once(c.sock, 'connect');
+    t.after(() => c.sock.destroy());
+
+    await c.request('DESCRIBE rtsp://127.0.0.1/AABBCCDDEEFF RTSP/1.0\r\nCSeq: 1\r\n\r\n');
+    const deadline = Date.now() + 1000;
+    while (!c.readBuf().toString().includes('a=maxptime:20') && Date.now() < deadline)
+        await new Promise(r => setTimeout(r, 10));
+    const sdp = c.readBuf().toString();
+    assert.match(sdp, /a=rtpmap:97 opus\/48000\/2/);
+    assert.match(sdp, /maxaveragebitrate=128000/);
+    assert.match(sdp, /sprop-maxcapturerate=32000/);
+    assert.match(sdp, /stereo=0;sprop-stereo=0;cbr=1;useinbandfec=0;usedtx=0/);
+    assert.match(sdp, /a=control:trackID=0/);
+    assert.ok(!sdp.includes('MPEG4-GENERIC'));
+    assert.ok(!sdp.includes('config='));
 });
 
 test('unknown camera path gets 404; resolver failure gets 503', async t => {

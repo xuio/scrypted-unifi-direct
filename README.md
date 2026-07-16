@@ -11,22 +11,25 @@ Protect cameras — it emulates the UniFi controller so each camera streams live
 Assistant, Google Home, or Scrypted NVR — no Protect NVR, Cloud Key, or Console
 required.
 
-Built and verified against **UVC G5 Turret Ultra** (firmware 5.3.90). Other UniFi /
-Ubiquiti camera models should work; model-specific capabilities are auto-detected
-and the settings surface adapts accordingly.
+Built against **UVC G5 Turret Ultra** firmware 5.3.90. The patched Opus profile
+has been booted and validated on camera hardware with the direct Scrypted path:
+mono 32 kHz capture, fullband Opus at 128 kbit/s CBR, standards-compliant 48 kHz
+RTP signaling, 20 ms packets, and exact +960 timestamps. Other UniFi / Ubiquiti
+camera models should work; model-specific capabilities are auto-detected and
+the settings surface adapts accordingly.
 
 ## Features
 
 | Feature | Status |
 |---|---|
 | **Live video** (H.264, up to 2688×1512) served as native RTSP — no transcoding, no ffmpeg in the media path | ✅ |
-| **Audio** (AAC) | ✅ |
+| **Audio** (standards-compliant mono Opus at 48 kHz RTP / 128 or 96 kbit/s CBR on validated patched firmware; AAC fallback) | ✅ |
 | **Snapshots** — full-resolution, decoded from the live keyframe like Protect does, with a configurable cache | ✅ |
 | **On-camera detections** — person / vehicle / animal / package + motion, as `ObjectDetector` / `MotionSensor` events | ✅ |
 | **Detection zones** — smart-detect, exclude, line-crossing, loiter, motion, and privacy masks, applied over the management channel | ✅ |
 | **Camera settings** — image (ISP), video (bitrate/fps/keyframe), audio, overlay (OSD), status light, name — with per-model capability gating | ✅ |
 | **Secondary stream** — optional concurrent 720p/360p stream per camera; map HomeKit to it in Rebroadcast so HomeKit **copies** a compatible stream instead of receiving the 4MP source above its 1080p cap | ✅ |
-| **Audio-only RTSP endpoint** — stable native-AAC URL per camera (`rtsp://host:17553/<MAC>`) for soundscape analyzers like **BirdNET-Go**, no video bytes on the wire; legacy and mono 32 kHz / 128 kbps profiles supported | ✅ |
+| **Audio-only RTSP endpoint** — stable native-audio URL per camera (`rtsp://host:17553/<MAC>`) for soundscape analyzers like **BirdNET-Go**, no video bytes on the wire; Opus 48 kHz mono at 128 or 96 kbit/s and legacy AAC supported | ✅ |
 | **HomeKit** — works through Scrypted's HomeKit plugin (snapshots are sized per request so previews render correctly) | ✅ |
 
 ## How it works
@@ -42,7 +45,8 @@ controller:
    `extendedFlv` stream over TCP and strips UniFi's proprietary variable-length
    trailers back to standard FLV.
 3. **Native RTSP** (`src/native-rtsp.ts` + `src/rtsp-session.ts`) — the FLV is
-   demuxed and RTP-packetized in pure JS (H.264 RFC 6184, AAC RFC 3640) and served
+   demuxed and RTP-packetized in pure JS (H.264 RFC 6184, AAC RFC 3640, or Opus
+   RFC 7587) and served
    by an in-process RTSP server — no re-encode, no ffmpeg subprocess, no external
    media server. Scrypted connects to it like any RTSP camera.
 4. **Management commands** — settings, detection enables, and all zone types are
@@ -64,6 +68,10 @@ API of their own.
   `/api/1.1/` API).
 - The camera must be **un-adopted** from any other Protect controller (or you must
   be willing to point its `controller.addr` here).
+- The 48 kHz Opus path requires the matching patched G5 Turret Ultra firmware.
+  It has been validated on the target camera/firmware combination but remains a
+  custom image; retain a tested backup and recovery path before flashing another
+  device.
 
 ## Network security and trust model
 
@@ -121,11 +129,12 @@ the emulator TLS certificate.
   The endpoint has no RTSP authentication; follow the
   [network security guidance](#network-security-and-trust-model) when allowing
   access to TCP `17553`.
-- **AAC encoder** — supported cameras expose their native sample rate and bitrate.
-  Patched firmware can select mono **32 kHz / 128 kbps**; legacy 16 kHz and other
-  path-present firmware values remain supported. Available sample rates come from
-  the camera's capability list, and changing an encoder value rebuilds every track
-  so clients receive matching SDP/RTP parameters.
+- **Audio encoder** — supported cameras expose their native capture sample rate
+  and bitrate. Patched firmware selects Opus only for mono **32 kHz capture** at
+  **128 kbit/s CBR** or the validated **96 kbit/s** fallback. The published RTP
+  track is always Opus 48 kHz mono with 20 ms frames and a +960 timestamp step.
+  Other profiles retain the legacy AAC path. Changing an encoder value rebuilds
+  every track so clients receive matching SDP/RTP parameters.
 - **Zones** — add named zones; each gets a polygon editor plus only the fields its
   type uses. Applied live over the management channel and re-asserted on reconnect.
 - **Settings** — only controls the camera model actually supports are shown.
@@ -137,6 +146,11 @@ the emulator TLS certificate.
   full-res snapshot API); the low-res mjpg endpoint remains available as a fallback.
 - Verified primarily on the G5 Turret Ultra. Other models rely on capability
   auto-detection; please report gaps.
+- The 48 kHz/fullband/CBR Opus path has passed hardware boot, live decode, SDP,
+  RTP packet/timestamp, FFT, and short stability validation on one G5 Turret
+  Ultra. A longer multi-day soak and an exercised hardware recovery procedure
+  are still recommended before treating the custom firmware as production-safe
+  across additional devices.
 
 ## Operational backlog
 
@@ -149,7 +163,7 @@ the emulator TLS certificate.
 6. Review the running 24-hour post-deploy soak. Retain the configured 4-second GOP,
    adaptive bitrate, high-stream 10 Mbps cap / 9 Mbps motion floor / 10 Mbps client
    floor, medium 2 Mbps cap / firmware-clamped 1.5 Mbps motion floor / 2 Mbps client
-   floor, and AAC-LC mono 32 kHz / 128 kbps unless longer daylight data supports a
+   floor, and Opus mono 48 kHz RTP / 32 kHz capture / 128 kbit/s CBR unless longer daylight data supports a
    change.
 
 ## Development
@@ -186,7 +200,7 @@ the emulator TLS certificate.
 
   The monitor discovers loopback RTSP URLs from `/tmp/unifi-direct.log`, never
   writes their random path tokens to its result files, and resumes safely when
-  invoked again with the same run directory. Deep audio events retain AAC codec
+  invoked again with the same run directory. Deep audio events retain audio codec
   profile/object type plus observed encoded bitrate statistics while preserving
   the existing sample-rate/channel-layout summary. Use `--log` if the diagnostic
   log is elsewhere. The built-in FFmpeg default points to the Darwin ARM64 binary in

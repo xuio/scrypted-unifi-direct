@@ -1,7 +1,11 @@
 import dns from 'dns';
 import net from 'net';
 import { PassThrough } from 'stream';
-import type { ControllerEmulator } from './controller-emulator';
+import {
+    sameAudioProfile,
+    type ControllerEmulator,
+    type SerializerAudioProfile,
+} from './controller-emulator';
 import { PushPortRegistry, PushRoute } from './push-registry';
 import { RtspServeHandle } from './rtsp-session';
 import { startNativeServe } from './native-rtsp';
@@ -59,7 +63,7 @@ export function makeDetrailer() {
             if (buf.length < 11) break;
             const type = buf[0];
             // must be sitting on a tag header; if not, we desynced — inch forward.
-            if (type !== 8 && type !== 9 && type !== 18) { q.consume(1); continue; }
+            if (type !== 8 && type !== 9 && type !== 10 && type !== 18) { q.consume(1); continue; }
             const dataSize = (buf[1] << 16) | (buf[2] << 8) | buf[3];
             if (dataSize > MAX_TAG) { q.consume(1); continue; }
             const tagLen = 11 + dataSize + 4;
@@ -73,7 +77,7 @@ export function makeDetrailer() {
                 const np = tagLen + g;
                 if (np + 11 > buf.length) { pendingMore = true; break; }
                 const nt = buf[np];
-                if (nt !== 8 && nt !== 9 && nt !== 18) continue;
+                if (nt !== 8 && nt !== 9 && nt !== 10 && nt !== 18) continue;
                 const nds = (buf[np + 1] << 16) | (buf[np + 2] << 8) | buf[np + 3];
                 if (nds > MAX_TAG) continue;
                 const ne = np + 11 + nds;
@@ -158,6 +162,7 @@ export class DirectStream {
         private mac: string,
         private channel: string,
         private codec: string,
+        private requestedAudioProfile: SerializerAudioProfile,
         private selfIp: string,
         private cameraPort: number,
         /** The camera's configured host — the registry routes only its pushes
@@ -227,9 +232,26 @@ export class DirectStream {
     /** The underlying RTSP serve (audio-tap access for the audio endpoint). */
     get serveHandle() { return this.serve; }
 
-    /** True only when AAC was actually discovered and published in this
-     *  generation's SDP. Cameras with a disabled microphone serve video-only. */
+    /** True only when the selected audio codec was discovered and published in
+     * this generation's SDP. Cameras with a disabled microphone serve video-only. */
     get hasAudio() { return !!this.serve?.audioParams(); }
+    /** The exact codec this generation published, never merely the requested
+     * capability. Undefined means video-only. */
+    get audioCodec() { return this.serve?.audioParams()?.codec; }
+    /** Exact served audio parameters, verified from the sequence header and
+     * first packet rather than copied from requested capabilities. */
+    get audioParams() { return this.serve?.audioParams(); }
+    /** A stream may be reused only when both its request and any published track
+     * agree with the newly selected profile. Video-only is not treated as a
+     * contradictory publication (the microphone may simply be disabled). */
+    matchesAudioProfile(profile: SerializerAudioProfile) {
+        if (!sameAudioProfile(this.requestedAudioProfile, profile)) return false;
+        const published = this.serve?.audioParams();
+        if (!published) return true;
+        if (published.codec !== profile.codec) return false;
+        return profile.codec !== 'opus'
+            || (published.codec === 'opus' && published.bitRate === profile.bitRate);
+    }
 
     async start(): Promise<void> {
         try {
@@ -287,7 +309,14 @@ export class DirectStream {
         // Propagate a lost-management-session race immediately. Swallowing it
         // leaves start() waiting the full 25 seconds for a push that was never
         // commanded, while Scrypted could already be retrying a clean creation.
-        this.emulator.startStream(this.mac, this.channel, this.selfIp, this.cameraPort, this.codec);
+        this.emulator.startStream(
+            this.mac,
+            this.channel,
+            this.selfIp,
+            this.cameraPort,
+            this.codec,
+            this.requestedAudioProfile.codec,
+        );
         this.streaming = true;
     }
 
@@ -490,6 +519,10 @@ export class DirectStream {
             const servePromise = startNativeServe({
                 flv: steadyFlv,
                 hasAudio: true,
+                audioCodec: this.requestedAudioProfile.codec,
+                opusBitRate: this.requestedAudioProfile.codec === 'opus'
+                    ? this.requestedAudioProfile.bitRate
+                    : undefined,
                 audioGraceMs: AUDIO_GRACE_MS,
                 logger: this.logger,
                 onEgressPressure: paused => {

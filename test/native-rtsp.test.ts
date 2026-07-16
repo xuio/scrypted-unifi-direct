@@ -5,8 +5,9 @@ import { once } from 'events';
 import { performance } from 'perf_hooks';
 import { PassThrough } from 'stream';
 import {
-    FlvTagParser, parseAvcC, parseAsc, splitNals, toAnnexB,
-    LazyRtpKeyframe, PacedQueue, RtpTrack, packetizeH264, packetizeAac, buildSdp, startNativeServe,
+    FlvTagParser, parseAvcC, parseAsc, parseOpusConfig, parseOpusPacketProfile, opusPacketInfo,
+    splitNals, toAnnexB, LazyRtpKeyframe, PacedQueue, RtpTrack,
+    packetizeH264, packetizeAac, packetizeOpus, buildSdp, startNativeServe,
     type EgressPressureSample,
 } from '../src/native-rtsp';
 import { rng, randBytes, flvTag, flvHeader } from './helpers';
@@ -69,6 +70,12 @@ function makeAvcC(sps: Buffer, pps: Buffer, nalLenMinus1 = 3): Buffer {
 }
 const SPS = Buffer.from([0x67, 0x64, 0x00, 0x28, 0xac, 0x2b, 0x40]);   // profile high, level 4.0
 const PPS = Buffer.from([0x68, 0xee, 0x3c, 0x80]);
+const opusPacket = (length: 240 | 320, fill = 0x55) => {
+    const packet = Buffer.alloc(length, fill);
+    // CELT config 31, mono, one frame: fullband and exactly 20 ms at 48 kHz.
+    packet[0] = 0xf8;
+    return packet;
+};
 
 test('parseAvcC extracts SPS/PPS and NAL length size', () => {
     const v = parseAvcC(makeAvcC(SPS, PPS));
@@ -96,6 +103,7 @@ test('parseAsc decodes the camera 16kHz mono AAC-LC config', () => {
     // objectType=2 (AAC-LC), freqIdx=8 (16000), channels=1 → 0b00010_100 0b0_0001_000
     const a = parseAsc(Buffer.from([0x14, 0x08]));
     assert.ok(a);
+    assert.equal(a.codec, 'aac');
     assert.equal(a.rate, 16000);
     assert.equal(a.channels, 1);
     assert.equal(a.frameSamples, 1024);
@@ -105,6 +113,7 @@ test('parseAsc decodes patched-camera 32kHz mono AAC-LC config', () => {
     // objectType=2 (AAC-LC), freqIdx=5 (32000), channels=1.
     const a = parseAsc(Buffer.from([0x12, 0x88]));
     assert.ok(a);
+    assert.equal(a.codec, 'aac');
     assert.equal(a.rate, 32000);
     assert.equal(a.channels, 1);
     assert.equal(a.frameSamples, 1024);
@@ -134,6 +143,40 @@ test('parseAsc handles explicit-rate and rejects PCE-deferred channels', () => {
     // channels=0 (defined in PCE) must bail to video-only
     assert.equal(parseAsc(Buffer.from([0x14, 0x00])), undefined);
     void bits;
+});
+
+test('Opus config and packet validation enforce the patched firmware contract', () => {
+    assert.equal(parseOpusConfig(Buffer.from('cf000300', 'hex')), true);
+    assert.equal(parseOpusConfig(Buffer.from('cf000200', 'hex')), false);
+    assert.equal(parseOpusConfig(Buffer.from('cf00030000', 'hex')), false);
+
+    assert.deepEqual(opusPacketInfo(opusPacket(320)), {
+        frameCount: 1,
+        frameSamples: 960,
+        packetSamples: 960,
+        fullband: true,
+        stereo: false,
+    });
+    assert.deepEqual(parseOpusPacketProfile(opusPacket(320), 128000), {
+        codec: 'opus',
+        rate: 48000,
+        channels: 1,
+        frameSamples: 960,
+        bitRate: 128000,
+        frameDurationMs: 20,
+    });
+    assert.deepEqual(parseOpusPacketProfile(opusPacket(240), 96000), {
+        codec: 'opus',
+        rate: 48000,
+        channels: 1,
+        frameSamples: 960,
+        bitRate: 96000,
+        frameDurationMs: 20,
+    });
+    assert.equal(parseOpusPacketProfile(opusPacket(320), 96000), undefined);
+    const stereo = opusPacket(320);
+    stereo[0] |= 0x04;
+    assert.equal(parseOpusPacketProfile(stereo, 128000), undefined);
 });
 
 test('splitNals splits length-prefixed units and tolerates truncation', () => {
@@ -289,6 +332,19 @@ test('packetizeAac: an oversized AAC AU is fragmented below the RTP MTU', () => 
     assert.ok(Buffer.concat(parsed.map(p => p.payload.subarray(4))).equals(frame));
 });
 
+test('packetizeOpus carries exactly one raw Opus packet with no AAC headers', () => {
+    const frame = opusPacket(320);
+    const packets = packetizeOpus(new RtpTrack(97), frame, 960);
+    assert.equal(packets.length, 1);
+    const parsed = parseRtp(packets[0]);
+    assert.equal(parsed.pt, 97);
+    assert.equal(parsed.marker, false);
+    assert.equal(parsed.ts, 960);
+    assert.ok(parsed.payload.equals(frame));
+    assert.deepEqual(packetizeOpus(new RtpTrack(97), Buffer.alloc(0), 0), []);
+    assert.deepEqual(packetizeOpus(new RtpTrack(97), Buffer.alloc(1201), 0), []);
+});
+
 test('RtpTrack.senderReport maps RTP time to NTP and counts correctly', () => {
     const track = new RtpTrack(96);
     assert.equal(track.senderReport(), undefined, 'no SR before any packet');
@@ -434,6 +490,34 @@ test('missing optional AAC does not hold video publication for seconds', async (
     }
 });
 
+test('Opus startup requires an explicit bitrate and rejects an invalid first packet', async () => {
+    const missingProfile = new PassThrough();
+    await assert.rejects(
+        startNativeServe({ flv: missingProfile, hasAudio: true, audioCodec: 'opus' }),
+        /explicit 128000 or 96000 bps profile/,
+    );
+    missingProfile.destroy();
+
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({
+        flv,
+        hasAudio: true,
+        audioCodec: 'opus',
+        opusBitRate: 128000,
+        audioGraceMs: 10,
+    });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(10, 0, Buffer.from('cf000300', 'hex')),
+        // Wrong TOC/profile despite the expected CBR packet size.
+        flvTag(10, 0, Buffer.alloc(320, 0x01)),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+    await assert.rejects(servePromise, /destroyed during media discovery/);
+    assert.equal(flv.destroyed, true);
+});
+
 test('AAC RTP timestamps remain monotonic when FLV audio time jumps backward', async () => {
     const flv = new PassThrough();
     const servePromise = startNativeServe({ flv, hasAudio: true });
@@ -517,6 +601,89 @@ test('AAC clock preserves an exact one-frame loss at 32kHz', async () => {
         unsubscribe();
         serve.destroy();
     }
+});
+
+test('Opus type-10 packets stay raw and advance the 48k RTP clock by exactly 960', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({
+        flv,
+        hasAudio: true,
+        audioCodec: 'opus',
+        opusBitRate: 128000,
+    });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        // Patched serializers may still carry AAC tags. Explicit Opus selection
+        // must ignore them instead of publishing a mislabeled AAC track.
+        flvTag(8, 0, aacTagData(0, Buffer.from([0x14, 0x08]))),
+        flvTag(10, 0, Buffer.from('cf000300', 'hex')),
+        // The first packet proves the bitrate/profile before SDP publication.
+        flvTag(10, 0, opusPacket(320, 1)),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+
+    const serve = await servePromise;
+    const packets: Buffer[] = [];
+    const unsubscribe = serve.subscribeAudio(packet => packets.push(Buffer.from(packet)));
+    try {
+        assert.deepEqual(serve.audioParams(), {
+            codec: 'opus',
+            rate: 48000,
+            channels: 1,
+            frameSamples: 960,
+            bitRate: 128000,
+            frameDurationMs: 20,
+        });
+        const frames = [
+            opusPacket(320, 2),
+            opusPacket(320, 3),
+            opusPacket(320, 4),
+            opusPacket(320, 5),
+        ];
+        flv.write(Buffer.concat([
+            flvTag(10, 700, frames[0]),
+            flvTag(10, 720, frames[1]),
+            // A backward FLV reset must not perturb the RTP frame clock.
+            flvTag(10, 100, frames[2]),
+            flvTag(10, 120, frames[3]),
+        ]));
+        const deadline = Date.now() + 2500;
+        while (packets.length < frames.length && Date.now() < deadline)
+            await new Promise(r => setTimeout(r, 10));
+        assert.equal(packets.length, frames.length);
+        const parsed = packets.map(parseRtp);
+        assert.deepEqual(parsed.map(p => p.payload.length), [320, 320, 320, 320]);
+        assert.ok(parsed.every((p, i) => p.payload.equals(frames[i])),
+            'Opus RTP payload gained AAC AU headers or other wrapping');
+        assert.deepEqual(parsed.slice(1).map((p, i) => (p.ts - parsed[i].ts) >>> 0), [960, 960, 960]);
+    } finally {
+        unsubscribe();
+        serve.destroy();
+    }
+});
+
+test('an Opus packet-size change invalidates the published bitrate contract', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({
+        flv,
+        hasAudio: true,
+        audioCodec: 'opus',
+        opusBitRate: 128000,
+    });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(10, 0, Buffer.from('cf000300', 'hex')),
+        flvTag(10, 0, opusPacket(320)),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+    const serve = await servePromise;
+    flv.write(flvTag(10, 20, opusPacket(240)));
+    for (let i = 0; i < 20 && !flv.destroyed; i++)
+        await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(flv.destroyed, true, 'profile violation did not rebuild the stream generation');
+    assert.equal(serve.alive, false);
 });
 
 test('a client joining mid-GOP receives the buffered GOP instantly', async () => {
@@ -984,5 +1151,20 @@ test('buildSdp advertises H.264 with sprop and optional AAC section', () => {
     assert.match(both.sdp, /m=audio 0 RTP\/AVP 97/);
     assert.match(both.sdp, /MPEG4-GENERIC\/16000\/1/);
     assert.match(both.sdp, /config=1408/);
+    assert.equal(both.audioTrack, 'trackID=1');
+});
+
+test('buildSdp advertises standards-compliant mono Opus without AAC labeling', () => {
+    const v = parseAvcC(makeAvcC(SPS, PPS))!;
+    const opus = parseOpusPacketProfile(opusPacket(320), 128000)!;
+    const both = buildSdp(v, opus);
+    assert.match(both.sdp, /m=audio 0 RTP\/AVP 97/);
+    assert.match(both.sdp, /a=rtpmap:97 opus\/48000\/2/);
+    assert.match(both.sdp,
+        /a=fmtp:97 maxaveragebitrate=128000;sprop-maxcapturerate=32000;stereo=0;sprop-stereo=0;cbr=1;useinbandfec=0;usedtx=0/);
+    assert.match(both.sdp, /a=ptime:20/);
+    assert.match(both.sdp, /a=maxptime:20/);
+    assert.ok(!both.sdp.includes('MPEG4-GENERIC'));
+    assert.ok(!both.sdp.includes('config='));
     assert.equal(both.audioTrack, 'trackID=1');
 });

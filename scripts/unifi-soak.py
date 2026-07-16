@@ -52,7 +52,13 @@ AAC_OBJECT_TYPES = {
 ERROR_PATTERNS = {
     "pipeline_restart": re.compile(r"pipeline restart|restarting media pipeline", re.I),
     "pipeline_closed": re.compile(r"native media pipeline closed", re.I),
-    "audio_error": re.compile(r"audio (?:parse|packet|rtp|decode)?\s*error|unparsable AudioSpecificConfig", re.I),
+    "audio_error": re.compile(
+        r"audio (?:parse|packet|rtp|decode)?\s*error"
+        r"|unparsable AudioSpecificConfig"
+        r"|invalid first Opus packet"
+        r"|(?:valid )?Opus (?:config|packet|parser failure|profile changed)",
+        re.I,
+    ),
     "video_error": re.compile(r"video tag error", re.I),
     "sequence_header_change": re.compile(r"sequence header changed", re.I),
     "queue_overflow": re.compile(r"(?:queue|gop buffer) overflow", re.I),
@@ -1016,6 +1022,14 @@ def self_test() -> None:
     assert safe_text("failed rtsp://user:pass@host/path?token=abc") == "failed [redacted-rtsp]"
     assert camera_argument("aa:bb:cc:dd:ee:ff=Camera One") == ("AABBCCDDEEFF", "Camera One")
     assert percentile([1, 2, 3, 4], 0.5) == 2.5
+    for marker in (
+        "invalid first Opus packet (240 bytes)",
+        "Opus config was not followed by a valid packet",
+        "valid Opus packet arrived after video-only SDP publication",
+        "Opus packet size changed (240 bytes)",
+        "Opus parser failure: malformed packet",
+    ):
+        assert ERROR_PATTERNS["audio_error"].search(marker), marker
     test_cameras = {
         "020000000001": "Camera 1",
         "020000000002": "Camera 2",
@@ -1063,6 +1077,12 @@ def self_test() -> None:
     }
     assert parse_ffmpeg_audio_metadata("Stream #0:0: Audio: aac, 16000 Hz, mono\n") == {
         "codec": "aac",
+    }
+    assert parse_ffmpeg_audio_metadata(
+        "Stream #0:0: Audio: opus, 48000 Hz, mono, fltp, 128 kb/s\n"
+    ) == {
+        "codec": "opus",
+        "declared_bitrate_bps": 128000,
     }
     assert parse_ffmpeg_audio_metadata(
         "Stream #0:0: Audio: aac (LC), 32000 Hz, mono, fltp\n"
@@ -1127,7 +1147,7 @@ def self_test() -> None:
         run = fake_run_command(args, timeout)
         if "0:v:0" in args:
             return run, [0.0, 0.04, 0.08]
-        assert "-c:a" not in args, "the authoritative audio health probe must decode AAC"
+        assert "-c:a" not in args, "the authoritative audio health probe must decode audio"
         return run, [0.0, 0.03]
 
     globals()["run_command"] = fake_run_command
@@ -1162,7 +1182,10 @@ def self_test() -> None:
             with diagnostic_log.open("a") as output:
                 output.write("DS 020000000001 stream connection dropped; tearing down for rebuild\n")
             diagnostic_log.rename(Path(str(diagnostic_log) + ".1"))
-            diagnostic_log.write_text("native media pipeline closed; cleaning up generation\n")
+            diagnostic_log.write_text(
+                "native media pipeline closed; cleaning up generation\n"
+                "native-rtsp restarting media pipeline: Opus packet size changed (240 bytes)\n"
+            )
             assert monitor.run() == 0
             summary = json.loads(monitor.summary_path.read_text())
             events_text = monitor.events_path.read_text()
@@ -1177,6 +1200,8 @@ def self_test() -> None:
             }
             assert summary["media_error_markers"]["camera_disconnect"] == 1
             assert summary["media_error_markers"]["pipeline_closed"] == 1
+            assert summary["media_error_markers"]["pipeline_restart"] == 1
+            assert summary["media_error_markers"]["audio_error"] == 1
             assert summary["startup"]["failures"] == 0
             assert summary["deep_video"]["probes"] == 8
             assert summary["deep_video"]["arrival_stalls"] == 0

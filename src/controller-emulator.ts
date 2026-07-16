@@ -10,23 +10,65 @@ type Logger = { log: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
 const WS_GUID = '258EAFA5-E914-47DA-95CA-C5AB0DC85B11';
 
-// The camera has ONE shared audio encoder feeding all stream serializers. Asking
-// a serializer for Opus at a rate that differs from the AAC encoder's own rate
-// makes that shared encoder emit garbage-decoding AAC (mixed-rate conflict). We
-// only ever consume the AAC track (the native muxer has no Opus path), so we do
-// NOT request Opus at all — `withOpus: false` lets the camera push clean AAC at
-// whatever rate the encoder runs. This matters especially when the encoder is
-// not at 16 kHz: with a firmware patch that pins 32 kHz AAC, requesting
-// opusSampleRate=16000 corrupted ~2-3% of frames (audible glitch/level loss);
-// disabling the Opus request eliminates it (and the ~0.5% residual on 16 kHz cams).
-// Do not add an inert-looking opusSampleRate alongside withOpus=false: patched
-// firmware may reinterpret serializer parameters. Older cameras can retain a
-// legacy value because ChangeVideoSettings merges parameter objects rather than
-// deleting omitted keys; withOpus=false is the authoritative switch and makes
-// that retained value inert. The AAC rate is the camera's own setting, and the
-// muxer's parseAsc follows the emitted AudioSpecificConfig.
-export function aacOnlySerializerParameters(streamName?: string): { withOpus: false; streamName?: string } {
-    return streamName ? { streamName, withOpus: false } : { withOpus: false };
+export type SerializerAudioCodec = 'aac' | 'opus';
+export type OpusBitRate = 96000 | 128000;
+export type SerializerAudioProfile =
+    | { codec: 'aac' }
+    | { codec: 'opus'; captureRate: 32000; channels: 1; bitRate: OpusBitRate };
+
+export const AAC_AUDIO_PROFILE: SerializerAudioProfile = Object.freeze({ codec: 'aac' });
+
+export function sameAudioProfile(a: SerializerAudioProfile, b: SerializerAudioProfile): boolean {
+    return a.codec === b.codec
+        && (a.codec !== 'opus' || (b.codec === 'opus'
+            && a.captureRate === b.captureRate
+            && a.channels === b.channels
+            && a.bitRate === b.bitRate));
+}
+
+/** Select Opus only for the final patched-firmware capability signature:
+ * Opus is the sole advertised output codec and the serializer explicitly
+ * supports the required 48 kHz rate. Older firmware may advertise both AAC and
+ * Opus; that ambiguous profile must stay on the proven AAC path. */
+export function preferredAudioCodec(features: Record<string, any> = {}): SerializerAudioCodec {
+    return Array.isArray(features.audioCodecs)
+        && features.audioCodecs.length === 1
+        && features.audioCodecs[0] === 'opus'
+        && Array.isArray(features.opusSampleRates)
+        && features.opusSampleRates.includes(48000)
+        ? 'opus'
+        : 'aac';
+}
+
+/** Select a truthful camera-side serializer profile. The type-10 CF000300
+ * sequence header carries no bitrate, so Opus is eligible only when the local
+ * settings API confirms the patched 32 kHz mono capture profile and one of the
+ * two validated CBR targets. 128 kbit/s is preferred when configured; 96
+ * kbit/s is the only quality fallback. Any other or unreadable state retains
+ * the proven AAC serializer rather than advertising guessed Opus parameters. */
+export function preferredAudioProfile(
+    features: Record<string, any> = {},
+    settings: Record<string, any> = {},
+): SerializerAudioProfile {
+    if (preferredAudioCodec(features) !== 'opus') return AAC_AUDIO_PROFILE;
+    const audio = settings?.av?.audio || {};
+    const captureRate = Number(audio.sampleRate);
+    const channels = Number(audio.channels);
+    const bitRate = Number(audio.bitRate);
+    if (captureRate !== 32000 || channels !== 1) return AAC_AUDIO_PROFILE;
+    if (bitRate !== 128000 && bitRate !== 96000) return AAC_AUDIO_PROFILE;
+    return { codec: 'opus', captureRate: 32000, channels: 1, bitRate };
+}
+
+/** Build one authoritative serializer contract. withOpus=false deliberately
+ * carries no stale sample-rate hint; the Opus contract always requests 48 kHz. */
+export function audioSerializerParameters(codec: SerializerAudioCodec, streamName?: string):
+    | { withOpus: false; streamName?: string }
+    | { withOpus: true; opusSampleRate: 48000; streamName?: string } {
+    const parameters = codec === 'opus'
+        ? { withOpus: true as const, opusSampleRate: 48000 as const }
+        : { withOpus: false as const };
+    return streamName ? { streamName, ...parameters } : parameters;
 }
 
 function wsAccept(key: string) {
@@ -433,6 +475,9 @@ export class ControllerEmulator extends EventEmitter {
     // actively streaming: ChangeVideoSettings payloads are partials merged by
     // key, so we simply OMIT live tracks from any command that isn't theirs.
     private activeStreams = new Map<string, Map<string, string>>();
+    /** Codec selected from each camera's feature advertisement. Retained so
+     * stop/quiesce commands cannot reintroduce a conflicting serializer mode. */
+    private audioCodecs = new Map<string, SerializerAudioCodec>();
 
     private activeTracks(mac: string): Map<string, string> {
         let m = this.activeStreams.get(mac);
@@ -440,15 +485,17 @@ export class ControllerEmulator extends EventEmitter {
         return m;
     }
 
+    private audioCodec(mac: string): SerializerAudioCodec {
+        return this.audioCodecs.get(mac) ?? 'aac';
+    }
+
     /**
      * On adoption, stop any serializer a previous controller/plugin generation
      * may have left pushing to
      * an external host at a different audio rate. That rate mismatch forces the
-     * camera's shared audio encoder into a scalable/SSR AAC that decodes as
-     * garbage on the streams we consume (verified: SAME-rate concurrent
-     * serializers are clean — the failure is specifically mixed rates). Pointing
-     * them at /dev/null without requesting an Opus conversion means the encoder comes up clean
-     * (no per-camera reboot needed) and the camera stops wasting uplink to a
+     * camera's shared audio encoder into a conflicting mode. Pointing them at
+     * /dev/null with the currently selected serializer codec keeps every track
+     * consistent (no per-camera reboot needed) and stops wasting uplink to a
      * dead relay. Tracks WE are actively streaming are left untouched.
      */
     private quiesceSubstreams(s: CameraSession) {
@@ -462,7 +509,13 @@ export class ControllerEmulator extends EventEmitter {
             // tracks remain in this map and are left untouched.
             for (const t of ['video1', 'video2', 'video3'])
                 if (!active.has(t))
-                    video[t] = { avSerializer: { type: 'extendedFlv', parameters: aacOnlySerializerParameters(), destinations: ['file:///dev/null'] } };
+                    video[t] = {
+                        avSerializer: {
+                            type: 'extendedFlv',
+                            parameters: audioSerializerParameters(this.audioCodec(s.mac)),
+                            destinations: ['file:///dev/null'],
+                        },
+                    };
             if (!Object.keys(video).length) return;
             s.send('ChangeVideoSettings', { video }, true);
             dbg('emulator quiesceSubstreams', s.mac, Object.keys(video).join(','));
@@ -513,24 +566,29 @@ export class ControllerEmulator extends EventEmitter {
      * Concurrent tracks are supported (verified on-hardware: the camera
      * sustains simultaneous per-track pushes with clean audio), with ONE hard
      * rule inherited from the shared audio encoder: every serializer that
-     * carries audio must request the SAME sample rate — mixed rates force the
-     * encoder into scalable/SSR AAC that decodes as garbage. Our active tracks
-     * do not request Opus at all, so all consume the camera's one native AAC
-     * profile; leftover serializers from a previous NVR (unknown rates) are
-     * pointed at /dev/null without an Opus conversion request. Tracks we
-     * are actively streaming are OMITTED from the payload (partials merge by
+     * carries audio must request the SAME codec/rate. Opus-capable cameras use
+     * 48 kHz on every active and quiesced serializer; legacy cameras use AAC.
+     * Tracks already streaming are OMITTED from the payload (partials merge by
      * key), so starting one track never restarts another.
      */
-    startStream(mac: string, channel: string, destHost: string, destPort: number, videoCodec = 'h264') {
+    startStream(
+        mac: string,
+        channel: string,
+        destHost: string,
+        destPort: number,
+        videoCodec = 'h264',
+        audioCodec: SerializerAudioCodec = 'aac',
+    ) {
         const s = this.sessions.get(mac);
         if (!s) throw new Error(`camera ${mac} is not connected to the emulator`);
         const active = this.activeTracks(mac);
+        this.audioCodecs.set(mac, audioCodec);
         const streamName = crypto.randomBytes(8).toString('hex');
         const video: Record<string, any> = {
             [channel]: {
                 avSerializer: {
                     type: 'extendedFlv',
-                    parameters: aacOnlySerializerParameters(streamName),
+                    parameters: audioSerializerParameters(audioCodec, streamName),
                     destinations: [`tcp://${destHost}:${destPort}?retryInterval=1&connectTimeout=5`],
                 },
                 type: videoCodec,
@@ -541,14 +599,14 @@ export class ControllerEmulator extends EventEmitter {
             video[other] = {
                 avSerializer: {
                     type: 'extendedFlv',
-                    parameters: aacOnlySerializerParameters(),
+                    parameters: audioSerializerParameters(audioCodec),
                     destinations: ['file:///dev/null'],
                 },
             };
         }
         active.set(channel, `tcp://${destHost}:${destPort}`);
         s.send('ChangeVideoSettings', { video }, true);
-        dbg('emulator startStream', mac, channel, `-> ${destHost}:${destPort}`, videoCodec, 'streamName', streamName,
+        dbg('emulator startStream', mac, channel, `-> ${destHost}:${destPort}`, videoCodec, audioCodec, 'streamName', streamName,
             'active', [...active.keys()].join(','));
         this.log(`commanded ${mac} ${channel} -> ${destHost}:${destPort} (${videoCodec})`);
     }
@@ -559,7 +617,15 @@ export class ControllerEmulator extends EventEmitter {
         const s = this.sessions.get(mac);
         if (!s) return;
         s.send('ChangeVideoSettings', {
-            video: { [channel]: { avSerializer: { type: 'extendedFlv', parameters: aacOnlySerializerParameters(), destinations: ['file:///dev/null'] } } },
+            video: {
+                [channel]: {
+                    avSerializer: {
+                        type: 'extendedFlv',
+                        parameters: audioSerializerParameters(this.audioCodec(mac)),
+                        destinations: ['file:///dev/null'],
+                    },
+                },
+            },
         }, true);
     }
 }

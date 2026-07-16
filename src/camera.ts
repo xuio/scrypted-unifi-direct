@@ -18,8 +18,15 @@ import sdk, {
 } from '@scrypted/sdk';
 import { createHash } from 'crypto';
 import { CameraApiClient } from './client';
-import { ControllerEmulator } from './controller-emulator';
+import {
+    AAC_AUDIO_PROFILE,
+    ControllerEmulator,
+    preferredAudioProfile as selectPreferredAudioProfile,
+    sameAudioProfile,
+} from './controller-emulator';
+import type { SerializerAudioProfile } from './controller-emulator';
 import { DirectStream } from './direct-stream';
+import type { ServedAudioParams } from './rtsp-session';
 import { PARITY_FIELDS, readField, writeField, writeFieldForTracks, toSetting, isFieldSupported, buildMgmtSetting, buildSshCommand } from './camera-settings';
 import {
     ZoneDef, ZoneType, ZONE_TYPES, ZONE_DEFAULTS, buildZonePayloads, polyCoord,
@@ -63,6 +70,9 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     private creating = new Map<string, Promise<DirectStream>>();
     private pendingStreams = new Map<string, DirectStream>();
     private streamGen = 0;   // bumped on channel/codec change & release to cancel in-flight creates
+    private selectedAudioProfile: SerializerAudioProfile | undefined;
+    private audioProfileRead: Promise<SerializerAudioProfile> | undefined;
+    private audioProfileRevision = 0;
     private released = false;
     private lifecycleAbort = new AbortController();
     private onlineWaiters = new Set<() => void>();
@@ -153,12 +163,89 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     private async getFeatures(): Promise<Record<string, any>> {
         if (this.cachedFeatures) return this.cachedFeatures;
         try {
-            const feats = (await this.getClient().getStatus() as any)?.features || {};
+            const revision = this.audioProfileRevision;
+            const client = this.getClient();
+            const feats = (await client.getStatus() as any)?.features || {};
             // A status request may resolve after the device was removed. Do not
-            // repopulate state on the released camera instance.
-            if (!this.released) this.cachedFeatures = feats;
+            // repopulate state on the released camera instance or after an
+            // identity/profile invalidation replaced the owning client.
+            if (this.released || revision !== this.audioProfileRevision) return {};
+            this.cachedFeatures = feats;
             return feats;
         } catch { return {}; }
+    }
+
+    /** Invalidate any in-flight audio-profile read. Capability invalidation is
+     * used on management reconnect so firmware feature changes cannot leave a
+     * stale serializer choice alive. */
+    private invalidateAudioProfile(invalidateFeatures = false, clearSelected = false) {
+        this.audioProfileRevision = (this.audioProfileRevision ?? 0) + 1;
+        this.audioProfileRead = undefined;
+        if (invalidateFeatures) this.cachedFeatures = undefined;
+        if (clearSelected) this.selectedAudioProfile = undefined;
+    }
+
+    /** Read both authoritative inputs before selecting Opus. Settings are
+     * intentionally required: CF000300 does not carry bitrate, and advertising
+     * 128 kbit/s when the camera is configured for 96 kbit/s would be false. */
+    private async preferredAudioProfile(forceRefresh = false): Promise<SerializerAudioProfile> {
+        // Client startup is latency-sensitive. A verified serializer profile is
+        // stable until management reconnect, an encoder-setting change, or a
+        // camera identity/configuration change explicitly invalidates it.
+        if (!forceRefresh && this.selectedAudioProfile)
+            return this.selectedAudioProfile;
+        const revision = this.audioProfileRevision;
+        let read = this.audioProfileRead;
+        if (!read) {
+            read = (async () => {
+                try {
+                    // Read status and settings as one decision. A transient HTTP
+                    // failure must preserve the last known profile rather than
+                    // demote a healthy Opus push to AAC on incomplete evidence.
+                    const client = this.getClient();
+                    const status = await client.getStatus() as any;
+                    if (this.released || revision !== this.audioProfileRevision)
+                        return this.selectedAudioProfile ?? AAC_AUDIO_PROFILE;
+                    const features = status?.features || {};
+                    const settings = await client.getSettings();
+                    if (this.released || revision !== this.audioProfileRevision)
+                        return this.selectedAudioProfile ?? AAC_AUDIO_PROFILE;
+                    this.cachedFeatures = features;
+                    return selectPreferredAudioProfile(features, settings);
+                } catch (e) {
+                    dbg('audio profile read failed; preserving last profile', this.mac, (e as Error)?.message);
+                    return this.selectedAudioProfile ?? AAC_AUDIO_PROFILE;
+                }
+            })();
+            this.audioProfileRead = read;
+            read.finally(() => {
+                if (this.audioProfileRead === read) this.audioProfileRead = undefined;
+            }).catch(() => { });
+        }
+        const next = await read;
+        if (this.released) return this.selectedAudioProfile ?? AAC_AUDIO_PROFILE;
+        if (revision !== this.audioProfileRevision)
+            return this.preferredAudioProfile(forceRefresh);
+        this.adoptAudioProfile(next);
+        return next;
+    }
+
+    /** Commit a newly observed profile and tear down every shared-encoder stream
+     * as one generation if codec/bitrate changed. Per-track replacement would
+     * briefly run conflicting serializer requests against the camera's one audio
+     * encoder. */
+    private adoptAudioProfile(next: SerializerAudioProfile) {
+        if (this.released) return;
+        const previous = this.selectedAudioProfile;
+        const liveMismatch = [...this.streams.values(), ...this.pendingStreams.values()]
+            .some(stream => !stream.matchesAudioProfile(next));
+        this.selectedAudioProfile = next;
+        if ((!previous || sameAudioProfile(previous, next)) && !liveMismatch) return;
+        dbg('audio profile changed', this.mac, previous, '->', next, '; resetting all streams');
+        this.resetStreams();
+        this.snapshots.clearCache();
+        this.onDeviceEvent(ScryptedInterface.VideoCamera, undefined)
+            .catch(e => dbg('audio profile event failed', this.mac, (e as Error)?.message));
     }
 
     /** Race one camera-owned I/O operation against release. The underlying API
@@ -300,6 +387,12 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             const real = await this.getClient().getMac();
             if (real && real !== this.mac) {
                 this.console.warn(`[unifi-direct] stored mac "${this.mac}" != camera mac "${real}"; repairing`);
+                // DirectStream.stop() sends the camera-side quiesce command using
+                // the MAC captured when the stream was created. Stop everything
+                // before publishing the replacement identity so no caller can
+                // reuse old-MAC streams/profile state under the new key.
+                this.resetStreams();
+                this.invalidateAudioProfile(true, true);
                 this.storage.setItem('mac', real);
             }
         } catch { /* camera unreachable — leave as-is */ }
@@ -614,8 +707,14 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     }
 
     // ---- VideoCamera (direct live) ----
-    private mediaStreamOptions(channelKey: string, hasAudio = true): ResponseMediaStreamOptions {
+    private mediaStreamOptions(
+        channelKey: string,
+        audioProfile: SerializerAudioProfile | ServedAudioParams | undefined,
+    ): ResponseMediaStreamOptions {
         const c = CHANNELS[channelKey] || CHANNELS.high;
+        const audio = audioProfile?.codec === 'opus'
+            ? { codec: 'opus', sampleRate: 48000, bitrate: audioProfile.bitRate }
+            : audioProfile?.codec === 'aac' ? { codec: 'aac' } : undefined;
         return {
             id: channelKey,
             name: `${c.label} ${c.w}x${c.h} (direct)`,
@@ -623,14 +722,28 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             tool: 'scrypted',
             source: 'local',
             video: { codec: this.codec, width: c.w, height: c.h },
-            ...(hasAudio ? { audio: { codec: 'aac' } } : {}),
+            ...(audio ? { audio } : {}),
+            ...(audioProfile?.codec === 'opus' ? {
+                metadata: {
+                    audioCodecs: ['opus'],
+                    audio: {
+                        codec: 'opus',
+                        sampleRate: 48000,
+                        channels: 1,
+                        bitrate: audioProfile.bitRate,
+                        frameDurationMs: 20,
+                        rtpClockRate: 48000,
+                    },
+                },
+            } : {}),
         };
     }
 
     async getVideoStreamOptions(): Promise<ResponseMediaStreamOptions[]> {
+        const advertisedAudioProfile = await this.preferredAudioProfile();
         return this.advertisedChannels().map(k => {
             const live = this.streams.get(CHANNELS[k].track);
-            return this.mediaStreamOptions(k, live ? live.hasAudio : true);
+            return this.mediaStreamOptions(k, live ? live.audioParams : advertisedAudioProfile);
         });
     }
 
@@ -663,7 +776,8 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         // Serialize creation per channel so concurrent callers (prebuffer probe
         // + a viewer) can't both build a DirectStream on the same camera port —
         // the loser would EADDRINUSE and its stop() would kill the winner's push.
-        const stream = await this.getOrCreateStream(chan.track, emulator);
+        const audioProfile = await this.preferredAudioProfile();
+        const stream = await this.getOrCreateStream(chan.track, emulator, audioProfile);
         const url = stream.url!;
         dbg('getVideoStream', this.mac, 'serving', url);
 
@@ -671,22 +785,34 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             url,
             container: 'rtsp',
             inputArguments: ['-rtsp_transport', 'tcp', '-i', url],
-            mediaStreamOptions: this.mediaStreamOptions(channelKey, stream.hasAudio),
+            mediaStreamOptions: this.mediaStreamOptions(channelKey, stream.audioParams),
         };
         return mediaManager.createFFmpegMediaObject(ffmpegInput, { sourceId: this.id });
     }
 
-    private async getOrCreateStream(track: string, emulator: ControllerEmulator): Promise<DirectStream> {
+    private async getOrCreateStream(
+        track: string,
+        emulator: ControllerEmulator,
+        audioProfile: SerializerAudioProfile = AAC_AUDIO_PROFILE,
+    ): Promise<DirectStream> {
         if (this.released) throw new Error('camera has been released');
+        const pending = this.pendingStreams.get(track);
+        if (pending && !pending.matchesAudioProfile(audioProfile))
+            this.resetStreams();
         const existing = this.streams.get(track);
-        if (existing?.alive) return existing;
-        if (existing) { existing.stop(); this.streams.delete(track); }
+        if (existing?.alive && existing.matchesAudioProfile(audioProfile)) return existing;
+        if (existing) {
+            // Audio is one camera-wide encoder. Replacing only this track can
+            // overlap incompatible serializer profiles with another live track.
+            if (!existing.matchesAudioProfile(audioProfile)) this.resetStreams();
+            else { existing.stop(); this.streams.delete(track); }
+        }
 
         let creating = this.creating.get(track);
         if (!creating) {
             creating = (async () => {
                 const gen = this.streamGen;
-                const s = this.createDirectStream(track, emulator);
+                const s = this.createDirectStream(track, emulator, audioProfile);
                 this.pendingStreams.set(track, s);
                 try {
                     await s.start();
@@ -696,7 +822,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                     // a live stream nobody will ever consume or reap, leaving the
                     // camera pushing that track forever.
                     const stillWanted = this.advertisedChannels().some(k => CHANNELS[k].track === track);
-                    if (gen !== this.streamGen || !stillWanted) { s.stop(); throw new Error('stream creation superseded'); }
+                    if (gen !== this.streamGen || !stillWanted || !s.matchesAudioProfile(audioProfile)) {
+                        s.stop();
+                        throw new Error('stream creation superseded');
+                    }
                     this.streams.set(track, s);
                     return s;
                 } finally {
@@ -704,16 +833,18 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 }
             })();
             this.creating.set(track, creating);
-            creating.finally(() => this.creating.delete(track)).catch(() => { });
+            creating.finally(() => {
+                if (this.creating.get(track) === creating) this.creating.delete(track);
+            }).catch(() => { });
         }
         return creating;
     }
 
     /** Isolated construction boundary keeps lifecycle races independently
      * testable without changing DirectStream's runtime behavior. */
-    private createDirectStream(track: string, emulator: ControllerEmulator): DirectStream {
+    private createDirectStream(track: string, emulator: ControllerEmulator, audioProfile: SerializerAudioProfile): DirectStream {
         const selfIp = this.provider.getPushAddress()!;
-        return new DirectStream(emulator, this.mac, track, this.codec, selfIp, TRACK_PORTS[track],
+        return new DirectStream(emulator, this.mac, track, this.codec, audioProfile, selfIp, TRACK_PORTS[track],
             this.storage.getItem('host') || '', this.console, this.provider.pushRegistry);
     }
 
@@ -725,6 +856,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         this.pendingStreams.clear();
         for (const s of this.streams.values()) { try { s.stop(); } catch { } }
         this.streams.clear();
+        // In-flight promises remain observed by their callers, but may no longer
+        // be reused by a request for the new profile. Their conditional finally
+        // cleanup cannot delete a newer creation inserted under the same track.
+        this.creating.clear();
     }
 
     /**
@@ -756,7 +891,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     get audioEndpointEnabled(): boolean { return this.storage.getItem('audioRtsp') === 'true'; }
 
     /** Ensure the configured-channel stream is live and return its serve handle
-     *  — the audio endpoint taps its paced AAC packets. Same stream the
+     *  — the audio endpoint taps its paced AAC or Opus packets. Same stream the
      *  prebuffer keeps warm, so enabling audio adds no camera-side cost. */
     async audioSource() {
         if (this.released) throw new Error('camera has been released');
@@ -767,7 +902,8 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         if (this.released) throw new Error('camera has been released');
         if (!emulator.isOnline(this.mac))
             throw new Error(`camera ${this.mac} is not connected`);
-        const stream = await this.getOrCreateStream(this.channel.track, emulator);
+        const audioProfile = await this.preferredAudioProfile();
+        const stream = await this.getOrCreateStream(this.channel.track, emulator, audioProfile);
         const handle = stream.serveHandle;
         if (!handle) throw new Error('stream has no serve handle');
         return handle;
@@ -794,12 +930,22 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     }
 
     /** Surface management connectivity promptly through Scrypted's standard
-     * Online interface. A WSS disconnect is not proof that a healthy media push
-     * has died, so this deliberately does not reset live streams. */
+     * Online interface. A WSS disconnect alone is not proof that a healthy
+     * media push died. On reconnect, however, capabilities and camera audio
+     * settings are refetched; a changed preferred profile atomically replaces
+     * every shared-encoder stream. */
     onManagementConnectionChanged(isOnline: boolean) {
         if (this.released) return;
         this.online = isOnline;
-        if (isOnline) this.snapshots.warm();
+        if (isOnline) {
+            this.invalidateAudioProfile(true);
+            this.snapshots.warm();
+            // Refresh in the background so a reconnect can adopt firmware or
+            // setting changes without putting two camera HTTPS round trips back
+            // on the next HomeKit/client startup path.
+            this.preferredAudioProfile(true)
+                .catch(e => dbg('audio profile reconnect refresh failed', this.mac, (e as Error)?.message));
+        }
         this.onDeviceEvent(ScryptedInterface.Settings, undefined)
             .catch(e => dbg('connection status event failed', this.mac, (e as Error)?.message));
     }
@@ -826,6 +972,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         if (this.released) return;
         const importing = this.importInFlight;
         this.released = true;
+        this.invalidateAudioProfile();
         // Abort before destroying transport owners so camera-local waits resolve
         // immediately and every post-await guard observes the released state.
         this.lifecycleAbort?.abort();
@@ -844,6 +991,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
 
     // ---- Settings ----
     async getSettings(): Promise<Setting[]> {
+        const audioProfileRevision = this.audioProfileRevision;
         let statusLine = '';
         let cameraSettings: any;
         let cameraFeatures: Record<string, any> = {};
@@ -861,11 +1009,17 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         if (this.streamRebuilds)
             streamState += ` · rebuilds=${this.streamRebuilds} (last ${Math.round((Date.now() - this.lastRebuild!) / 60000)}m ago)`;
         try {
-            const s = await this.getClient().getStatus();
+            const client = this.getClient();
+            const s = await client.getStatus();
+            if (this.released || audioProfileRevision !== this.audioProfileRevision)
+                throw new Error('settings read superseded');
             statusLine = `${s.board?.name || '?'} · fw ${s.fw?.semver || '?'} · emulator=${online ? 'CONNECTED' : 'waiting'} · stream=${streamState} · ctrl=${s.controller?.host}`;
             cameraFeatures = (s as any)?.features || {};
+            cameraSettings = await client.getSettings();
+            if (this.released || audioProfileRevision !== this.audioProfileRevision)
+                throw new Error('settings read superseded');
             this.cachedFeatures = cameraFeatures;
-            cameraSettings = await this.getClient().getSettings();
+            this.adoptAudioProfile(selectPreferredAudioProfile(cameraFeatures, cameraSettings));
             // Lazy import for a camera already online when the user opens settings.
             this.importCameraZones().catch(() => { });
         } catch (e: any) {
@@ -898,7 +1052,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             {
                 key: 'audioRtsp', title: 'Audio RTSP endpoint', group: 'Stream', type: 'boolean',
                 value: this.audioEndpointEnabled,
-                description: 'Serve this camera\'s native AAC microphone track as a stable audio-only RTSP URL for external consumers like BirdNET-Go. Supports both legacy profiles and patched mono 32 kHz / 128 kbps AAC. Unauthenticated, LAN-scoped — same trust model as the camera push ports.',
+                description: 'Serve this camera\'s selected microphone track as a stable audio-only RTSP URL for external consumers like BirdNET-Go. Patched firmware publishes mono 48 kHz / 128 or 96 kbps Opus; legacy firmware falls back to native AAC. Unauthenticated, LAN-scoped — same trust model as the camera push ports.',
             },
             ...(this.audioEndpointEnabled ? [{
                 key: 'audioRtspUrl', title: 'Audio RTSP URL', group: 'Stream', readonly: true, type: 'string',
@@ -932,7 +1086,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                 key: 'audio.tuning', title: 'Audio tuning', group: 'Audio', type: 'string',
                 value: this.audioTuning || 'default',
                 choices: ['default', ...cameraFeatures.audioStyle],
-                description: 'Camera audio DSP profile (a processing stage before the encoder). "nature" leaves the sound open — measured ~+5 dB more content across the 1–6 kHz bird band vs "noiseReduced", which suppresses that range for speech — so "nature" is better for bioacoustics / BirdNET. "default" sends no command (the camera keeps its current profile) and does NOT undo a previously-applied style until the camera reboots. Sample rate, channel count, and bitrate come from the separate native AAC encoder settings when the firmware exposes them.',
+                description: 'Camera audio DSP profile (a processing stage before the encoder). "nature" leaves the sound open — measured ~+5 dB more content across the 1–6 kHz bird band vs "noiseReduced", which suppresses that range for speech — so "nature" is better for bioacoustics / BirdNET. "default" sends no command (the camera keeps its current profile) and does NOT undo a previously-applied style until the camera reboots. Encoder settings exposed by the firmware feed either the patched Opus serializer or the legacy AAC path.',
             });
         }
         const parity: Setting[] = [];
@@ -1022,8 +1176,12 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             // Audio presence and encoder configuration are part of RTSP SDP/RTP
             // framing and cannot be changed in-place. Rebuild every advertised
             // track so the camera's one shared encoder is restarted once and all
-            // consumers re-DESCRIBE the new AAC contract together.
+            // consumers re-DESCRIBE the new AAC or Opus contract together.
             if (field.key === 'audio.enabled' || field.key === 'audio.sampleRate' || field.key === 'audio.bitrate') {
+                // The just-written encoder state invalidates the previously
+                // verified profile; on a failed refetch, fall back to AAC rather
+                // than resurrecting the old bitrate/rate contract.
+                this.invalidateAudioProfile(false, true);
                 this.resetStreams();
                 await this.onDeviceEvent(ScryptedInterface.VideoCamera, undefined);
             }
@@ -1121,7 +1279,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             // Point at a different camera → drop everything cached from the old one
             // (a stale last-good frame or feature flags would otherwise leak across).
             this.snapshots.reset();
-            this.cachedFeatures = undefined;
+            this.invalidateAudioProfile(true, true);
             // The mask fingerprint describes what was applied to the OLD camera;
             // keeping it would skip pushing masks to the new one forever.
             this.storage.removeItem('privacyMasksFp');

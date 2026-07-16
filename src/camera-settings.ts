@@ -34,10 +34,6 @@ export interface FieldDef {
 // mirror how UniFi Protect derives its per-camera featureFlags (e.g.
 // hasInfrared=truedaynight, hasLdc=ldc), so gating adapts across models.
 const hasMic = (f: Record<string, any>) => !!f.mic;
-// Older firmware does not advertise audioCodecs; preserve its path-present AAC
-// controls. When a codec list is present it is authoritative.
-const hasAac = (f: Record<string, any>) => hasMic(f)
-    && (!Array.isArray(f.audioCodecs) || f.audioCodecs.includes('aac'));
 const hasSpeaker = (f: Record<string, any>) => !!(f.speaker || f.adjustableSpeakerVolume);
 const hasStatusLed = (f: Record<string, any>) => !!f.ledStatus;
 const hasInfrared = (f: Record<string, any>) => !!(f.truedaynight || f.ledIr);   // night vision / IR
@@ -110,23 +106,24 @@ export const PARITY_FIELDS: FieldDef[] = [
     { key: 'audio.denoise', title: 'Mic noise reduction', group: 'Audio', type: 'boolean', paths: ['av.audio.denoise'], cap: hasMic },
     { key: 'audio.highpass', title: 'Mic high-pass filter', group: 'Audio', type: 'boolean', paths: ['av.audio.highpass'], cap: hasMic },
     {
-        key: 'audio.sampleRate', title: 'AAC sample rate (Hz)', group: 'Audio', type: 'integer',
-        paths: ['av.audio.sampleRate'], range: [8000, 96000], cap: hasAac,
-        description: 'Native camera AAC sample rate. Patched firmware may support 32000 Hz; older firmware values such as 16000 Hz remain supported. The option is shown only when the camera reports this encoder field.',
+        key: 'audio.sampleRate', title: 'Audio capture sample rate (Hz)', group: 'Audio', type: 'integer',
+        paths: ['av.audio.sampleRate'], range: [8000, 96000], cap: hasMic,
+        description: 'Camera microphone capture rate. The patched Opus serializer requires 32000 Hz capture and publishes a standards-compliant 48 kHz RTP clock; legacy AAC profiles may use other reported rates.',
     },
     {
-        key: 'audio.bitrate', title: 'AAC bitrate (bps)', group: 'Audio', type: 'integer',
-        paths: ['av.audio.bitRate'], range: [8000, 320000], cap: hasAac,
-        description: 'Native camera AAC target bitrate. Patched firmware may support 128000 bps. The option is shown only when the camera reports this encoder field.',
+        key: 'audio.bitrate', title: 'Audio target bitrate (bps)', group: 'Audio', type: 'integer',
+        paths: ['av.audio.bitRate'], range: [8000, 320000], cap: hasMic,
+        description: 'Camera encoder target bitrate. Opus-capable firmware offers 128000 bps CBR or the validated 96000 bps quality fallback; other values use the legacy AAC path.',
     },
     {
-        key: 'audio.channels', title: 'AAC channels', group: 'Audio', type: 'integer',
-        paths: ['av.audio.channels'], readonly: true, cap: hasAac,
-        description: 'Reported encoder channel count. HomeKit and the direct stream use the camera’s native value; the patched high-quality profile is mono (1).',
+        key: 'audio.channels', title: 'Audio channels', group: 'Audio', type: 'integer',
+        paths: ['av.audio.channels'], readonly: true, cap: hasMic,
+        description: 'Reported microphone channel count. The patched Opus profile is mono (1).',
     },
     {
-        key: 'audio.codec', title: 'Audio codec', group: 'Audio', type: 'string',
+        key: 'audio.codec', title: 'Firmware base encoder', group: 'Audio', type: 'string',
         paths: ['av.audio.type'], readonly: true, cap: hasMic,
+        description: 'Internal capture-encoder field reported by the camera. It is not the direct output-track label: the plugin selects Opus only from advertised capabilities plus verified 32 kHz/96–128 kbit/s settings and RTP packet size.',
     },
 
     // ---- Speaker — gated on the camera having a (adjustable) speaker ----
@@ -320,8 +317,8 @@ export function deepMerge(a: any, b: any): any {
     return a;
 }
 
-/** Build the UI setting. Newer camera firmware advertises the AAC rates it can
- * switch between; turn that field into a select when present. Older firmware
+/** Build the UI setting. Newer camera firmware advertises the capture rates it
+ * can switch between; turn that field into a select when present. Older firmware
  * often reports only av.audio.sampleRate, so it keeps the numeric input instead
  * of losing a previously-working value or being hidden outright. */
 export function toSetting(field: FieldDef, value: any, features: Record<string, any> = {}): Setting {
@@ -342,6 +339,25 @@ export function toSetting(field: FieldDef, value: any, features: Record<string, 
             type = 'string';
             settingValue = String(value);
         }
+    } else if (field.key === 'audio.bitrate'
+        && Array.isArray(features.audioCodecs)
+        && features.audioCodecs.length === 1
+        && features.audioCodecs[0] === 'opus'
+        && Array.isArray(features.opusSampleRates)
+        && features.opusSampleRates.includes(48000)) {
+        // The type-10 sequence header does not communicate bitrate. Restrict the
+        // Opus UI to profiles the muxer can independently validate from exact
+        // 20 ms CBR packet sizes (320 or 240 bytes).
+        choices = ['128000', '96000'];
+        const current = Number(value);
+        // Preserve an already-configured legacy value in the selector so opening
+        // and saving settings cannot coerce it accidentally. It remains an AAC
+        // fallback until the user explicitly chooses one of the validated Opus
+        // targets above.
+        if (Number.isInteger(current) && !choices.includes(String(current)))
+            choices.push(String(current));
+        type = 'string';
+        settingValue = String(value);
     }
     return {
         key: field.key,

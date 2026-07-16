@@ -2,10 +2,11 @@ import net, { AddressInfo } from 'net';
 import { randomBytes } from 'crypto';
 import { performance } from 'perf_hooks';
 import type { Readable } from 'stream';
-import { RtspSession, RtspServeHandle, SdpInfo } from './rtsp-session';
-import type { LatestKeyframe } from './rtsp-session';
+import { RtspSession } from './rtsp-session';
+import type { LatestKeyframe, RtspServeHandle, SdpInfo } from './rtsp-session';
 import { ByteQueue } from './byte-queue';
 import { dbg } from './debug';
+import type { OpusBitRate } from './controller-emulator';
 
 type Logger = { log?: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
@@ -16,8 +17,14 @@ const RTP_STALL_MS = 8000;
 /** Max RTP payload bytes (mirrors the ffmpeg path's pkt_size=1200). */
 const MAX_PAYLOAD = 1200;
 const PT_VIDEO = 96;   // dynamic PT for H264/90000
-const PT_AUDIO = 97;   // dynamic PT for MPEG4-GENERIC (AAC-hbr)
+const PT_AUDIO = 97;   // dynamic PT for either AAC-hbr or Opus
 const VIDEO_CLOCK = 90000;
+export const OPUS_RATE = 48000 as const;
+export const OPUS_CAPTURE_RATE = 32000 as const;
+export const OPUS_CHANNELS = 1 as const;
+export const OPUS_FRAME_SAMPLES = 960 as const;
+export const OPUS_FRAME_DURATION_MS = 20 as const;
+export const OPUS_CONFIG = Buffer.from([0xcf, 0x00, 0x03, 0x00]);
 
 // ---------------------------------------------------------------------------
 // FLV tag parsing (standard FLV — the detrailer already stripped UniFi's
@@ -109,20 +116,32 @@ export function parseAvcC(d: Buffer): VideoParams | undefined {
     } catch { return; }
 }
 
-export interface AudioParams {
+export interface AacAudioParams {
+    codec: 'aac';
     rate: number;
     channels: number;
     /** Samples represented by one AAC access unit (normally 1024; AAC-LC may
      *  explicitly signal the 960-sample variant in GASpecificConfig). */
-    frameSamples?: number;
+    frameSamples: number;
     /** Raw AudioSpecificConfig bytes (for the SDP `config=` fmtp param). */
     config: Buffer;
 }
 
+export interface OpusAudioParams {
+    codec: 'opus';
+    rate: typeof OPUS_RATE;
+    channels: typeof OPUS_CHANNELS;
+    frameSamples: typeof OPUS_FRAME_SAMPLES;
+    bitRate: OpusBitRate;
+    frameDurationMs: typeof OPUS_FRAME_DURATION_MS;
+}
+
+export type AudioParams = AacAudioParams | OpusAudioParams;
+
 const AAC_RATES = [96000, 88200, 64000, 48000, 44100, 32000, 24000, 22050, 16000, 12000, 11025, 8000, 7350];
 
 /** Parse an AAC AudioSpecificConfig into sample rate + channel count. */
-export function parseAsc(d: Buffer): AudioParams | undefined {
+export function parseAsc(d: Buffer): AacAudioParams | undefined {
     try {
         if (d.length < 2) return;
         const freqIdx = ((d[0] & 0x07) << 1) | (d[1] >> 7);
@@ -142,8 +161,79 @@ export function parseAsc(d: Buffer): AudioParams | undefined {
         // channels=0 means "defined in a PCE" — bail to video-only rather than
         // advertise a wrong SDP (audio is best-effort).
         if (!rate || !channels) return;
-        return { rate, channels, frameSamples: frameLengthFlag ? 960 : 1024, config: Buffer.from(d) };
+        return { codec: 'aac', rate, channels, frameSamples: frameLengthFlag ? 960 : 1024, config: Buffer.from(d) };
     } catch { return; }
+}
+
+/** Identify the UniFi extended-FLV Opus sequence header. CF000300 confirms the
+ * mono/48 kHz/20 ms transport contract but carries no bitrate. Bitrate is
+ * deliberately derived from the first exact-size 20 ms CBR packet instead. */
+export function parseOpusConfig(d: Buffer): boolean {
+    return d.equals(OPUS_CONFIG);
+}
+
+export interface OpusPacketInfo {
+    frameCount: number;
+    frameSamples: number;
+    packetSamples: number;
+    fullband: boolean;
+    stereo: boolean;
+}
+
+/** Parse the self-describing Opus TOC sufficiently to verify the firmware
+ * contract. This mirrors libopus' packet_get_nb_frames and
+ * packet_get_samples_per_frame rules at the RTP clock's fixed 48 kHz. */
+export function opusPacketInfo(d: Buffer): OpusPacketInfo | undefined {
+    if (!d.length) return;
+    const toc = d[0];
+    const config = toc >> 3;
+    const code = toc & 0x03;
+    let frameCount: number;
+    if (code === 0) frameCount = 1;
+    else if (code === 1 || code === 2) frameCount = 2;
+    else {
+        if (d.length < 2) return;
+        frameCount = d[1] & 0x3f;
+        if (!frameCount) return;
+    }
+
+    let frameSamples: number;
+    if (toc & 0x80) {
+        frameSamples = (OPUS_RATE << ((toc >> 3) & 0x03)) / 400;
+    } else if ((toc & 0x60) === 0x60) {
+        frameSamples = (toc & 0x08) ? OPUS_RATE / 50 : OPUS_RATE / 100;
+    } else {
+        const size = (toc >> 3) & 0x03;
+        frameSamples = size === 3 ? OPUS_RATE * 60 / 1000 : (OPUS_RATE << size) / 100;
+    }
+    const packetSamples = frameCount * frameSamples;
+    if (packetSamples > OPUS_RATE * 120 / 1000) return;
+    // RFC 6716 TOC configurations 14/15 (hybrid) and 28-31 (CELT) are fullband.
+    const fullband = config === 14 || config === 15 || config >= 28;
+    const stereo = !!(toc & 0x04);
+    return { frameCount, frameSamples, packetSamples, fullband, stereo };
+}
+
+/** Derive and validate the only supported Opus profiles from one complete raw
+ * fullband 20 ms CBR packet: 128000/400 = 320 bytes, 96000/400 = 240 bytes. */
+export function parseOpusPacketProfile(d: Buffer, expectedBitRate: OpusBitRate): OpusAudioParams | undefined {
+    const packet = opusPacketInfo(d);
+    if (!packet || packet.frameCount !== 1 || packet.frameSamples !== OPUS_FRAME_SAMPLES
+        || !packet.fullband || packet.stereo)
+        return;
+    const observedBitRate: OpusBitRate | undefined =
+        d.length === 320 ? 128000
+            : d.length === 240 ? 96000
+                : undefined;
+    if (!observedBitRate || observedBitRate !== expectedBitRate) return;
+    return {
+        codec: 'opus',
+        rate: OPUS_RATE,
+        channels: OPUS_CHANNELS,
+        frameSamples: OPUS_FRAME_SAMPLES,
+        bitRate: observedBitRate,
+        frameDurationMs: OPUS_FRAME_DURATION_MS,
+    };
 }
 
 function sameBuffers(a: Buffer[], b: Buffer[]) {
@@ -155,8 +245,16 @@ function sameVideoParams(a: VideoParams, b: VideoParams) {
 }
 
 function sameAudioParams(a: AudioParams, b: AudioParams) {
-    return a.rate === b.rate && a.channels === b.channels
-        && (a.frameSamples ?? 1024) === (b.frameSamples ?? 1024) && a.config.equals(b.config);
+    if (a.codec !== b.codec) return false;
+    if (a.codec === 'aac' && b.codec === 'aac')
+        return a.rate === b.rate && a.channels === b.channels
+            && a.frameSamples === b.frameSamples && a.config.equals(b.config);
+    if (a.codec === 'opus' && b.codec === 'opus')
+        return a.rate === b.rate && a.channels === b.channels
+            && a.frameSamples === b.frameSamples
+            && a.bitRate === b.bitRate
+            && a.frameDurationMs === b.frameDurationMs;
+    return false;
 }
 
 const ANNEXB_SC = Buffer.from([0, 0, 0, 1]);
@@ -322,6 +420,18 @@ export function packetizeAac(track: RtpTrack, frame: Buffer, ts: number): Buffer
     return out;
 }
 
+/** Packetize one Opus frame per RFC 7587. An Opus packet is already the RTP
+ * payload: there are no AAC AU headers and it must not be fragmented across RTP
+ * packets. The configured 128 kbit/s / 20 ms CBR profile is 320 bytes, well
+ * below the shared 1200-byte path-MTU budget. */
+export function packetizeOpus(track: RtpTrack, frame: Buffer, ts: number): Buffer[] {
+    if (!frame.length || frame.length > MAX_PAYLOAD) return [];
+    // With DTX disabled this is one continuous talkspurt. Do not assert M on
+    // every 20 ms packet; without talkspurt detection, leaving it clear is the
+    // standards-safe signal.
+    return [track.build(ts, false, undefined, frame)];
+}
+
 /** Reconstruct the H.264 access unit retained by the muxer. The input packets
  *  are the exact immutable RTP buffers produced for one IDR (including the
  *  in-band SPS/PPS); no parser/ByteQueue views survive into this path. */
@@ -385,19 +495,35 @@ export function buildSdp(v: VideoParams, a?: AudioParams): SdpInfo {
     ];
     const info: SdpInfo = { sdp: '', videoTrack: 'trackID=0' };
     if (a) {
-        lines.push(
-            `m=audio 0 RTP/AVP ${PT_AUDIO}`,
-            `a=rtpmap:${PT_AUDIO} MPEG4-GENERIC/${a.rate}/${a.channels}`,
-            `a=fmtp:${PT_AUDIO} profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=${a.config.toString('hex')}`,
-            'a=control:trackID=1',
-        );
+        appendAudioSdp(lines, a, 'trackID=1');
         info.audioTrack = 'trackID=1';
     }
     info.sdp = lines.join('\r\n') + '\r\n';
     return info;
 }
 
-/** Audio-only SDP for the stable audio endpoint (single AAC track, trackID=0). */
+function appendAudioSdp(lines: string[], a: AudioParams, control: string) {
+    lines.push(`m=audio 0 RTP/AVP ${PT_AUDIO}`);
+    if (a.codec === 'opus') {
+        // RFC 7587 requires opus/48000/2 in rtpmap even for mono. The negotiated
+        // stereo/sprop-stereo values below unambiguously identify the stream as
+        // mono; the remaining fmtp fields mirror the firmware encoder contract.
+        lines.push(
+            `a=rtpmap:${PT_AUDIO} opus/${OPUS_RATE}/2`,
+            `a=fmtp:${PT_AUDIO} maxaveragebitrate=${a.bitRate};sprop-maxcapturerate=${OPUS_CAPTURE_RATE};stereo=0;sprop-stereo=0;cbr=1;useinbandfec=0;usedtx=0`,
+            `a=ptime:${a.frameDurationMs}`,
+            `a=maxptime:${a.frameDurationMs}`,
+        );
+    } else {
+        lines.push(
+            `a=rtpmap:${PT_AUDIO} MPEG4-GENERIC/${a.rate}/${a.channels}`,
+            `a=fmtp:${PT_AUDIO} profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=${a.config.toString('hex')}`,
+        );
+    }
+    lines.push(`a=control:${control}`);
+}
+
+/** Audio-only SDP for the stable endpoint (AAC or standards-compliant Opus). */
 export function buildAudioSdp(a: AudioParams): SdpInfo {
     const lines = [
         'v=0',
@@ -405,11 +531,8 @@ export function buildAudioSdp(a: AudioParams): SdpInfo {
         's=UniFi Direct Audio',
         'c=IN IP4 0.0.0.0',
         't=0 0',
-        `m=audio 0 RTP/AVP ${PT_AUDIO}`,
-        `a=rtpmap:${PT_AUDIO} MPEG4-GENERIC/${a.rate}/${a.channels}`,
-        `a=fmtp:${PT_AUDIO} profile-level-id=1;mode=AAC-hbr;sizelength=13;indexlength=3;indexdeltalength=3;config=${a.config.toString('hex')}`,
-        'a=control:trackID=0',
     ];
+    appendAudioSdp(lines, a, 'trackID=0');
     return { sdp: lines.join('\r\n') + '\r\n', audioTrack: 'trackID=0' };
 }
 
@@ -512,27 +635,38 @@ export class PacedQueue {
 
 /**
  * Serve a de-trailered (standard) FLV Readable as an in-process RTSP server. The
- * FLV is demuxed and RTP-packetized directly (H.264 RFC 6184 + AAC RFC 3640) and
+ * FLV is demuxed and RTP-packetized directly (H.264 RFC 6184, AAC RFC 3640, or
+ * Opus RFC 7587) and
  * fanned out to every connected RTSP client over interleaved TCP — no ffmpeg
  * subprocess and no localhost UDP hop to drop keyframe bursts.
  *
- * H.264 + AAC only (the camera must be commanded to push h264). Audio is
- * best-effort: any uncertainty (non-AAC, unparsable ASC, missing config) yields
- * a video-only SDP rather than a stalled or broken stream.
+ * The camera must be commanded to push H.264 and the same selected audio codec
+ * passed here. Audio is best-effort: any uncertainty (unparsable/missing config)
+ * yields a video-only SDP rather than a stalled or mislabeled stream.
  */
 export async function startNativeServe(opts: {
     flv: Readable;
     hasAudio: boolean;
+    /** Exact audio codec requested from the UniFi serializer. Opus-capable
+     * firmware emits both AAC and type-10 Opus tags, so selecting explicitly is
+     * what prevents the first AAC tag from winning discovery accidentally. */
+    audioCodec?: 'aac' | 'opus';
+    /** Expected camera setting for Opus. Required because CF000300 carries no
+     * bitrate; the muxer verifies it against the first raw 20 ms CBR packet. */
+    opusBitRate?: OpusBitRate;
     logger?: Logger;
     /** How long to wait for the H.264 sequence header before failing. */
     sdpTimeoutMs?: number;
-    /** How long past the video config to wait for the AAC config. */
+    /** How long past the video config to wait for the selected audio config. */
     audioGraceMs?: number;
     /** Pause/resume the owning camera ingress when the pacer approaches its hard
      * queue bound. The callback must be cheap and must never throw into media. */
     onEgressPressure?: (paused: boolean, sample: EgressPressureSample) => void;
 }): Promise<RtspServeHandle> {
     const { flv, hasAudio } = opts;
+    const audioCodec = opts.audioCodec ?? 'aac';
+    if (audioCodec === 'opus' && opts.opusBitRate !== 128000 && opts.opusBitRate !== 96000)
+        throw new Error('Opus requires an explicit 128000 or 96000 bps profile');
 
     let dead = false;
     // Monotonic egress liveness. Wall-clock jumps must not make a healthy stream
@@ -546,7 +680,9 @@ export async function startNativeServe(opts: {
     let audioParams: AudioParams | undefined;
     let audioBroken = false;      // audio is best-effort; once broken, video-only
     let audioServed = false;      // audio made it into the SDP
-    let audioTs: number | undefined;   // synthesized AAC RTP clock (exact frameSamples/frame)
+    let sdpFinalized = false;     // immutable for this RTSP generation once built
+    let audioTs: number | undefined;   // synthesized codec RTP clock
+    let opusConfigSeen = false;
     let latestKeyframe: LatestKeyframe | undefined;   // lazy Annex-B for snapshots
     let onVideoParams: (() => void) | undefined;
     let onAudioParams: (() => void) | undefined;
@@ -613,7 +749,7 @@ export async function startNativeServe(opts: {
     const SOFT_QUEUE_LOW = 2000;
     // Keep one due-ordered FIFO per RTP clock. FLV tags from the two tracks can
     // arrive in either order at the same timestamp; a single append-only queue
-    // lets an AAC packet at T block video packets intentionally spread over
+    // lets an audio packet at T block video packets intentionally spread over
     // T-frameInterval..T, collapsing the IDR back into a microburst.
     const videoEgress = new PacedQueue();
     const audioEgress = new PacedQueue();
@@ -633,7 +769,7 @@ export async function startNativeServe(opts: {
         const v = videoEgress.length ? videoEgress : undefined;
         const a = audioEgress.length ? audioEgress : undefined;
         if (!v && !a) throw new Error('egress queue is empty');
-        // Video wins a tie so a keyframe resets GOP history before same-time AAC.
+        // Video wins a tie so a keyframe resets GOP history before same-time audio.
         return !a || (v && v.frontDue() <= a.frontDue()) ? v! : a;
     };
     const clearEgress = () => {
@@ -852,31 +988,33 @@ export async function startNativeServe(opts: {
         enqueue('trackID=0', pkts, mediaMs, isKeyframe);
     };
 
-    const handleAudioTag = (tsMs: number, d: Buffer) => {
+    const acceptAudioParams = (next: AudioParams | undefined, label: string, changedReason: string) => {
+        if (!next) {
+            if (!audioParams) {
+                audioBroken = true;
+                dbg(`native-rtsp unparsable ${label}; serving video-only`);
+                onAudioParams?.();
+            }
+            return;
+        }
+        if (!audioParams) {
+            audioParams = next;
+            dbg('native-rtsp audio config:', audioParams.codec, audioParams.rate, 'Hz,', audioParams.channels, 'ch');
+            onAudioParams?.();
+        } else if (!sameAudioParams(audioParams, next)) {
+            requestRestart(changedReason);
+        }
+    };
+
+    const handleAacTag = (tsMs: number, d: Buffer) => {
         if (d.length < 2) return;
         if (d[0] >> 4 !== 10) return;   // not AAC — ignore (video must not regress)
         const pktType = d[1];
         if (pktType === 0) {
-            const next = parseAsc(d.subarray(2));
-            if (!next) {
-                if (!audioParams) {
-                    audioBroken = true;
-                    dbg('native-rtsp unparsable AudioSpecificConfig; serving video-only');
-                }
-                return;
-            }
-            if (!audioParams) {
-                audioParams = next;
-                if (audioParams) {
-                    dbg('native-rtsp asc:', audioParams.rate, 'Hz,', audioParams.channels, 'ch');
-                    onAudioParams?.();
-                }
-            } else if (!sameAudioParams(audioParams, next)) {
-                requestRestart('AAC sequence header changed');
-            }
+            acceptAudioParams(parseAsc(d.subarray(2)), 'AudioSpecificConfig', 'AAC sequence header changed');
             return;
         }
-        if (pktType !== 1 || !audioParams || !audioServed) return;
+        if (pktType !== 1 || audioParams?.codec !== 'aac' || !audioServed) return;
         // Synthesize the AAC RTP clock at exactly the AudioSpecificConfig frame
         // length (normally 1024 samples). The FLV ms
         // timestamps quantize to ±1 sample, which makes a receiver's NetEq
@@ -887,7 +1025,7 @@ export async function startNativeServe(opts: {
         // clock must never follow it backward or receivers see duplicate DTS and
         // briefly reset their audio jitter buffer.
         const expected = Math.round(tsMs * audioParams.rate / 1000);
-        const frameSamples = audioParams.frameSamples ?? 1024;
+        const frameSamples = audioParams.frameSamples;
         if (audioTs === undefined || expected - audioTs >= frameSamples) audioTs = expected;
         const ts = audioTs;
         audioTs += frameSamples;
@@ -904,14 +1042,73 @@ export async function startNativeServe(opts: {
         enqueue('trackID=1', pkts, ts * 1000 / audioParams.rate, false);
     };
 
+    const handleOpusTag = (tsMs: number, d: Buffer) => {
+        // UniFi's type-10 sequence header is a standalone CF000300 payload. Every
+        // following type-10 payload is one complete raw Opus packet.
+        if (parseOpusConfig(d)) {
+            if (sdpFinalized && !audioServed) {
+                requestRestart('Opus config arrived after video-only SDP publication');
+                return;
+            }
+            opusConfigSeen = true;
+            return;
+        }
+        if (!opusConfigSeen) return;
+        if (!audioParams) {
+            const config = parseOpusPacketProfile(d, opts.opusBitRate!);
+            if (!config) {
+                // A confirmed Opus serializer contract followed by incompatible
+                // bytes is not "optional audio missing". Publishing this
+                // generation video-only would make it reusable forever and hide
+                // a bitrate/duration/bandwidth/channel mismatch. Rebuild so the
+                // camera is commanded from a clean serializer generation.
+                requestRestart(`invalid first Opus packet (${d.length} bytes)`);
+                return;
+            }
+            if (sdpFinalized && !audioServed) {
+                requestRestart('valid Opus packet arrived after video-only SDP publication');
+                return;
+            }
+            acceptAudioParams(config, 'Opus packet', 'Opus profile changed');
+            // SDP publication resumes on the next raw packet. This first packet
+            // exists to prove the bitrate CF000300 cannot communicate.
+            return;
+        }
+        if (audioParams?.codec !== 'opus' || !audioServed) return;
+
+        // Hard CBR is part of the advertised contract. A size change means the
+        // camera setting or encoder mode changed underneath this SDP; rebuild
+        // rather than forward bytes under a stale bitrate claim.
+        if (!parseOpusPacketProfile(d, audioParams.bitRate)) {
+            requestRestart(`Opus packet size changed (${d.length} bytes)`);
+            return;
+        }
+
+        // RFC 7587's RTP clock is always 48 kHz. This profile emits one 20 ms
+        // frame per packet, so every emitted timestamp advances by exactly 960;
+        // millisecond FLV timestamp quantization/resets never perturb that clock.
+        if (audioTs === undefined) audioTs = Math.round(tsMs * (OPUS_RATE / 1000));
+        const ts = audioTs;
+        audioTs += OPUS_FRAME_SAMPLES;
+        const pkts = packetizeOpus(audioTrack, d, ts);
+        if (!pkts.length) {
+            dbg('native-rtsp invalid/oversized Opus packet dropped:', d.length, 'bytes');
+            return;
+        }
+        enqueue('trackID=1', pkts, ts * 1000 / OPUS_RATE, false);
+    };
+
     const parser = new FlvTagParser((type, tsMs, data) => {
         try {
             if (restartRequested) return;
             if (type === 9) handleVideoTag(tsMs, data);
-            else if (type === 8 && hasAudio && !audioBroken) handleAudioTag(tsMs, data);
+            else if (hasAudio && !audioBroken && audioCodec === 'aac' && type === 8) handleAacTag(tsMs, data);
+            else if (hasAudio && !audioBroken && audioCodec === 'opus' && type === 10) handleOpusTag(tsMs, data);
             // type 18 (script data) ignored.
         } catch (e) {
-            if (type === 8) {
+            if (audioCodec === 'opus' && type === 10 && opusConfigSeen) {
+                requestRestart(`Opus parser failure: ${(e as Error)?.message || e}`);
+            } else if ((audioCodec === 'aac' && type === 8) || (audioCodec === 'opus' && type === 10)) {
                 audioBroken = true;   // never let audio take down video
                 dbg('native-rtsp audio error, disabling audio:', (e as Error)?.message);
             } else {
@@ -978,7 +1175,7 @@ export async function startNativeServe(opts: {
         throw e;
     }
 
-    // Audio config normally rides right next to the video config; give it a short
+    // The selected audio config normally rides right next to the video config; give it a short
     // grace window, then proceed video-only (best-effort, never blocks video).
     if (hasAudio && !audioParams && !audioBroken) {
         await new Promise<void>(resolve => {
@@ -988,6 +1185,8 @@ export async function startNativeServe(opts: {
             flv.once('close', done);
         });
     }
+    if (hasAudio && audioCodec === 'opus' && opusConfigSeen && !audioParams && !audioBroken)
+        requestRestart('Opus config was not followed by a valid packet');
     if (dead || restartRequested)
         throw new Error('native rtsp serve destroyed during media discovery');
 
@@ -1048,6 +1247,7 @@ export async function startNativeServe(opts: {
     const useAudio = (hasAudio && !audioBroken && audioParams) ? audioParams : undefined;
     const info = buildSdp(videoParams!, useAudio);
     audioServed = !!info.audioTrack;
+    sdpFinalized = true;
     dbg('native-rtsp sdp ready; video', info.videoTrack, 'audio', info.audioTrack ?? '(none)');
 
     // On PLAY: replay the buffered GOP so the client renders instantly instead

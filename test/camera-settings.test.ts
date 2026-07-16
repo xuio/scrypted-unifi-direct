@@ -66,26 +66,26 @@ test('capability gating: WDR hidden on HDR models, speaker needs the flag', () =
     assert.equal(isFieldSupported(field('soundled.speakerVolume'), settings, { adjustableSpeakerVolume: true }, 'video1'), true);
 });
 
-test('AAC encoder options are gated by mic capability and reported fields', () => {
+test('audio encoder options are gated by mic capability and reported fields', () => {
     const settings = { av: { audio: { sampleRate: 32000, bitRate: 128000, channels: 1, type: 'aac' } } };
     for (const key of ['audio.sampleRate', 'audio.bitrate', 'audio.channels', 'audio.codec']) {
         assert.equal(isFieldSupported(field(key), settings, {}, 'video1'), false, `${key} shown without mic capability`);
         assert.equal(isFieldSupported(field(key), settings, { mic: true }, 'video1'), true, `${key} hidden despite reported support`);
     }
     for (const key of ['audio.sampleRate', 'audio.bitrate', 'audio.channels'])
-        assert.equal(isFieldSupported(field(key), settings, { mic: true, audioCodecs: ['opus'] }, 'video1'), false,
-            `${key} shown despite an authoritative codec list without AAC`);
+        assert.equal(isFieldSupported(field(key), settings, { mic: true, audioCodecs: ['opus'] }, 'video1'), true,
+            `${key} hidden for a mic with the patched Opus serializer`);
     assert.equal(isFieldSupported(field('audio.sampleRate'), { av: { audio: { bitRate: 128000 } } }, { mic: true }, 'video1'), false,
         'a guessed sample-rate field must not be exposed on older firmware');
 });
 
-test('AAC encoder writes preserve legacy and patched numeric profiles', () => {
+test('audio encoder writes preserve legacy and patched numeric profiles', () => {
     assert.deepEqual(writeField(field('audio.sampleRate'), 16000, 'video1'), { av: { audio: { sampleRate: 16000 } } });
     assert.deepEqual(writeField(field('audio.sampleRate'), 32000, 'video1'), { av: { audio: { sampleRate: 32000 } } });
     assert.deepEqual(writeField(field('audio.bitrate'), 128000, 'video1'), { av: { audio: { bitRate: 128000 } } });
 });
 
-test('AAC sample-rate choices follow the camera capability list', () => {
+test('audio sample-rate choices follow the camera capability list', () => {
     const f = field('audio.sampleRate');
     const selectable = toSetting(f, 32000, { audioSampleRates: [32000, 16000, 32000, 'bad'] });
     assert.equal(selectable.type, 'string');
@@ -96,6 +96,23 @@ test('AAC sample-rate choices follow the camera capability list', () => {
     assert.equal(legacy.type, 'integer');
     assert.equal(legacy.choices, undefined);
     assert.equal(legacy.value, 16000, 'older path-present firmware keeps a numeric setting');
+});
+
+test('Opus bitrate choices expose only validated CBR profiles and preserve legacy state', () => {
+    const f = field('audio.bitrate');
+    const features = { audioCodecs: ['opus'], opusSampleRates: [48000] };
+    const selected = toSetting(f, 128000, features);
+    assert.equal(selected.type, 'string');
+    assert.deepEqual(selected.choices, ['128000', '96000']);
+    assert.equal(selected.value, '128000');
+
+    const legacyValue = toSetting(f, 64000, features);
+    assert.deepEqual(legacyValue.choices, ['128000', '96000', '64000']);
+    assert.equal(legacyValue.value, '64000');
+
+    const ambiguous = toSetting(f, 128000, { audioCodecs: ['aac', 'opus'], opusSampleRates: [48000] });
+    assert.equal(ambiguous.type, 'integer');
+    assert.equal(ambiguous.choices, undefined);
 });
 
 test('buildMgmtSetting routes fields to the right Change*Settings command', () => {

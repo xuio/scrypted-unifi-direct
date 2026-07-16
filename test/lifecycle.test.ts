@@ -201,6 +201,135 @@ test('camera client reuse is keyed by host and credentials', () => {
     replacement.destroy();
 });
 
+test('verified audio profile is cached for client startup and refreshed on reconnect', async () => {
+    let statusReads = 0;
+    let settingsReads = 0;
+    const client = {
+        getStatus: async () => {
+            statusReads++;
+            return { features: { audioCodecs: ['opus'], opusSampleRates: [48000] } };
+        },
+        getSettings: async () => {
+            settingsReads++;
+            return { av: { audio: { sampleRate: 32000, channels: 1, bitRate: 128000 } } };
+        },
+    };
+    const cam: any = Object.create(UnifiCamera.prototype);
+    Object.assign(cam, {
+        released: false,
+        selectedAudioProfile: undefined,
+        audioProfileRead: undefined,
+        audioProfileRevision: 0,
+        cachedFeatures: undefined,
+        streams: new Map(),
+        pendingStreams: new Map(),
+        creating: new Map(),
+        streamGen: 0,
+        snapshots: { warm: () => { }, clearCache: () => { } },
+        console: { log: () => { }, warn: () => { } },
+        getClient: () => client,
+        onDeviceEvent: async () => { },
+    });
+
+    const first = await cam.preferredAudioProfile();
+    assert.deepEqual(first, {
+        codec: 'opus',
+        captureRate: 32000,
+        channels: 1,
+        bitRate: 128000,
+    });
+    assert.deepEqual([statusReads, settingsReads], [1, 1]);
+
+    assert.strictEqual(await cam.preferredAudioProfile(), first);
+    assert.deepEqual([statusReads, settingsReads], [1, 1],
+        'an already-verified live profile added camera HTTPS latency to client startup');
+
+    cam.onManagementConnectionChanged(true);
+    for (let i = 0; i < 20 && settingsReads < 2; i++)
+        await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual([statusReads, settingsReads], [2, 2],
+        'management reconnect did not force a background capability/settings refresh');
+    assert.strictEqual(await cam.preferredAudioProfile(), cam.selectedAudioProfile);
+    assert.deepEqual([statusReads, settingsReads], [2, 2],
+        'the completed reconnect refresh was not reused by the next client');
+});
+
+test('media options advertise verified Opus metadata and keep video-only generations audio-free', () => {
+    const cam: any = Object.create(UnifiCamera.prototype);
+    const opus = cam.mediaStreamOptions('medium', {
+        codec: 'opus',
+        rate: 48000,
+        channels: 1,
+        frameSamples: 960,
+        bitRate: 128000,
+        frameDurationMs: 20,
+    });
+    assert.deepEqual(opus.audio, { codec: 'opus', sampleRate: 48000, bitrate: 128000 });
+    assert.deepEqual(opus.metadata, {
+        audioCodecs: ['opus'],
+        audio: {
+            codec: 'opus',
+            sampleRate: 48000,
+            channels: 1,
+            bitrate: 128000,
+            frameDurationMs: 20,
+            rtpClockRate: 48000,
+        },
+    });
+
+    const aac = cam.mediaStreamOptions('high', { codec: 'aac' });
+    assert.deepEqual(aac.audio, { codec: 'aac' });
+    assert.equal(aac.metadata, undefined);
+
+    const videoOnly = cam.mediaStreamOptions('medium', undefined);
+    assert.equal(videoOnly.audio, undefined);
+    assert.equal(videoOnly.metadata, undefined);
+});
+
+test('audio profile changes reset all shared streams and snapshot state once', async () => {
+    let resets = 0;
+    let cacheClears = 0;
+    let events = 0;
+    const cam: any = Object.create(UnifiCamera.prototype);
+    Object.assign(cam, {
+        released: false,
+        selectedAudioProfile: {
+            codec: 'opus',
+            captureRate: 32000,
+            channels: 1,
+            bitRate: 128000,
+        },
+        streams: new Map([
+            ['video1', { matchesAudioProfile: () => false }],
+            ['video2', { matchesAudioProfile: () => false }],
+        ]),
+        pendingStreams: new Map([['video3', { matchesAudioProfile: () => false }]]),
+        storage: { getItem: (key: string) => key === 'mac' ? 'AABBCCDDEEFF' : undefined },
+        snapshots: { clearCache: () => cacheClears++ },
+        resetStreams: () => {
+            resets++;
+            cam.streams.clear();
+            cam.pendingStreams.clear();
+        },
+        onDeviceEvent: async () => { events++; },
+    });
+    const next = {
+        codec: 'opus' as const,
+        captureRate: 32000 as const,
+        channels: 1 as const,
+        bitRate: 96000 as const,
+    };
+    cam.adoptAudioProfile(next);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual([resets, cacheClears, events], [1, 1, 1]);
+    assert.deepEqual(cam.selectedAudioProfile, next);
+
+    cam.adoptAudioProfile(next);
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.deepEqual([resets, cacheClears, events], [1, 1, 1],
+        're-adopting the same profile caused another camera-wide restart');
+});
+
 test('reset stops an in-flight DirectStream before start resolves', async () => {
     let resolveStart!: () => void;
     const startGate = new Promise<void>(resolve => { resolveStart = resolve; });

@@ -9,7 +9,8 @@ export const AUDIO_RTSP_PORT = 17553;
 
 /**
  * Stable audio-only RTSP endpoints: `rtsp://<host>:17553/<MAC>` serves just the
- * camera's native AAC track (legacy or patched high-quality profile) for
+ * camera's selected native audio track (standards-compliant Opus on patched
+ * firmware, AAC on legacy firmware) for
  * external consumers like BirdNET-Go, which
  * ingests RTSP URLs configured once.
  *

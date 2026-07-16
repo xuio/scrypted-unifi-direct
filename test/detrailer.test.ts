@@ -16,7 +16,7 @@ function makeExtendedFlv(seed: number, nTags: number, opts: { bigTags?: boolean 
     const input: Buffer[] = [header];
     const cleanTags: Buffer[] = [];
     for (let i = 0; i < nTags; i++) {
-        const type = [8, 9, 18][randInt(r, 0, 2)];
+        const type = [8, 9, 10, 18][randInt(r, 0, 3)];
         const size = opts.bigTags && r() < 0.15 ? randInt(r, 100_000, 500_000) : randInt(r, 0, 4000);
         const tag = flvTag(type, randInt(r, 0, 0xffffff), randBytes(r, size));
         input.push(tag);
@@ -54,6 +54,20 @@ test('handles keyframe-sized tags (100-500KB)', () => {
     const { input, expected } = makeExtendedFlv(7, 30, { bigTags: true });
     const out = feedChunked(makeDetrailer(), input, rng(77), 16384);
     assert.ok(out.equals(expected));
+});
+
+test('preserves UniFi extended-FLV type-10 Opus tags', () => {
+    const config = flvTag(10, 0, Buffer.from('cf000300', 'hex'));
+    const packet = flvTag(10, 20, Buffer.alloc(320, 0x5a));
+    const successor = flvTag(9, 40, Buffer.from([1, 2, 3]));
+    const trailer = Buffer.alloc(16, 0x77);
+    const out = Buffer.concat(makeDetrailer()(Buffer.concat([
+        flvHeader(),
+        config, trailer,
+        packet, trailer,
+        successor,
+    ])));
+    assert.ok(out.equals(Buffer.concat([flvHeader(), config, packet])));
 });
 
 test('pure garbage input produces no output and does not throw', () => {

@@ -32,11 +32,11 @@ class BackpressuredFlv extends EventEmitter {
     destroy() { this.destroyed = true; this.emit('close'); return this; }
 }
 
-function makeStream() {
+function makeStream(audioProfile: any = { codec: 'aac' }) {
     const emulator = { startStream() { }, stopStream() { } };
     const registry = { register: async () => { }, unregister() { } };
     return new DirectStream(
-        emulator as any, 'AABBCCDDEEFF', 'video1', 'h264', '127.0.0.1', 17550,
+        emulator as any, 'AABBCCDDEEFF', 'video1', 'h264', audioProfile, '127.0.0.1', 17550,
         '127.0.0.1', { log() { } }, registry as any,
     );
 }
@@ -55,9 +55,11 @@ test('arms the push route and readiness observers before commanding the camera',
         unregister: () => calls.push('unregister'),
     };
     let stream!: DirectStream;
+    let startArgs: any[] | undefined;
     const emulator = {
-        startStream() {
+        startStream(...args: any[]) {
             calls.push('startStream');
+            startArgs = args;
             assert.equal(registrationResolved, true,
                 'camera was commanded before push registration completed');
             assert.equal(typeof (stream as any).onServeReady, 'function',
@@ -71,7 +73,7 @@ test('arms the push route and readiness observers before commanding the camera',
         stopStream() { calls.push('stopStream'); },
     };
     stream = new DirectStream(
-        emulator as any, 'AABBCCDDEEFF', 'video1', 'h264', '127.0.0.1', 17550,
+        emulator as any, 'AABBCCDDEEFF', 'video1', 'h264', { codec: 'aac' }, '127.0.0.1', 17550,
         '127.0.0.1', { log() { } }, registry as any,
     );
 
@@ -82,6 +84,7 @@ test('arms the push route and readiness observers before commanding the camera',
     releaseRegistration();
     await starting;
     assert.deepEqual(calls, ['register', 'armed', 'startStream']);
+    assert.equal(startArgs?.[5], 'aac', 'requested audio codec was not forwarded to the serializer command');
     stream.stop();
     assert.deepEqual(calls, ['register', 'armed', 'startStream', 'stopStream', 'unregister']);
 });
@@ -97,7 +100,7 @@ test('a synchronous camera command failure disarms startup observers cleanly', a
         unregister: () => calls.push('unregister'),
     };
     const stream = new DirectStream(
-        emulator as any, 'AABBCCDDEEFF', 'video1', 'h264', '127.0.0.1', 17550,
+        emulator as any, 'AABBCCDDEEFF', 'video1', 'h264', { codec: 'aac' }, '127.0.0.1', 17550,
         '127.0.0.1', { log() { } }, registry as any,
     );
 
@@ -108,6 +111,60 @@ test('a synchronous camera command failure disarms startup observers cleanly', a
     // Give Node's unhandled-rejection check a turn; the abandoned readiness
     // promise must remain disarmed rather than reject behind the caller's back.
     await new Promise<void>(resolve => setImmediate(resolve));
+});
+
+test('stream reuse requires the requested and published audio profiles to match', () => {
+    const requested = {
+        codec: 'opus' as const,
+        captureRate: 32000 as const,
+        channels: 1 as const,
+        bitRate: 128000 as const,
+    };
+    const stream = makeStream(requested);
+    try {
+        assert.equal(stream.matchesAudioProfile(requested), true,
+            'a video-only generation should remain reusable for its requested profile');
+        assert.equal(stream.matchesAudioProfile({ ...requested, bitRate: 96000 }), false);
+        assert.equal(stream.matchesAudioProfile({ codec: 'aac' }), false);
+
+        (stream as any).serve = {
+            destroy() { },
+            audioParams: () => ({
+                codec: 'opus',
+                rate: 48000,
+                channels: 1,
+                frameSamples: 960,
+                bitRate: 128000,
+                frameDurationMs: 20,
+            }),
+        };
+        assert.equal(stream.matchesAudioProfile(requested), true);
+        (stream as any).serve = {
+            destroy() { },
+            audioParams: () => ({
+                codec: 'opus',
+                rate: 48000,
+                channels: 1,
+                frameSamples: 960,
+                bitRate: 96000,
+                frameDurationMs: 20,
+            }),
+        };
+        assert.equal(stream.matchesAudioProfile(requested), false);
+        (stream as any).serve = {
+            destroy() { },
+            audioParams: () => ({
+                codec: 'aac',
+                rate: 16000,
+                channels: 1,
+                frameSamples: 1024,
+                config: Buffer.from([0x14, 0x08]),
+            }),
+        };
+        assert.equal(stream.matchesAudioProfile(requested), false);
+    } finally {
+        stream.stop();
+    }
 });
 
 const TEST_SPS = Buffer.from('6742c01eda0280b7fe5c05050502', 'hex');

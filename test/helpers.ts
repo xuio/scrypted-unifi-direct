@@ -18,7 +18,7 @@ export function randBytes(r: () => number, n: number, opts: { avoidTagTypes?: bo
     for (let i = 0; i < n; i++) {
         let v = randInt(r, 0, 255);
         // FLV tag-type bytes excluded → no accidental resync point in a trailer
-        if (opts.avoidTagTypes && (v === 8 || v === 9 || v === 18)) v = 7;
+        if (opts.avoidTagTypes && (v === 8 || v === 9 || v === 10 || v === 18)) v = 7;
         b[i] = v;
     }
     return b;

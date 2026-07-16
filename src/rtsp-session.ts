@@ -1,6 +1,7 @@
 import net from 'net';
 import { randomBytes } from 'crypto';
 import { dbg } from './debug';
+import type { OpusBitRate } from './controller-emulator';
 
 /** SDP plus the trackID controls the muxer fans RTP out to. */
 export interface SdpInfo {
@@ -20,6 +21,29 @@ export interface LatestKeyframe {
     /** Materialize and cache a self-contained SPS/PPS/IDR Annex-B access unit. */
     annexb(): Buffer;
 }
+
+/** Codec parameters for the exact audio RTP track published by the native
+ * muxer. The discriminator prevents raw Opus packets from ever inheriting the
+ * AAC SDP/config path (or vice versa). */
+export type ServedAudioParams =
+    | {
+        codec: 'aac';
+        rate: number;
+        channels: number;
+        /** Samples represented by one AAC access unit. */
+        frameSamples: number;
+        /** Raw AudioSpecificConfig bytes used by RFC 3640 SDP. */
+        config: Buffer;
+    }
+    | {
+        codec: 'opus';
+        /** Opus RTP uses a fixed 48 kHz clock, including for mono audio. */
+        rate: 48000;
+        channels: 1;
+        frameSamples: 960;
+        bitRate: OpusBitRate;
+        frameDurationMs: 20;
+    };
 
 /**
  * Handle returned by a serve implementation. Scrypted connects OUT to `url` like
@@ -41,8 +65,8 @@ export interface RtspServeHandle {
      * (SPS + PPS + IDR) is materialized lazily. Undefined until the first IDR.
      */
     latestKeyframe(): LatestKeyframe | undefined;
-    /** AAC parameters of the served audio track (undefined when video-only). */
-    audioParams(): { rate: number; channels: number; config: Buffer } | undefined;
+    /** Parameters of the served AAC or Opus track (undefined when video-only). */
+    audioParams(): ServedAudioParams | undefined;
     /**
      * Tap the served audio: `fn` receives every audio RTP packet at egress
      * (post-pacer, realtime cadence, the muxer's own SSRC/seq — packets are

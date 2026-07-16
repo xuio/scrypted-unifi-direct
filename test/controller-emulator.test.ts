@@ -1,7 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'events';
-import { aacOnlySerializerParameters, makeFrameParser, MAX_WS_FRAME } from '../src/controller-emulator';
+import {
+    AAC_AUDIO_PROFILE,
+    audioSerializerParameters,
+    makeFrameParser,
+    MAX_WS_FRAME,
+    preferredAudioCodec,
+    preferredAudioProfile,
+    sameAudioProfile,
+} from '../src/controller-emulator';
 import { ControllerEmulator } from '../src/controller-emulator';
 import { loadOrCreateEmulatorTls } from '../src/emulator-tls';
 
@@ -32,13 +40,99 @@ function upgradeRequest(headers: Record<string, string> = {}) {
     };
 }
 
-test('AAC-only serializers never carry an Opus sample-rate hint', () => {
-    assert.deepEqual(aacOnlySerializerParameters(), { withOpus: false });
-    assert.deepEqual(aacOnlySerializerParameters('stream-token'), {
+test('serializer parameters identify Opus at 48 kHz and preserve AAC fallback', () => {
+    assert.deepEqual(audioSerializerParameters('aac'), { withOpus: false });
+    assert.deepEqual(audioSerializerParameters('aac', 'stream-token'), {
         streamName: 'stream-token',
         withOpus: false,
     });
-    assert.equal('opusSampleRate' in aacOnlySerializerParameters('stream-token'), false);
+    assert.equal('opusSampleRate' in audioSerializerParameters('aac', 'stream-token'), false);
+    assert.deepEqual(audioSerializerParameters('opus'), {
+        withOpus: true,
+        opusSampleRate: 48000,
+    });
+    assert.deepEqual(audioSerializerParameters('opus', 'stream-token'), {
+        streamName: 'stream-token',
+        withOpus: true,
+        opusSampleRate: 48000,
+    });
+});
+
+test('Opus selection requires the final capability signature and verified settings', () => {
+    const capable = { audioCodecs: ['opus'], opusSampleRates: [48000] };
+    const configured = { av: { audio: { sampleRate: 32000, channels: 1, bitRate: 128000 } } };
+    assert.equal(preferredAudioCodec(capable), 'opus');
+    assert.equal(preferredAudioCodec({ audioCodecs: ['aac', 'opus'], opusSampleRates: [48000] }), 'aac');
+    assert.equal(preferredAudioCodec({ audioCodecs: ['opus'], opusSampleRates: [16000] }), 'aac');
+    assert.deepEqual(preferredAudioProfile(capable, configured), {
+        codec: 'opus',
+        captureRate: 32000,
+        channels: 1,
+        bitRate: 128000,
+    });
+    assert.deepEqual(preferredAudioProfile(capable, {
+        av: { audio: { sampleRate: 32000, channels: 1, bitRate: 96000 } },
+    }), {
+        codec: 'opus',
+        captureRate: 32000,
+        channels: 1,
+        bitRate: 96000,
+    });
+    assert.strictEqual(preferredAudioProfile(capable, {
+        av: { audio: { sampleRate: 16000, channels: 1, bitRate: 128000 } },
+    }), AAC_AUDIO_PROFILE);
+    assert.strictEqual(preferredAudioProfile(capable, {
+        av: { audio: { sampleRate: 32000, channels: 2, bitRate: 128000 } },
+    }), AAC_AUDIO_PROFILE);
+    assert.strictEqual(preferredAudioProfile(capable, {
+        av: { audio: { sampleRate: 32000, channels: 1, bitRate: 64000 } },
+    }), AAC_AUDIO_PROFILE);
+    assert.equal(sameAudioProfile(AAC_AUDIO_PROFILE, AAC_AUDIO_PROFILE), true);
+    assert.equal(sameAudioProfile(
+        { codec: 'opus', captureRate: 32000, channels: 1, bitRate: 128000 },
+        { codec: 'opus', captureRate: 32000, channels: 1, bitRate: 96000 },
+    ), false);
+});
+
+test('stream commands keep every active and quiesced serializer on the selected Opus codec', () => {
+    const emulator = new ControllerEmulator(0, { log() { } }, { cert: '', key: '' });
+    const sent: Array<{ fn: string; payload: any }> = [];
+    const mac = 'AABBCCDDEEFF';
+    (emulator as any).sessions.set(mac, {
+        mac,
+        authenticated: true,
+        socket: { destroyed: false, writableEnded: false },
+        send: (fn: string, payload: any) => {
+            sent.push({ fn, payload });
+            return sent.length;
+        },
+    });
+
+    emulator.startStream(mac, 'video1', '192.168.50.11', 17550, 'h264', 'opus');
+    const first = sent.at(-1)!;
+    assert.equal(first.fn, 'ChangeVideoSettings');
+    for (const track of ['video1', 'video2', 'video3']) {
+        assert.deepEqual(first.payload.video[track].avSerializer.parameters, {
+            ...(track === 'video1' ? { streamName: first.payload.video[track].avSerializer.parameters.streamName } : {}),
+            withOpus: true,
+            opusSampleRate: 48000,
+        });
+    }
+    assert.equal(typeof first.payload.video.video1.avSerializer.parameters.streamName, 'string');
+
+    emulator.startStream(mac, 'video2', '192.168.50.11', 17551, 'h264', 'opus');
+    const second = sent.at(-1)!;
+    assert.equal(second.payload.video.video1, undefined,
+        'starting another track restarted an already-active serializer');
+    assert.equal(second.payload.video.video2.avSerializer.parameters.withOpus, true);
+    assert.equal(second.payload.video.video3.avSerializer.parameters.opusSampleRate, 48000);
+
+    emulator.stopStream(mac, 'video2');
+    const stopped = sent.at(-1)!;
+    assert.deepEqual(stopped.payload.video.video2.avSerializer.parameters, {
+        withOpus: true,
+        opusSampleRate: 48000,
+    });
 });
 
 function clientFrame(payload: Buffer, opcode = 2, forceWide = false): Buffer {
