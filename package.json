@@ -34,7 +34,7 @@
     "scrypted-package-json": "scrypted-package-json",
     "lint": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "tsc -p tsconfig.test.json && node --test build-test/test/*.test.js",
-    "test:client-runners": "node scripts/browser-startup.js --self-test && node scripts/homekit-startup.js --self-test && node scripts/homekit-snapshot.js --self-test",
+    "test:client-runners": "node scripts/browser-startup.js --self-test && node scripts/homekit-startup.js --self-test && node scripts/homekit-snapshot.js --self-test && node scripts/set-homekit-replay-bootstrap.js --self-test",
     "test:soak": "python3 scripts/unifi-soak.py --self-test"
   },
   "main": "dist/main.nodejs.js",
