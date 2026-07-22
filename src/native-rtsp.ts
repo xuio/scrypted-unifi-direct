@@ -7,6 +7,7 @@ import type { LatestKeyframe, RtspServeHandle, SdpInfo } from './rtsp-session';
 import { ByteQueue } from './byte-queue';
 import { dbg } from './debug';
 import type { OpusBitRate } from './controller-emulator';
+import { inspectAvccAccessUnit, type CadenceDiagnostics } from './cadence-diagnostics';
 
 type Logger = { log?: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
@@ -706,6 +707,13 @@ export class PacedQueue {
 // Serve
 // ---------------------------------------------------------------------------
 
+export type NativeTerminalReason =
+    | 'pipeline-restart'
+    | 'flv-input-closed'
+    | 'rtsp-server-error'
+    | 'native-startup-error'
+    | 'serve-handle-destroyed';
+
 /**
  * Serve a de-trailered (standard) FLV Readable as an in-process RTSP server. The
  * FLV is demuxed and RTP-packetized directly (H.264 RFC 6184, AAC RFC 3640, or
@@ -735,9 +743,15 @@ export async function startNativeServe(opts: {
     /** Pause/resume the owning camera ingress when the pacer approaches its hard
      * queue bound. The callback must be cheap and must never throw into media. */
     onEgressPressure?: (paused: boolean, sample: EgressPressureSample) => void;
+    /** Bounded, aggregate-only observer shared with DirectStream. It never owns
+     * media buffers and emits at most one compact snapshot per interval. */
+    cadenceDiagnostics?: CadenceDiagnostics;
+    /** Exact terminal category for the owning DirectStream's final diagnostic. */
+    onTerminal?: (reason: NativeTerminalReason) => void;
 }): Promise<RtspServeHandle> {
     const { flv, hasAudio } = opts;
     const audioCodec = opts.audioCodec ?? 'aac';
+    const cadence = opts.cadenceDiagnostics;
     if (audioCodec === 'opus' && opts.opusBitRate !== 128000 && opts.opusBitRate !== 96000)
         throw new Error('Opus requires an explicit 128000 or 96000 bps profile');
 
@@ -747,7 +761,7 @@ export async function startNativeServe(opts: {
     let lastVideoRtp = performance.now();
     const sessions = new Set<RtspSession>();
     let server: net.Server | undefined;
-    let destroy: (() => void) | undefined;
+    let destroy: ((reason: NativeTerminalReason) => void) | undefined;
 
     let videoParams: VideoParams | undefined;
     let audioParams: AudioParams | undefined;
@@ -834,6 +848,14 @@ export async function startNativeServe(opts: {
     let pressureMaxQueued = 0;
     let pressurePauseCount = 0;
     let pressureResumeCount = 0;
+    // Reuse these tiny parallel scratch arrays across drains so diagnostics do
+    // not allocate one wrapper object per access unit on the hot path. The due
+    // value belongs to the marker packet and is the media deadline used by the
+    // pacer, not a wall-clock approximation sampled after fanout.
+    const videoMarkerTimestamps: number[] = [];
+    const videoMarkerDues: number[] = [];
+    const audioMarkerTimestamps: number[] = [];
+    const audioMarkerDues: number[] = [];
 
     const queued = () => videoEgress.length + audioEgress.length;
     const queueFront = (): PacedQueue => {
@@ -843,11 +865,16 @@ export async function startNativeServe(opts: {
         // Video wins a tie so a keyframe resets GOP history before same-time audio.
         return !a || (v && v.frontDue() <= a.frontDue()) ? v! : a;
     };
-    const clearEgress = () => {
+    const clearEgress = (reason: string) => {
+        const videoPackets = videoEgress.length;
+        const audioPackets = audioEgress.length;
+        if (videoPackets || audioPackets)
+            cadence?.recordQueueDiscard(videoPackets, audioPackets, reason);
         videoEgress.clear();
         audioEgress.clear();
     };
     const emitPressure = (paused: boolean) => {
+        cadence?.recordEgressPressure(paused);
         try {
             opts.onEgressPressure?.(paused, {
                 queued: queued(),
@@ -873,19 +900,21 @@ export async function startNativeServe(opts: {
             dbg('native-rtsp resuming camera ingress:', n, 'queued packets; peak', pressureMaxQueued);
             emitPressure(false);
         }
+        cadence?.recordQueue(n, pressurePaused);
     };
     const requestRestart = (reason: string) => {
         if (dead || restartRequested) return;
         restartRequested = true;
+        cadence?.recordRestart(reason);
         dbg('native-rtsp restarting media pipeline:', reason);
         clearTimeout(drainTimer);
         drainTimer = undefined;
-        clearEgress();
+        clearEgress('pipeline-restart');
         updatePressure();
         // This can be requested while attaching the FLV data listener, before the
         // cleanup closure below is assigned. Defer one microtask so startup has
         // completed its synchronous declarations.
-        queueMicrotask(() => destroy?.());
+        queueMicrotask(() => destroy?.('pipeline-restart'));
     };
 
     const enqueue = (control: string, pkts: Buffer[], mediaMs: number, keyframe: boolean) => {
@@ -946,29 +975,68 @@ export async function startNativeServe(opts: {
         }
         const batch: { control: string; packet: Buffer }[] = [];
         const audioOut: Buffer[] = [];
+        videoMarkerTimestamps.length = 0;
+        videoMarkerDues.length = 0;
+        audioMarkerTimestamps.length = 0;
+        audioMarkerDues.length = 0;
         let lastVideoTs: number | undefined, lastAudioTs: number | undefined;
         while (queued() && epoch + queueFront().frontDue() <= now) {
             const queue = queueFront();
             const control = queue === videoEgress ? 'trackID=0' : 'trackID=1';
+            const due = queue.frontDue();
             const packet = queue.frontPacket();
             const keyframeStart = queue.frontIsKeyframeStart();
+            const marker = queue.frontIsMarker();
             queue.shift();
             if (keyframeStart) { gop = []; gopBytes = 0; gopOverflow = false; }   // GOP history resets at the keyframe boundary, at send time
             if (control !== 'trackID=1' || gop.length) gopAppend(control, packet);
-            if (control === 'trackID=1') { lastAudioTs = packet.readUInt32BE(4); audioOut.push(packet); }
-            else lastVideoTs = packet.readUInt32BE(4);
+            if (control === 'trackID=1') {
+                lastAudioTs = packet.readUInt32BE(4);
+                audioOut.push(packet);
+                if (marker && cadence) {
+                    audioMarkerTimestamps.push(lastAudioTs);
+                    audioMarkerDues.push(due);
+                }
+            } else {
+                lastVideoTs = packet.readUInt32BE(4);
+                if (marker && cadence) {
+                    videoMarkerTimestamps.push(lastVideoTs);
+                    videoMarkerDues.push(due);
+                }
+            }
             // This wrapper is the synchronous RtspSession fanout contract. The
             // per-packet PACER wrapper has been removed; no mutable send object is
             // retained across drains or asynchronous writes.
             batch.push({ control, packet });
         }
         updatePressure();
+        const fanoutStartedAt = cadence ? performance.now() : 0;
         // audio tap: deliver at egress time, isolated from the media path.
         if (audioOut.length && audioSubs.size)
             for (const sub of audioSubs)
                 for (const p of audioOut) { try { sub.fn(p); } catch { } }
         if (batch.length) {
             for (const s of sessions) s.sendMixedBatch(batch);
+            if (cadence) {
+                const egressWall = performance.now();
+                let playingClients = 0;
+                for (const session of sessions)
+                    if (session.playing) playingClients++;
+                cadence.recordFanout(batch.length, egressWall - fanoutStartedAt);
+                for (let i = 0; i < videoMarkerTimestamps.length; i++)
+                    cadence.recordPacerVideoMarker(
+                        videoMarkerTimestamps[i], egressWall, playingClients, videoMarkerDues[i]);
+                if (audioParams) {
+                    for (let i = 0; i < audioMarkerTimestamps.length; i++)
+                        cadence.recordPacerAudioMarker(
+                            audioParams.codec,
+                            audioMarkerTimestamps[i],
+                            egressWall,
+                            audioParams.frameSamples,
+                            audioMarkerDues[i],
+                        );
+                }
+            }
             // stamp the RTCP RTP↔wall mapping at actual send time (post-pacer)
             if (lastVideoTs !== undefined) {
                 videoTrack.stamp(lastVideoTs);
@@ -1002,14 +1070,27 @@ export async function startNativeServe(opts: {
     };
 
     const handleVideoTag = (tsMs: number, d: Buffer) => {
-        if (d.length < 5) return;
-        const frameType = d[0] >> 4;
+        if (!d.length) {
+            cadence?.recordVideoMalformed('short-video-tag', tsMs, d.length, false);
+            return;
+        }
         const codecId = d[0] & 0x0f;
-        if (codecId !== 7) return;   // not AVC (caller routes h265 to ffmpeg)
+        if (codecId !== 7) {
+            cadence?.recordVideoTagIgnored();
+            return;   // not AVC (caller routes h265 to ffmpeg)
+        }
+        if (d.length < 5) {
+            cadence?.recordVideoMalformed('short-video-tag', tsMs, d.length, false);
+            return;
+        }
+        const frameType = d[0] >> 4;
         const pktType = d[1];
         if (pktType === 0) {
             const next = parseAvcC(d.subarray(5));
-            if (!next) return;
+            if (!next) {
+                cadence?.recordVideoMalformed('invalid-avcc', tsMs, d.length, false);
+                return;
+            }
             if (!videoParams) {
                 videoParams = next;
                 if (videoParams) {
@@ -1024,12 +1105,31 @@ export async function startNativeServe(opts: {
             }
             return;
         }
-        if (pktType !== 1 || !videoParams) return;
+        if (pktType !== 1) {
+            if (pktType === 2) cadence?.recordVideoTagIgnored();
+            else cadence?.recordVideoMalformed(`video-packet-type-${pktType}`, tsMs, d.length, false);
+            return;
+        }
+        if (!videoParams) {
+            cadence?.recordVideoTagIgnored();
+            return;
+        }
         // PTS = DTS + CTS (composition time is signed 24-bit, in ms).
         let cts = (d[2] << 16) | (d[3] << 8) | d[4];
         if (cts & 0x800000) cts -= 0x1000000;
+        const inspection = cadence
+            ? inspectAvccAccessUnit(d, 5, videoParams.nalLen)
+            : undefined;
         const nals = splitNals(d, 5, videoParams.nalLen);
-        if (!nals.length) return;
+        if (!nals.length) {
+            cadence?.recordVideoMalformed(
+                inspection?.valid ? 'empty-video-au' : `avcc-${inspection?.reason ?? 'empty-au'}`,
+                tsMs,
+                d.length,
+                false,
+            );
+            return;
+        }
         // FLV frameType is only metadata. Confirm an independently decodable
         // H.264 IDR (NAL type 5) before replacing snapshot/GOP bootstrap state;
         // otherwise a mislabeled intra frame can make the next client black.
@@ -1048,6 +1148,9 @@ export async function startNativeServe(opts: {
         const ts = mediaMs * (VIDEO_CLOCK / 1000);
         const pkts: Buffer[] = [];
         packetizeH264(videoTrack, videoParams, nals, ts, isKeyframe, pkts);
+        if (inspection && !inspection.valid)
+            cadence?.recordVideoMalformed(`avcc-${inspection.reason}`, tsMs, d.length, pkts.length > 0);
+        cadence?.recordVideoAu(mediaMs, d.length, isKeyframe, nals.length, pkts.length);
         if (keyframeArrival !== undefined)
             latestKeyframe = new LazyRtpKeyframe(keyframeArrival, pkts);
         // Hand off to the egress pacer, which schedules the send by media time
@@ -1122,6 +1225,7 @@ export async function startNativeServe(opts: {
             return;
         }
         if (!opusConfigSeen) return;
+        cadence?.recordOpusInputPacket(tsMs, d.length);
         if (!audioParams) {
             const config = parseOpusPacketProfile(d, opts.opusBitRate!);
             if (!config) {
@@ -1172,6 +1276,7 @@ export async function startNativeServe(opts: {
     const parser = new FlvTagParser((type, tsMs, data) => {
         try {
             if (restartRequested) return;
+            cadence?.recordParserFlvTag(type, data.length);
             if (type === 9) handleVideoTag(tsMs, data);
             else if (hasAudio && !audioBroken && audioCodec === 'aac' && type === 8) handleAacTag(tsMs, data);
             else if (hasAudio && !audioBroken && audioCodec === 'opus' && type === 10) handleOpusTag(tsMs, data);
@@ -1206,13 +1311,14 @@ export async function startNativeServe(opts: {
     }, 5000);
 
     let stallTimer: any;
-    destroy = () => {
+    destroy = reason => {
         if (dead) return;
         dead = true;
+        try { opts.onTerminal?.(reason); } catch { }
         clearInterval(rtcpTimer);
         clearInterval(stallTimer);
         clearTimeout(drainTimer);
-        clearEgress();
+        clearEgress(reason);
         updatePressure();
         flv.removeListener('data', feed);
         try { server?.close(); } catch { }
@@ -1222,7 +1328,7 @@ export async function startNativeServe(opts: {
         audioSubs.clear();
         try { flv.destroy(); } catch { }
     };
-    flv.once('close', () => destroy?.());
+    flv.once('close', () => destroy?.('flv-input-closed'));
     // Close RTSP clients at the point of failure instead of waiting for the
     // provider's coarse health poll. Their reconnect then creates a clean stream.
     stallTimer = setInterval(() => {
@@ -1242,7 +1348,7 @@ export async function startNativeServe(opts: {
             flv.once('close', onclose);
         });
     } catch (e) {
-        destroy?.();
+        destroy?.('native-startup-error');
         throw e;
     }
 
@@ -1372,12 +1478,12 @@ export async function startNativeServe(opts: {
             });
         });
     } catch (e) {
-        destroy?.();
+        destroy?.('native-startup-error');
         throw e;
     }
     server.on('error', e => {
         dbg('native-rtsp server error:', (e as Error)?.message);
-        destroy?.();
+        destroy?.('rtsp-server-error');
     });
     url = `rtsp://127.0.0.1:${(server.address() as AddressInfo).port}${pathToken}`;
     // destroy() may have raced the listen (flv died mid-await): close and bail.
@@ -1390,7 +1496,7 @@ export async function startNativeServe(opts: {
     lastVideoRtp = performance.now();
     return {
         url,
-        destroy: destroy!,
+        destroy: () => destroy?.('serve-handle-destroyed'),
         get clientCount() { return sessions.size; },
         get alive() { return !dead && (performance.now() - lastVideoRtp) < RTP_STALL_MS; },
         latestKeyframe: () => latestKeyframe,

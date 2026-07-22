@@ -1,5 +1,6 @@
 import dns from 'dns';
 import net from 'net';
+import { randomBytes } from 'crypto';
 import { PassThrough } from 'stream';
 import {
     sameAudioProfile,
@@ -8,9 +9,11 @@ import {
 } from './controller-emulator';
 import { PushPortRegistry, PushRoute } from './push-registry';
 import { RtspServeHandle } from './rtsp-session';
-import { startNativeServe } from './native-rtsp';
+import { startNativeServe, type NativeTerminalReason } from './native-rtsp';
 import { ByteQueue } from './byte-queue';
 import { dbg } from './debug';
+import { CadenceDiagnostics, type IngressPauseReason } from './cadence-diagnostics';
+import { writeCadenceSnapshot } from './cadence-log';
 
 export { ByteQueue };   // re-exported for the detrailer test's existing import path
 
@@ -115,8 +118,6 @@ const AUDIO_GRACE_MS = 250;
 export const SETTLE_BUFFER_HWM = 8 * 1024 * 1024;
 export const STEADY_BUFFER_HWM = 512 * 1024;
 
-type IngressPauseReason = 'flv-drain' | 'egress-pressure' | 'handoff';
-
 /**
  * One live direct stream for a camera+channel.
  *
@@ -148,6 +149,8 @@ export class DirectStream {
     } | undefined;
     private ingressPauseReasons = new Set<IngressPauseReason>();
     private ingressPausedSocket: net.Socket | undefined;
+    private cadenceDiagnostics: CadenceDiagnostics | undefined;
+    private nativeTerminalReason: NativeTerminalReason | undefined;
     private lastCandidateDataAt = 0;
     private settleTimer: any;
     private serve: RtspServeHandle | undefined;
@@ -251,6 +254,16 @@ export class DirectStream {
         if (published.codec !== profile.codec) return false;
         return profile.codec !== 'opus'
             || (published.codec === 'opus' && published.bitRate === profile.bitRate);
+    }
+
+    private createCadenceDiagnostics() {
+        const cadence = new CadenceDiagnostics({
+            mac: this.mac,
+            channel: this.channel,
+            generation: randomBytes(6).toString('hex'),
+        });
+        cadence.onSnapshot = writeCadenceSnapshot;
+        return cadence;
     }
 
     async start(): Promise<void> {
@@ -382,6 +395,7 @@ export class DirectStream {
                 let writable = true;
                 for (const part of clean) {
                     if (flv.destroyed) break;
+                    this.cadenceDiagnostics?.recordDetrailedPart(part);
                     if (!flv.write(part)) writable = false;
                 }
                 if (!writable) this.pauseIngress(sock, flv);
@@ -422,8 +436,12 @@ export class DirectStream {
      * reasons. In particular, a PassThrough `drain` must not resume the camera
      * while the RTP pacer is still above its egress high-water mark. */
     private setIngressPauseReason(reason: IngressPauseReason, active: boolean, socket = this.cameraSocket) {
+        const changed = active
+            ? !this.ingressPauseReasons.has(reason)
+            : this.ingressPauseReasons.has(reason);
         if (active) this.ingressPauseReasons.add(reason);
         else this.ingressPauseReasons.delete(reason);
+        if (changed) this.cadenceDiagnostics?.recordIngressPause(reason, active);
 
         if (this.stopped || !socket || socket.destroyed || socket !== this.cameraSocket) {
             if (!this.ingressPauseReasons.size) this.ingressPausedSocket = undefined;
@@ -444,6 +462,8 @@ export class DirectStream {
         const pending = this.ingressDrain;
         if (pending) pending.flv.removeListener('drain', pending.listener);
         this.ingressDrain = undefined;
+        for (const reason of this.ingressPauseReasons)
+            this.cadenceDiagnostics?.recordIngressPause(reason, false);
         this.ingressPauseReasons.clear();
         // Teardown destroys the socket; resuming it here could deliver one more
         // data event into a pipeline whose buffers are already being released.
@@ -462,6 +482,8 @@ export class DirectStream {
         this.detrailer = undefined;
         this.lastCandidateDataAt = 0;
         clearTimeout(this.settleTimer);
+        this.cadenceDiagnostics?.stop(`candidate-discarded:${reason}`);
+        this.cadenceDiagnostics = undefined;
         dbg('DS', this.mac, reason);
         try { oldFlv?.destroy(); } catch { }
         try { oldSocket?.destroy(); } catch { }
@@ -470,6 +492,9 @@ export class DirectStream {
     /** Lock onto a candidate FLV connection with a fresh pipeline and settle timer. */
     private adopt(sock: net.Socket) {
         this.clearIngressPauses();
+        this.cadenceDiagnostics?.stop('candidate-replaced');
+        this.cadenceDiagnostics = this.createCadenceDiagnostics();
+        this.nativeTerminalReason = undefined;
         this.cameraSocket = sock;
         this.flv = new PassThrough({ highWaterMark: SETTLE_BUFFER_HWM });
         this.detrailer = makeDetrailer();
@@ -492,6 +517,8 @@ export class DirectStream {
         }
         this.serveStarted = true;
         dbg('DS', this.mac, 'connection stable; starting native rtsp serve');
+        const cadence = this.cadenceDiagnostics ?? this.createCadenceDiagnostics();
+        this.cadenceDiagnostics = cadence;
         const settleFlv = this.flv;
         const steadyFlv = new PassThrough({ highWaterMark: STEADY_BUFFER_HWM });
         this.handoffSource = settleFlv;
@@ -507,10 +534,17 @@ export class DirectStream {
 
         // if this settled connection later collapses, mark dead for rebuild.
         steadyFlv.once('close', () => {
-            if (this.serveStarted && !this.stopped) {
-                dbg('DS', this.mac, 'native media pipeline closed; cleaning up generation');
-                this.stop();
-            }
+            // Native registers its own close listener during startNativeServe.
+            // Let every listener for this event run first so onTerminal can
+            // publish the exact cause before DirectStream emits its final record.
+            queueMicrotask(() => {
+                if (this.serveStarted && !this.stopped && this.serve) {
+                    dbg('DS', this.mac, 'native media pipeline closed; cleaning up generation');
+                    this.stop(this.nativeTerminalReason
+                        ? `native-${this.nativeTerminalReason}`
+                        : 'native-media-pipeline-closed');
+                }
+            });
         });
         try {
             // Async functions execute through their first await synchronously, so
@@ -525,6 +559,11 @@ export class DirectStream {
                     : undefined,
                 audioGraceMs: AUDIO_GRACE_MS,
                 logger: this.logger,
+                cadenceDiagnostics: cadence,
+                onTerminal: reason => {
+                    if (this.cadenceDiagnostics === cadence)
+                        this.nativeTerminalReason = reason;
+                },
                 onEgressPressure: paused => {
                     if (this.flv === steadyFlv)
                         this.setIngressPauseReason('egress-pressure', paused);
@@ -576,6 +615,10 @@ export class DirectStream {
             // still-undefined this.serve, so the freshly-built one would leak
             // (sockets, unreferenced). Destroy it and bail.
             if (this.stopped) { serve.destroy(); this.onServeFail?.(new Error('stopped')); return; }
+            if (!serve.alive) {
+                serve.destroy();
+                throw new Error('native media pipeline closed during startup');
+            }
             this.serve = serve;
             this.onServeReady?.();
         } catch (e) {
@@ -583,6 +626,10 @@ export class DirectStream {
             try { settleFlv.destroy(); } catch { }
             if (this.handoffSource === settleFlv) this.handoffSource = undefined;
             this.setIngressPauseReason('handoff', false);
+            cadence.stop(this.nativeTerminalReason
+                ? `native-${this.nativeTerminalReason}`
+                : 'native-startup-error');
+            if (this.cadenceDiagnostics === cadence) this.cadenceDiagnostics = undefined;
             this.onServeFail?.(e as Error);
         }
     }
@@ -597,7 +644,7 @@ export class DirectStream {
             // an established stream lost its feed → tear down for a clean rebuild.
             if (!this.stopped) {
                 dbg('DS', this.mac, 'stream connection dropped; tearing down for rebuild');
-                this.stop();
+                this.stop('camera-stream-disconnected');
             }
             return;
         }
@@ -606,9 +653,12 @@ export class DirectStream {
         try { this.flv?.destroy(); } catch { }
         this.flv = undefined;
         this.detrailer = undefined;
+        this.cadenceDiagnostics?.stop('candidate-connection-closed');
+        this.cadenceDiagnostics = undefined;
     }
 
-    stop() {
+    stop(reason = 'direct-stream-stop') {
+        if (this.stopped) return;
         this.stopped = true;
         clearTimeout(this.settleTimer);
         clearInterval(this.resolveTimer);
@@ -618,7 +668,12 @@ export class DirectStream {
         for (const s of this.cameraSockets) { try { s.destroy(); } catch { } }   // incl. non-adopted strays
         this.cameraSockets.clear();
         this.cameraSocket = undefined;
+        // Native teardown records any paced packets discarded by this terminal
+        // event. It no longer owns diagnostics.stop(), so do that teardown first
+        // and then emit one final aggregate with the DirectStream's exact cause.
         this.serve?.destroy();
+        this.cadenceDiagnostics?.stop(reason);
+        this.cadenceDiagnostics = undefined;
         try { this.flv?.destroy(); } catch { }
         try { this.handoffSource?.destroy(); } catch { }
         this.handoffSource = undefined;

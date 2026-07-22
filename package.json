@@ -35,6 +35,7 @@
     "lint": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.test.json --noEmit",
     "test": "tsc -p tsconfig.test.json && node --test build-test/test/*.test.js",
     "test:client-runners": "node scripts/browser-startup.js --self-test && node scripts/homekit-startup.js --self-test && node scripts/homekit-snapshot.js --self-test && node scripts/set-homekit-replay-bootstrap.js --self-test",
+    "test:cadence": "python3 scripts/test_video_cadence_soak.py && python3 scripts/video-cadence-soak.py --self-test",
     "test:soak": "python3 scripts/unifi-soak.py --self-test"
   },
   "main": "dist/main.nodejs.js",

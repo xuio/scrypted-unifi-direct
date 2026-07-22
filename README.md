@@ -184,6 +184,15 @@ the emulator TLS certificate.
   classifier used by the headless browser and open-source HAP startup/snapshot
   benchmarks. See [client startup validation](scripts/client-validation.md) for
   the non-GUI browser and HomeKit commands and pairing constraints.
+- `npm run test:cadence` — exercise the bounded dual-stream video/audio RTP
+  cadence validator and its fault-injection suite offline. For a live
+  high/medium soak, run `python3 scripts/video-cadence-soak.py --discover-log
+  /private/tmp/unifi-direct.log --camera-mac AABBCCDDEEFF --firmware-sha256
+  FIRMWARE_SHA256 --plugin-sha256 PLUGIN_SHA256 --source-sha256 SOURCE_SHA256
+  --duration 86400 --output ./video-cadence.json` on the Scrypted host. RTSP URLs
+  stay in memory; the atomic JSON report contains no credentials or random
+  stream-path tokens. Aggregate in-process diagnostics are written to the
+  bounded owner-only `/private/tmp/unifi-cadence.jsonl` log.
 - To run a real monitor, first enable **Mirror diagnostic events** in the plugin
   settings, then run the script in the same host or container namespace as the
   Scrypted plugin worker. Supply every expected camera and use a fresh,
