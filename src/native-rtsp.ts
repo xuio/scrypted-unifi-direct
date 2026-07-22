@@ -16,6 +16,10 @@ const RTP_STALL_MS = 8000;
 
 /** Max RTP payload bytes (mirrors the ffmpeg path's pkt_size=1200). */
 const MAX_PAYLOAD = 1200;
+const MIN_SPREAD_PACKETS = 20;
+const SPREAD_PACKETS_PER_MS = 6;
+const MAX_SPREAD_MS = 50;
+const SPREAD_MARGIN_MS = 5;
 const PT_VIDEO = 96;   // dynamic PT for H264/90000
 const PT_AUDIO = 97;   // dynamic PT for either AAC-hbr or Opus
 const VIDEO_CLOCK = 90000;
@@ -25,6 +29,75 @@ export const OPUS_CHANNELS = 1 as const;
 export const OPUS_FRAME_SAMPLES = 960 as const;
 export const OPUS_FRAME_DURATION_MS = 20 as const;
 export const OPUS_CONFIG = Buffer.from([0xcf, 0x00, 0x03, 0x00]);
+
+const OPUS_PACING_SERVO_GAIN = 1 / 32;
+const OPUS_PACING_MAX_CORRECTION_MS = 0.25;
+const OPUS_PACING_REBASE_PHASE_MS = 200;
+const OPUS_PACING_MIN_CONTIGUOUS_DELTA_MS = 10;
+const OPUS_PACING_MAX_CONTIGUOUS_DELTA_MS = 30;
+const OPUS_PACING_MAX_FORWARD_GAP_MS = 200;
+
+/** Smooth pacing timeline for fixed-duration Opus packets.
+ *
+ * The RTP clock must advance by exactly 960 samples for every emitted packet,
+ * but using that synthetic clock as the pacer's wall-time source forever lets a
+ * small camera clock-rate error accumulate until audio is seconds behind video.
+ * Track camera FLV time separately and slew the pacing deadline by at most a
+ * quarter millisecond per frame. Bounded forward gaps preserve elapsed camera
+ * time; backward or implausibly large timestamp resets rebase only the
+ * FLV-to-pacing offset. The deadline remains monotonic and the RTP clock remains
+ * completely independent. */
+export class OpusPacingClock {
+    private dueMs: number | undefined;
+    private flvOffsetMs = 0;
+    private lastFlvMs: number | undefined;
+
+    next(flvMs: number): number {
+        if (!Number.isFinite(flvMs)) throw new Error('invalid Opus FLV timestamp');
+        if (this.dueMs === undefined) {
+            this.dueMs = flvMs;
+            this.lastFlvMs = flvMs;
+            return this.dueMs;
+        }
+
+        const nominal = this.dueMs + OPUS_FRAME_DURATION_MS;
+        const flvDelta = flvMs - this.lastFlvMs!;
+        const phase = flvMs + this.flvOffsetMs - nominal;
+        const boundedForwardGap = flvDelta > OPUS_PACING_MAX_CONTIGUOUS_DELTA_MS
+            && flvDelta <= OPUS_PACING_MAX_FORWARD_GAP_MS;
+        if (boundedForwardGap) {
+            // A missing input packet still represents elapsed camera time. Keep
+            // that hole in the pacing timeline so repeated omissions cannot put
+            // audio seconds behind video. The RTP timestamp remains one +960
+            // step: the receiver observes a gap and conceals the missing audio.
+            this.dueMs += flvDelta;
+        } else if (flvDelta < OPUS_PACING_MIN_CONTIGUOUS_DELTA_MS
+            || flvDelta > OPUS_PACING_MAX_FORWARD_GAP_MS
+            || Math.abs(phase) > OPUS_PACING_REBASE_PHASE_MS) {
+            // Preserve one packet period across a backward/huge camera timestamp
+            // reset. Following it would move the deadline backward or far into
+            // the future, causing a burst or a multi-second freeze.
+            this.flvOffsetMs = nominal - flvMs;
+            this.dueMs = nominal;
+        } else {
+            const correction = Math.max(-OPUS_PACING_MAX_CORRECTION_MS,
+                Math.min(OPUS_PACING_MAX_CORRECTION_MS, phase * OPUS_PACING_SERVO_GAIN));
+            this.dueMs = nominal + correction;
+        }
+        this.lastFlvMs = flvMs;
+        return this.dueMs;
+    }
+}
+
+/** Return the pre-deadline egress window for one H.264 access unit. Small AUs
+ * stay synchronous; once an AU is large enough to form a meaningful writev
+ * burst, trickle it at the established six-packets/ms rate. The frame-interval
+ * cap preserves room for the next frame and is especially important for IDRs. */
+export function videoAuSpreadMs(packetCount: number, frameIntervalMs: number): number {
+    if (packetCount < MIN_SPREAD_PACKETS) return 0;
+    const spreadBudget = Math.max(0, frameIntervalMs - SPREAD_MARGIN_MS);
+    return Math.min(MAX_SPREAD_MS, spreadBudget, Math.ceil(packetCount / SPREAD_PACKETS_PER_MS));
+}
 
 // ---------------------------------------------------------------------------
 // FLV tag parsing (standard FLV — the detrailer already stripped UniFi's
@@ -682,6 +755,7 @@ export async function startNativeServe(opts: {
     let audioServed = false;      // audio made it into the SDP
     let sdpFinalized = false;     // immutable for this RTSP generation once built
     let audioTs: number | undefined;   // synthesized codec RTP clock
+    const opusPacingClock = new OpusPacingClock();
     let opusConfigSeen = false;
     let latestKeyframe: LatestKeyframe | undefined;   // lazy Annex-B for snapshots
     let onVideoParams: (() => void) | undefined;
@@ -735,9 +809,6 @@ export async function startNativeServe(opts: {
     // a 250 ms budget leaves nothing to smooth with — the IDR is already overdue
     // when it lands. 450 ms gives real headroom; the +latency is behind the prebuffer.
     const EGRESS_DELAY_MS = 450;
-    const BURST_SLICE = 120;
-    const MAX_SPREAD_MS = 50;
-    const SPREAD_MARGIN_MS = 5;
     const MAX_LATE_MS = 2000;
     const MAX_FUTURE_MS = 2000;
     const MAX_QUEUE = 8000;
@@ -821,14 +892,11 @@ export async function startNativeServe(opts: {
         if (restartRequested) return;
         const previousFrontDue = queued() ? queueFront().frontDue() : undefined;
         const n = pkts.length;
-        // Spread a large AU *before* its media deadline and finish its marker at
-        // mediaMs. Crucially, cap the window below the observed frame interval:
+        // Spread a multi-packet AU *before* its media deadline and finish its
+        // marker at mediaMs. Crucially, cap the window below the observed frame interval:
         // the old 150 ms post-deadline spread deterministically blocked 3-5 P
         // frames behind every IDR, then released them as a visible catch-up burst.
-        const spreadBudget = Math.max(0, videoFrameIntervalMs - SPREAD_MARGIN_MS);
-        const spread = control === 'trackID=0' && n > BURST_SLICE
-            ? Math.min(MAX_SPREAD_MS, spreadBudget, Math.ceil(n / 6))
-            : 0;
+        const spread = control === 'trackID=0' ? videoAuSpreadMs(n, videoFrameIntervalMs) : 0;
         const firstDue = mediaMs - spread;
         const target = control === 'trackID=0' ? videoEgress : audioEgress;
         for (let i = 0; i < n; i++)
@@ -1087,15 +1155,18 @@ export async function startNativeServe(opts: {
         // RFC 7587's RTP clock is always 48 kHz. This profile emits one 20 ms
         // frame per packet, so every emitted timestamp advances by exactly 960;
         // millisecond FLV timestamp quantization/resets never perturb that clock.
+        // Pacing is intentionally separate: a bounded servo follows the camera's
+        // FLV clock without ever changing, skipping, or regressing an RTP tick.
         if (audioTs === undefined) audioTs = Math.round(tsMs * (OPUS_RATE / 1000));
         const ts = audioTs;
         audioTs += OPUS_FRAME_SAMPLES;
+        const dueMs = opusPacingClock.next(tsMs);
         const pkts = packetizeOpus(audioTrack, d, ts);
         if (!pkts.length) {
             dbg('native-rtsp invalid/oversized Opus packet dropped:', d.length, 'bytes');
             return;
         }
-        enqueue('trackID=1', pkts, ts * 1000 / OPUS_RATE, false);
+        enqueue('trackID=1', pkts, dueMs, false);
     };
 
     const parser = new FlvTagParser((type, tsMs, data) => {

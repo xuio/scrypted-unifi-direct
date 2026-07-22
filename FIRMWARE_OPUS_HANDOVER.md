@@ -9,6 +9,6 @@ Please replace AAC with exactly **one high-quality Opus encoder/track**. Do not 
 - Scrypted may directly use/repacketize this source for compatible HomeKit 20/40/60 ms requests whose bitrate budget fits, keeping the encoded audio at 48 kHz while rewriting HomeKit RTP timing. A 30 ms request or lower bitrate requires an Opus-to-Opus session transcode; HKSV may transcode the same source to AAC. This does not require another camera encoder/output.
 - Keep the current AAC path on older firmware; do not infer Opus without the explicit capability/track metadata.
 
-**Integration gate:** the current UniFi Direct runtime still forces `withOpus: false`, parses only AAC from extended FLV, and advertises AAC RTSP. Do not make Opus-only firmware the default until native Opus ingest/SDP and capability/bitrate gating are deployed.
+**Integration gate:** the current UniFi Direct runtime satisfies this gate. It selects native Opus only when the camera explicitly advertises exactly `audioCodecs: ["opus"]` with 48 kHz support, parses the native extended-FLV Opus track, and publishes standards-compliant Opus SDP/RTP. Validation has observed 20 ms packets (96/128-byte firmware profiles) with exact 960-sample RTP cadence. Keep the explicit capability gate: older AAC firmware must continue on the existing AAC path, and firmware must expose only the single native Opus output—not parallel AAC/Opus encoders.
 
 Acceptance: 24 hours with no malformed packets, timestamp/cadence gaps, audible glitches, or quality regression versus the current mono 32 kHz / 128 kbit/s AAC profile.

@@ -7,10 +7,12 @@ import { PassThrough } from 'stream';
 import {
     FlvTagParser, parseAvcC, parseAsc, parseOpusConfig, parseOpusPacketProfile, opusPacketInfo,
     splitNals, toAnnexB, LazyRtpKeyframe, PacedQueue, RtpTrack,
-    packetizeH264, packetizeAac, packetizeOpus, buildSdp, startNativeServe,
+    packetizeH264, packetizeAac, packetizeOpus, buildSdp, startNativeServe, videoAuSpreadMs,
+    OpusPacingClock,
     type EgressPressureSample,
 } from '../src/native-rtsp';
 import { rng, randBytes, flvTag, flvHeader } from './helpers';
+import { RtspSession } from '../src/rtsp-session';
 
 // ---- FLV tag parsing ----
 
@@ -57,6 +59,18 @@ test('PacedQueue preserves FIFO/flags through head compaction without packet wra
     assert.equal(q.findLastMarkerDue(), 6199 / 3);
     q.clear();
     assert.equal(q.length, 0);
+});
+
+test('video AU spreading covers ordinary multi-packet frames without changing large-IDR pacing', () => {
+    const frameInterval = 1000 / 30;
+    assert.equal(videoAuSpreadMs(19, frameInterval), 0, 'tiny AUs should remain one synchronous writev');
+    for (const [packets, expectedMs] of [[20, 4], [60, 10], [85, 15], [119, 20], [120, 20], [121, 21]] as const)
+        assert.equal(videoAuSpreadMs(packets, frameInterval), expectedMs, `${packets}-packet AU`);
+
+    // The previous >120-packet path used this same ceil(n/6) formula and caps.
+    // Preserve its frame-interval headroom and global 50 ms backstop exactly.
+    assert.equal(videoAuSpreadMs(420, frameInterval), frameInterval - 5);
+    assert.equal(videoAuSpreadMs(420, 100), 50);
 });
 
 // ---- codec parameter parsing ----
@@ -177,6 +191,57 @@ test('Opus config and packet validation enforce the patched firmware contract', 
     const stereo = opusPacket(320);
     stereo[0] |= 0x04;
     assert.equal(parseOpusPacketProfile(stereo, 128000), undefined);
+});
+
+test('Opus pacing clock follows slow FLV drift with bounded monotonic slew', () => {
+    const frames = 120_000;   // 40 minutes: ±2400 ms without the servo
+    for (const driftPerFrame of [-0.02, 0.02]) {
+        const clock = new OpusPacingClock();
+        let flvMs = 10_000;
+        let previous = clock.next(flvMs);
+        for (let i = 0; i < frames; i++) {
+            flvMs += 20 + driftPerFrame;
+            const due = clock.next(flvMs);
+            const delta = due - previous;
+            assert.ok(delta >= 19.75 && delta <= 20.25,
+                `pacing slew escaped its bound: ${delta}ms`);
+            previous = due;
+        }
+        assert.ok(Math.abs(frames * driftPerFrame) > 2000,
+            'fixture must exceed the native pacer restart threshold without correction');
+        assert.ok(Math.abs(previous - flvMs) < 1,
+            `pacing clock accumulated phase error: due=${previous}, flv=${flvMs}`);
+    }
+});
+
+test('Opus pacing clock preserves bounded missing-frame time and rebases resets', () => {
+    const clock = new OpusPacingClock();
+    // A backward encoder reset retains one monotonic packet period. A bounded
+    // forward hole preserves its elapsed time, while a huge jump is treated as
+    // another reset rather than scheduling audio seconds into the future.
+    const due = [700, 720, 100, 120, 160, 180, 5000, 5020].map(ts => clock.next(ts));
+    assert.deepEqual(due, [700, 720, 740, 760, 800, 820, 840, 860]);
+
+    // Repeated one-frame omissions advance video/FLV by 40 ms per received
+    // packet. Absorbing those holes as 20 ms would exceed the pacer's 2-second
+    // late threshold after 101 packets; the pacing clock must never accumulate
+    // that lateness even though the separate RTP clock still advances by +960.
+    const missing = new OpusPacingClock();
+    let flvMs = 0;
+    let pacedMs = missing.next(flvMs);
+    for (let i = 0; i < 200; i++) {
+        flvMs += 40;
+        pacedMs = missing.next(flvMs);
+    }
+    assert.equal(pacedMs, flvMs);
+    assert.ok(flvMs - (200 * 20) > 2000, 'fixture must expose the old accumulated lateness');
+
+    // Integer-millisecond FLV quantization is a normal continuous clock, not a
+    // discontinuity; its correction remains much smaller than the hard bound.
+    const quantized = new OpusPacingClock();
+    const q = Array.from({ length: 500 }, (_, i) => quantized.next(Math.round(i * 20.02)));
+    const deltas = q.slice(1).map((value, i) => value - q[i]);
+    assert.ok(deltas.every(delta => delta > 19.9 && delta < 20.1));
 });
 
 test('splitNals splits length-prefixed units and tolerates truncation', () => {
@@ -424,6 +489,73 @@ async function connectMarkerClient(serve: { url: string }, capturePayloads = fal
     return { client, markers, packetTimes, videoPayloads };
 }
 
+test('an ordinary 85-packet video AU is spread on the actual RTSP egress path', async () => {
+    const sendTimes = new Map<number, number[]>();
+    const originalSendMixedBatch = RtspSession.prototype.sendMixedBatch;
+    RtspSession.prototype.sendMixedBatch = function (items) {
+        const now = performance.now();
+        for (const item of items) {
+            if (item.control !== 'trackID=0') continue;
+            const ts = item.packet.readUInt32BE(4);
+            const times = sendTimes.get(ts) ?? [];
+            times.push(now);
+            sendTimes.set(ts, times);
+        }
+        return originalSendMixedBatch.call(this, items);
+    };
+    const flv = new PassThrough();
+    let serve: Awaited<ReturnType<typeof startNativeServe>> | undefined;
+    let client: net.Socket | undefined;
+    try {
+        const servePromise = startNativeServe({ flv, hasAudio: false });
+        flv.write(Buffer.concat([
+            flvHeader(),
+            flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+            flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+        ]));
+        serve = await servePromise;
+        const connected = await connectMarkerClient(serve);
+        client = connected.client;
+        const { markers, packetTimes } = connected;
+        // Let the initial IDR establish the media/wall-clock epoch, then enqueue
+        // a representative P-frame. FU-A contributes 1198 source bytes per RTP
+        // packet, so this NAL packetizes to exactly the requested count.
+        await new Promise(r => setTimeout(r, 650));
+        packetTimes.clear();
+        sendTimes.clear();
+        const count = 85;
+        // This synthetic fixture starts with less than a full 450 ms reserve, so
+        // bootstrap intentionally anchors that partial backlog at "now". Keep
+        // the measured AU in the future just like the established pacer tests.
+        const base = 1100;
+        const nal = Buffer.alloc(1 + count * 1198, 1);
+        nal[0] = 0x41;
+        flv.write(flvTag(9, base, avcTagData(2, 1, lenPrefixed(nal))));
+
+        const deadline = Date.now() + 2500;
+        const complete = () => packetTimes.get(base * 90)?.length === count;
+        while (!complete() && Date.now() < deadline) await new Promise(r => setTimeout(r, 10));
+        assert.ok(complete(), 'timed out waiting for the paced access unit');
+
+        const times = sendTimes.get(base * 90)!;
+        assert.equal(times.length, count, 'sender did not emit every RTP packet');
+        assert.ok(markers.has(base * 90), 'receiver did not observe the final marker packet');
+        const span = times.at(-1)! - times[0];
+        const scheduled = videoAuSpreadMs(count, 1000 / 30);
+        // Timer and loopback-TCP granularity can coalesce neighboring due times,
+        // but this representative AU must still cross multiple event-loop turns.
+        assert.ok(span >= 4,
+            `${count}-packet AU collapsed to ${span.toFixed(1)}ms (scheduled ${scheduled}ms)`);
+        assert.ok(span <= scheduled + 25,
+            `${count}-packet AU exceeded its bounded window (${span.toFixed(1)}ms)`);
+        assert.ok(times.every((time, i) => i === 0 || time >= times[i - 1]), 'RTP packets were reordered');
+    } finally {
+        client?.destroy();
+        serve?.destroy();
+        RtspSession.prototype.sendMixedBatch = originalSendMixedBatch;
+    }
+});
+
 test('snapshot/GOP cache requires an actual IDR rather than FLV keyframe metadata', async () => {
     const flv = new PassThrough();
     const servePromise = startNativeServe({ flv, hasAudio: false });
@@ -640,6 +772,8 @@ test('Opus type-10 packets stay raw and advance the 48k RTP clock by exactly 960
             opusPacket(320, 3),
             opusPacket(320, 4),
             opusPacket(320, 5),
+            opusPacket(320, 6),
+            opusPacket(320, 7),
         ];
         flv.write(Buffer.concat([
             flvTag(10, 700, frames[0]),
@@ -647,16 +781,20 @@ test('Opus type-10 packets stay raw and advance the 48k RTP clock by exactly 960
             // A backward FLV reset must not perturb the RTP frame clock.
             flvTag(10, 100, frames[2]),
             flvTag(10, 120, frames[3]),
+            // A bounded missing-frame gap changes pacing, never the RTP step.
+            flvTag(10, 160, frames[4]),
+            flvTag(10, 180, frames[5]),
         ]));
         const deadline = Date.now() + 2500;
         while (packets.length < frames.length && Date.now() < deadline)
             await new Promise(r => setTimeout(r, 10));
         assert.equal(packets.length, frames.length);
         const parsed = packets.map(parseRtp);
-        assert.deepEqual(parsed.map(p => p.payload.length), [320, 320, 320, 320]);
+        assert.deepEqual(parsed.map(p => p.payload.length), frames.map(() => 320));
         assert.ok(parsed.every((p, i) => p.payload.equals(frames[i])),
             'Opus RTP payload gained AAC AU headers or other wrapping');
-        assert.deepEqual(parsed.slice(1).map((p, i) => (p.ts - parsed[i].ts) >>> 0), [960, 960, 960]);
+        assert.deepEqual(parsed.slice(1).map((p, i) => (p.ts - parsed[i].ts) >>> 0),
+            frames.slice(1).map(() => 960));
     } finally {
         unsubscribe();
         serve.destroy();
