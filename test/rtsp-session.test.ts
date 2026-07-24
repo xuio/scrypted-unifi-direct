@@ -1,8 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import net from 'net';
-import { once } from 'events';
-import { RtspSession, SdpInfo } from '../src/rtsp-session';
+import { EventEmitter, once } from 'events';
+import {
+    RtspSession,
+    SdpInfo,
+    type MixedBatchSerializationCache,
+} from '../src/rtsp-session';
 
 const SDP: SdpInfo = {
     sdp: 'v=0\r\nm=video 0 RTP/AVP 96\r\na=control:trackID=0\r\n',
@@ -42,6 +46,120 @@ async function setup(onPlay?: (session: RtspSession) => void) {
     const teardown = () => new Promise<void>(res => { client.destroy(); server.close(() => res()); });
     return { client, sessions, request, teardown, readBuf: () => buf, drainBuf: (n: number) => { buf = buf.subarray(n); } };
 }
+
+class RecordingSocket extends EventEmitter {
+    destroyed = false;
+    writable = true;
+    writableLength = 0;
+    readonly writes: Buffer[] = [];
+    corkCalls = 0;
+    uncorkCalls = 0;
+
+    setNoDelay() { }
+    cork() { this.corkCalls++; }
+    uncork() { this.uncorkCalls++; }
+    write(value: Buffer | string) {
+        this.writes.push(Buffer.isBuffer(value) ? value : Buffer.from(value));
+        return true;
+    }
+    destroy() {
+        this.destroyed = true;
+        this.writable = false;
+        return this;
+    }
+}
+
+function recordingSession(videoChannel?: number, audioChannel?: number) {
+    const socket = new RecordingSocket();
+    let closes = 0;
+    const session = new RtspSession(
+        socket as unknown as net.Socket,
+        SDP,
+        'rtsp://127.0.0.1/test',
+        () => closes++,
+    );
+    const channels = (session as unknown as { channels: Map<string, number> }).channels;
+    if (videoChannel !== undefined) channels.set('trackID=0', videoChannel);
+    if (audioChannel !== undefined) channels.set('trackID=1', audioChannel);
+    session.playing = true;
+    return { session, socket, closes: () => closes };
+}
+
+function interleavedFrames(data: Buffer) {
+    const frames: { channel: number; packet: Buffer }[] = [];
+    let offset = 0;
+    while (offset < data.length) {
+        assert.equal(data[offset], 0x24);
+        const length = data.readUInt16BE(offset + 2);
+        frames.push({
+            channel: data[offset + 1],
+            packet: data.subarray(offset + 4, offset + 4 + length),
+        });
+        offset += 4 + length;
+    }
+    assert.equal(offset, data.length);
+    return frames;
+}
+
+test('mixed live fanout serializes once per channel mapping and preserves packet order', () => {
+    const first = recordingSession(6, 10);
+    const peer = recordingSession(6, 10);
+    const remapped = recordingSession(2, 4);
+    const videoOnly = recordingSession(8);
+    const cache: MixedBatchSerializationCache = new Map();
+    const items = [
+        { control: 'trackID=0', packet: Buffer.from([1, 2, 3]) },
+        { control: 'trackID=1', packet: Buffer.from([4, 5]) },
+        { control: 'trackID=0', packet: Buffer.from([6]) },
+    ];
+
+    first.session.sendMixedBatch(items, cache);
+    peer.session.sendMixedBatch(items, cache);
+    remapped.session.sendMixedBatch(items, cache);
+    videoOnly.session.sendMixedBatch(items, cache);
+
+    for (const value of [first, peer, remapped, videoOnly]) {
+        assert.equal(value.socket.writes.length, 1, 'cached fanout must issue one socket write');
+        assert.equal(value.socket.corkCalls, 0);
+        assert.equal(value.socket.uncorkCalls, 0);
+    }
+    assert.strictEqual(
+        first.socket.writes[0],
+        peer.socket.writes[0],
+        'peers with the same channels did not share the serialized buffer',
+    );
+    assert.notStrictEqual(first.socket.writes[0], remapped.socket.writes[0]);
+    assert.equal(cache.size, 3);
+
+    const firstFrames = interleavedFrames(first.socket.writes[0]);
+    assert.deepEqual(firstFrames.map(frame => frame.channel), [6, 10, 6]);
+    assert.deepEqual(firstFrames.map(frame => [...frame.packet]), [[1, 2, 3], [4, 5], [6]]);
+    assert.deepEqual(
+        interleavedFrames(remapped.socket.writes[0]).map(frame => frame.channel),
+        [2, 4, 2],
+    );
+    assert.deepEqual(
+        interleavedFrames(videoOnly.socket.writes[0]).map(frame => frame.channel),
+        [8, 8],
+    );
+    assert.equal(first.session.sent, 3);
+    assert.equal(peer.session.sent, 3);
+    assert.equal(remapped.session.sent, 3);
+    assert.equal(videoOnly.session.sent, 2);
+});
+
+test('cached mixed batch applies backpressure before crossing the session cap', () => {
+    const value = recordingSession(0, 2);
+    value.socket.writableLength = 20 * 1024 * 1024;
+    value.session.sendMixedBatch([
+        { control: 'trackID=0', packet: Buffer.from([1, 2, 3]) },
+    ], new Map());
+
+    assert.equal(value.socket.writes.length, 0);
+    assert.equal(value.socket.destroyed, true);
+    assert.equal(value.closes(), 1);
+    assert.equal(value.session.sent, 0);
+});
 
 test('full handshake: OPTIONS/DESCRIBE/SETUP/PLAY, then interleaved RTP framing', async () => {
     const { sessions, request, teardown, readBuf, drainBuf } = await setup();

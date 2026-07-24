@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -44,8 +45,19 @@ def packet(
     )
 
 
-def analyzer(limit: int = 32, start_ns: int = 0, end_ns: int = 10_000_000_000):
-    value = cadence.VideoCadenceAnalyzer("test", anomaly_limit=limit)
+def analyzer(
+    limit: int = 32,
+    start_ns: int = 0,
+    end_ns: int = 10_000_000_000,
+    wall_gap_threshold_ms: float = cadence.DEFAULT_WALL_FAILURE_MS,
+    wall_warning_threshold_ms: float = cadence.DEFAULT_WALL_WARNING_MS,
+):
+    value = cadence.VideoCadenceAnalyzer(
+        "test",
+        anomaly_limit=limit,
+        wall_gap_threshold_ms=wall_gap_threshold_ms,
+        wall_warning_threshold_ms=wall_warning_threshold_ms,
+    )
     value.configure_window(start_ns, end_ns)
     return value
 
@@ -55,8 +67,15 @@ def audio_analyzer(
     start_ns: int = 0,
     end_ns: int = 10_000_000_000,
     codec: str = "opus",
+    wall_gap_threshold_ms: float = cadence.DEFAULT_WALL_FAILURE_MS,
+    wall_warning_threshold_ms: float = cadence.DEFAULT_WALL_WARNING_MS,
 ):
-    value = cadence.AudioCadenceAnalyzer("test-audio", anomaly_limit=limit)
+    value = cadence.AudioCadenceAnalyzer(
+        "test-audio",
+        anomaly_limit=limit,
+        wall_gap_threshold_ms=wall_gap_threshold_ms,
+        wall_warning_threshold_ms=wall_warning_threshold_ms,
+    )
     if codec == "opus":
         track = cadence.AudioTrack(97, "trackID=1", "opus", 48_000, 1, 2, 20.0)
     else:
@@ -392,7 +411,9 @@ class CommandPathTests(unittest.TestCase):
                     source_sha256="c" * 64,
                     duration=0.15,
                     startup_exclusion=0.02,
-                    wall_gap_ms=200.0,
+                    wall_warning_ms=40.0,
+                    wall_failure_ms=200.0,
+                    wall_gap_ms=None,
                     minimum_fps=1.0,
                     maximum_fps=200.0,
                     anomaly_limit=4,
@@ -407,6 +428,13 @@ class CommandPathTests(unittest.TestCase):
                 report = json.loads(report_text)
                 self.assertEqual(report["schema"], 2)
                 self.assertEqual(report["verdict"], "pass")
+                self.assertEqual(report["failure_reasons"], [])
+                self.assertIn("warning_reasons", report)
+                self.assertEqual(report["criteria"]["wall_gap_threshold_ms"], 200.0)
+                self.assertEqual(report["criteria"]["wall_gap_warning_threshold_ms"], 40.0)
+                self.assertEqual(report["criteria"]["wall_gap_failure_threshold_ms"], 200.0)
+                self.assertEqual(report["criteria"]["opus_wall_gap_threshold_ms"], 200.0)
+                self.assertEqual(report["criteria"]["opus_wall_gap_failure_threshold_ms"], 200.0)
                 self.assertEqual(set(report["streams"]), {"high", "medium"})
                 self.assertEqual(report["provenance"]["requested_camera_mac"], "1C6A1BFFAA3C")
                 self.assertEqual(report["provenance"]["firmware_sha256"], "a" * 64)
@@ -422,6 +450,53 @@ class CommandPathTests(unittest.TestCase):
             for server in servers:
                 server.close()
             self.assertEqual([server.error for server in servers], [None, None])
+
+    def test_wall_threshold_cli_preserves_the_legacy_hard_alias(self) -> None:
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["video-cadence-soak.py", "--output", "report.json", "--wall-gap-ms", "200"],
+        ):
+            args = cadence.parse_args()
+        self.assertEqual(cadence.resolve_wall_thresholds(args), (40.0, 200.0))
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            ["video-cadence-soak.py", "--output", "report.json", "--wall-gap-ms", "20"],
+        ):
+            args = cadence.parse_args()
+        self.assertEqual(cadence.resolve_wall_thresholds(args), (20.0, 20.0))
+
+        with mock.patch.object(
+            sys,
+            "argv",
+            [
+                "video-cadence-soak.py",
+                "--output",
+                "report.json",
+                "--wall-warning-ms",
+                "40",
+                "--wall-failure-ms",
+                "67",
+            ],
+        ):
+            args = cadence.parse_args()
+        self.assertEqual(cadence.resolve_wall_thresholds(args), (40.0, 67.0))
+
+    def test_legacy_40ms_hard_alias_disables_the_soft_range(self) -> None:
+        warning, failure = cadence.resolve_wall_thresholds(
+            SimpleNamespace(wall_warning_ms=40.0, wall_failure_ms=None, wall_gap_ms=40.0)
+        )
+        value = analyzer(
+            wall_gap_threshold_ms=failure,
+            wall_warning_threshold_ms=warning,
+        )
+        value.consume_rtp(packet(1, 1000), 0)
+        value.consume_rtp(packet(2, 3970), 40_000_001)
+        result = value.snapshot()
+        self.assertEqual(result["anomaly_counts"]["wall_gap_gt_threshold"], 1)
+        self.assertEqual(result["warning_counts"]["wall_gap_warning"], 0)
 
 
 class AudioCadenceTests(unittest.TestCase):
@@ -454,7 +529,9 @@ class AudioCadenceTests(unittest.TestCase):
         self.assertEqual(counts["sequence_gap"], 1)
         self.assertEqual(counts["opus_timestamp_delta_unexpected"], 1)
         self.assertEqual(counts["opus_timestamp_gap_gt_40ms"], 1)
-        self.assertEqual(counts["opus_wall_gap_gt_40ms"], 1)
+        self.assertEqual(counts["opus_wall_gap_gt_40ms"], 0)
+        self.assertEqual(counts["opus_wall_gap_gt_threshold"], 0)
+        self.assertEqual(audio_result["warning_counts"]["opus_wall_gap_warning"], 1)
         self.assertEqual(counts["opus_packet_duration_unexpected"], 1)
         video = analyzer()
         video.consume_rtp(packet(1, 1000), 0)
@@ -469,6 +546,33 @@ class AudioCadenceTests(unittest.TestCase):
             maximum_fps=100,
         )
         self.assertTrue(any("audio sequence_gap" in failure for failure in failures))
+
+    def test_opus_isolated_wall_gap_warns_but_consecutive_or_hard_gaps_fail(self) -> None:
+        isolated = audio_analyzer()
+        isolated.consume_rtp(audio_packet(1, 0), 0)
+        isolated.consume_rtp(audio_packet(2, 960), 45_000_000)
+        isolated.consume_rtp(audio_packet(3, 1920), 65_000_000)
+        result = isolated.snapshot()
+        self.assertEqual(result["warning_counts"]["opus_wall_gap_warning"], 1)
+        self.assertEqual(result["anomaly_counts"]["opus_wall_gap_gt_threshold"], 0)
+        self.assertEqual(result["anomaly_counts"]["opus_wall_gap_consecutive"], 0)
+
+        consecutive = audio_analyzer()
+        consecutive.consume_rtp(audio_packet(1, 0), 0)
+        consecutive.consume_rtp(audio_packet(2, 960), 45_000_000)
+        consecutive.consume_rtp(audio_packet(3, 1920), 90_000_000)
+        self.assertEqual(
+            consecutive.snapshot()["anomaly_counts"]["opus_wall_gap_consecutive"],
+            1,
+        )
+
+        hard = audio_analyzer()
+        hard.consume_rtp(audio_packet(1, 0), 0)
+        hard.consume_rtp(audio_packet(2, 960), 67_000_001)
+        self.assertEqual(
+            hard.snapshot()["anomaly_counts"]["opus_wall_gap_gt_threshold"],
+            1,
+        )
 
     def test_audio_duplicate_and_reorder_do_not_create_a_fictitious_next_gap(self) -> None:
         value = audio_analyzer()
@@ -637,7 +741,7 @@ class CadenceTests(unittest.TestCase):
     def test_missing_frame_fault_trips_all_relevant_gates(self) -> None:
         value = analyzer()
         value.consume_rtp(packet(10, 1000), 0)
-        value.consume_rtp(packet(12, 7030), 67_000_000)
+        value.consume_rtp(packet(12, 7030), 68_000_000)
         result = value.snapshot()
         counts = result["anomaly_counts"]
         self.assertEqual(counts["sequence_gap"], 1)
@@ -655,16 +759,103 @@ class CadenceTests(unittest.TestCase):
         self.assertEqual(counts["timestamp_delta_unexpected"], 1)
         self.assertEqual(counts["timestamp_gap_gt_40ms"], 0)
 
-    def test_wall_gap_threshold_is_strictly_greater_than_40ms(self) -> None:
+    def test_wall_gap_warning_and_failure_boundaries_are_strict(self) -> None:
         at_40 = analyzer()
         at_40.consume_rtp(packet(1, 1000), 0)
         at_40.consume_rtp(packet(2, 3970), 40_000_000)
         self.assertEqual(at_40.snapshot()["anomaly_counts"]["wall_gap_gt_threshold"], 0)
+        self.assertEqual(at_40.snapshot()["warning_counts"]["wall_gap_warning"], 0)
 
         above_40 = analyzer()
         above_40.consume_rtp(packet(1, 1000), 0)
         above_40.consume_rtp(packet(2, 3970), 40_000_001)
-        self.assertEqual(above_40.snapshot()["anomaly_counts"]["wall_gap_gt_threshold"], 1)
+        self.assertEqual(above_40.snapshot()["anomaly_counts"]["wall_gap_gt_threshold"], 0)
+        self.assertEqual(above_40.snapshot()["warning_counts"]["wall_gap_warning"], 1)
+
+        at_67 = analyzer()
+        at_67.consume_rtp(packet(1, 1000), 0)
+        at_67.consume_rtp(packet(2, 3970), 67_000_000)
+        self.assertEqual(at_67.snapshot()["anomaly_counts"]["wall_gap_gt_threshold"], 0)
+        self.assertEqual(at_67.snapshot()["warning_counts"]["wall_gap_warning"], 1)
+
+        above_67 = analyzer()
+        above_67.consume_rtp(packet(1, 1000), 0)
+        above_67.consume_rtp(packet(2, 3970), 67_000_001)
+        self.assertEqual(above_67.snapshot()["anomaly_counts"]["wall_gap_gt_threshold"], 1)
+        self.assertEqual(above_67.snapshot()["warning_counts"]["wall_gap_warning"], 0)
+
+    def test_isolated_wall_gap_is_a_warning_and_does_not_weaken_media_gates(self) -> None:
+        value = analyzer()
+        value.consume_rtp(packet(1, 1000), 0)
+        value.consume_rtp(packet(2, 3970), 45_000_000)
+        value.consume_rtp(packet(3, 7030), 79_000_000)
+        result = value.snapshot()
+
+        self.assertEqual(result["aus"]["clean"], 2)
+        self.assertEqual(result["aus"]["cadence_or_transport_violations"], 0)
+        self.assertEqual(result["anomalies_total"], 0)
+        self.assertEqual(result["warning_counts"]["wall_gap_warning"], 1)
+        self.assertEqual(result["warnings"][0]["kind"], "wall_gap_warning")
+        self.assertEqual(result["wall_arrival"]["max_consecutive_warnings"], 1)
+        self.assertEqual(
+            cadence.evaluate_stream(
+                result,
+                requested_seconds=0.079,
+                minimum_fps=1,
+                maximum_fps=100,
+            ),
+            [],
+        )
+        self.assertEqual(
+            cadence.evaluate_stream_warnings(result),
+            ["wall_gap_warning=1"],
+        )
+
+        strict = analyzer()
+        strict.consume_rtp(packet(1, 1000), 0)
+        strict.consume_rtp(packet(3, 3970), 45_000_000)
+        failures = cadence.evaluate_stream(
+            strict.snapshot(),
+            requested_seconds=0.045,
+            minimum_fps=1,
+            maximum_fps=100,
+        )
+        self.assertTrue(any("sequence_gap" in failure for failure in failures))
+
+    def test_consecutive_warning_gaps_are_a_hard_failure(self) -> None:
+        value = analyzer()
+        value.consume_rtp(packet(1, 1000), 0)
+        value.consume_rtp(packet(2, 3970), 45_000_000)
+        value.consume_rtp(packet(3, 7030), 90_000_000)
+        result = value.snapshot()
+
+        self.assertEqual(result["warning_counts"]["wall_gap_warning"], 2)
+        self.assertEqual(result["anomaly_counts"]["wall_gap_consecutive"], 1)
+        self.assertEqual(result["wall_arrival"]["max_consecutive_warnings"], 2)
+        failures = cadence.evaluate_stream(
+            result,
+            requested_seconds=0.09,
+            minimum_fps=1,
+            maximum_fps=100,
+        )
+        self.assertTrue(any("wall_gap_consecutive" in failure for failure in failures))
+
+    def test_receiver_warning_ring_is_bounded_independently_from_anomalies(self) -> None:
+        value = analyzer(limit=3)
+        value.consume_rtp(packet(1, 1000), 0)
+        sequence = 1
+        timestamp = 1000
+        wall = 0
+        for index in range(20):
+            sequence += 1
+            timestamp += 2970 if index % 3 else 3060
+            wall += 45_000_000 if index % 2 == 0 else 20_000_000
+            value.consume_rtp(packet(sequence, timestamp), wall)
+        result = value.snapshot()
+        self.assertEqual(result["warnings_total"], 10)
+        self.assertEqual(result["warnings_retained"], 3)
+        self.assertEqual(result["warnings_evicted"], 7)
+        self.assertEqual(result["anomalies_total"], 0)
 
     def test_orphan_fu_and_unterminated_fu_are_structurally_malformed(self) -> None:
         orphan = analyzer()
@@ -737,7 +928,11 @@ class CadenceTests(unittest.TestCase):
             value.consume_rtp(packet(sequence, timestamp), wall)
         result = value.snapshot()
         self.assertEqual(result["anomalies_retained"], 3)
-        self.assertGreater(result["anomalies_evicted"], 300)
+        self.assertGreater(result["anomalies_evicted"], 0)
+        self.assertEqual(
+            result["anomalies_evicted"],
+            result["anomalies_total"] - result["anomalies_retained"],
+        )
         self.assertEqual(len(result["anomalies"]), 3)
 
     def test_two_analyzers_can_be_driven_concurrently(self) -> None:

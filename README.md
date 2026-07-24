@@ -48,7 +48,9 @@ controller:
    demuxed and RTP-packetized in pure JS (H.264 RFC 6184, AAC RFC 3640, or Opus
    RFC 7587) and served
    by an in-process RTSP server — no re-encode, no ffmpeg subprocess, no external
-   media server. Scrypted connects to it like any RTSP camera.
+   media server. Scrypted connects to it like any RTSP camera. Live fanout
+   serializes an interleaved RTP batch once for clients with the same negotiated
+   channels, while a single client and GOP replay retain the no-copy writev path.
 4. **Management commands** — settings, detection enables, and all zone types are
    applied with the same `Change*Settings` messages Protect uses (not the camera's
    local HTTP API), for true parity.
@@ -191,7 +193,12 @@ the emulator TLS certificate.
   FIRMWARE_SHA256 --plugin-sha256 PLUGIN_SHA256 --source-sha256 SOURCE_SHA256
   --duration 86400 --output ./video-cadence.json` on the Scrypted host. RTSP URLs
   stay in memory; the atomic JSON report contains no credentials or random
-  stream-path tokens. Aggregate in-process diagnostics are written to the
+  stream-path tokens. Isolated receiver-arrival gaps over 40 through 67 ms are
+  warnings; gaps over 67 ms, consecutive warnings, and every RTP/media-integrity
+  defect remain hard failures. The thresholds are configurable with
+  `--wall-warning-ms` and `--wall-failure-ms`; the old `--wall-gap-ms` remains a
+  deprecated hard-threshold alias. Aggregate in-process diagnostics, including
+  pacer-deadline lateness and process event-loop delay, are written to the
   bounded owner-only `/private/tmp/unifi-cadence.jsonl` log.
 - To run a real monitor, first enable **Mirror diagnostic events** in the plugin
   settings, then run the script in the same host or container namespace as the

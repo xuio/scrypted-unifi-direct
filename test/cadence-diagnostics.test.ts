@@ -300,6 +300,33 @@ test('Opus input, +960 audio RTP, wall gaps, and A/V due offsets are independent
     assert.equal(snapshot.lifetime_gauges.max_abs_av_due_offset_ms, 80);
 });
 
+test('pacer drain deadline lateness is counted once and exposes process event-loop delay', () => {
+    const diagnostics = makeDiagnostics();
+    for (const lateness of [-2, 5, 5.25, 12.5, Number.NaN])
+        diagnostics.recordPacerDrain(lateness);
+
+    const snapshot = diagnostics.snapshot();
+    assert.equal(snapshot.totals.pacer_drain_callbacks, 5);
+    assert.equal(snapshot.totals.pacer_drain_deadline_lateness_ms, 22.75);
+    assert.equal(snapshot.totals.pacer_drain_late_over_5ms, 2);
+    assert.equal(snapshot.totals.pacer_drain_late_over_10ms, 1);
+    assert.equal(snapshot.lifetime_gauges.max_pacer_drain_deadline_lateness_ms, 12.5);
+    assert.equal(
+        snapshot.recent_anomalies.filter(anomaly =>
+            anomaly.kind === 'pacer_drain_deadline_late').length,
+        1,
+        'one late drain must produce exactly one diagnostic anomaly',
+    );
+    assert.equal(snapshot.lifetime_gauges.process_event_loop_delay_resolution_ms, 5);
+    for (const value of [
+        snapshot.lifetime_gauges.process_event_loop_delay_mean_ms,
+        snapshot.lifetime_gauges.process_event_loop_delay_p95_ms,
+        snapshot.lifetime_gauges.process_event_loop_delay_p99_ms,
+        snapshot.lifetime_gauges.process_event_loop_delay_max_ms,
+    ])
+        assert.ok(Number.isFinite(value) && value >= 0);
+});
+
 test('native serve wires parser, AVCC, AU, pacer, fanout, and final diagnostics', async () => {
     const diagnostics = new CadenceDiagnostics({
         ...streamIdentity,

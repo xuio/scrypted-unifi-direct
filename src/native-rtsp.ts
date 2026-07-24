@@ -3,7 +3,12 @@ import { randomBytes } from 'crypto';
 import { performance } from 'perf_hooks';
 import type { Readable } from 'stream';
 import { RtspSession } from './rtsp-session';
-import type { LatestKeyframe, RtspServeHandle, SdpInfo } from './rtsp-session';
+import type {
+    LatestKeyframe,
+    MixedBatchSerializationCache,
+    RtspServeHandle,
+    SdpInfo,
+} from './rtsp-session';
 import { ByteQueue } from './byte-queue';
 import { dbg } from './debug';
 import type { OpusBitRate } from './controller-emulator';
@@ -962,6 +967,7 @@ export async function startNativeServe(opts: {
         const front = queueFront();
         if (!epoch) epoch = now - front.frontDue() + EGRESS_DELAY_MS;
         const drift = (epoch + front.frontDue()) - now;
+        cadence?.recordPacerDrain(Math.max(0, -drift));
         if (drift > MAX_FUTURE_MS) {
             // Encoder timestamp reset/jump. Waiting seconds while valid packets
             // arrive is a frozen live view; re-anchor this generation promptly.
@@ -1016,7 +1022,15 @@ export async function startNativeServe(opts: {
             for (const sub of audioSubs)
                 for (const p of audioOut) { try { sub.fn(p); } catch { } }
         if (batch.length) {
-            for (const s of sessions) s.sendMixedBatch(batch);
+            // With multiple consumers, serialize once per negotiated channel
+            // mapping and share that immutable buffer across their socket writes.
+            // A lone consumer keeps the existing zero-copy cork/writev path.
+            let playingSessions = 0;
+            for (const session of sessions)
+                if (session.playing) playingSessions++;
+            const serializedByChannels: MixedBatchSerializationCache | undefined =
+                playingSessions > 1 ? new Map() : undefined;
+            for (const s of sessions) s.sendMixedBatch(batch, serializedByChannels);
             if (cadence) {
                 const egressWall = performance.now();
                 let playingClients = 0;

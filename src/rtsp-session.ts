@@ -98,6 +98,18 @@ const MAX_RTP_BACKLOG = 20 * 1024 * 1024;
  *  a broken/hostile client. */
 const MAX_REQUEST_BUF = 128 * 1024;
 
+interface SerializedMixedBatch {
+    readonly data: Buffer;
+    readonly packets: number;
+}
+
+/**
+ * Per-fanout cache for an immutable RTSP-interleaved batch. Sessions which
+ * negotiated the same RTP channels can safely share the serialized Buffer:
+ * net.Socket.write() retains but does not mutate it.
+ */
+export type MixedBatchSerializationCache = Map<string, SerializedMixedBatch>;
+
 /**
  * A single RTSP client session (Scrypted connects out as the client). Speaks
  * just enough RTSP-over-TCP: OPTIONS / DESCRIBE / SETUP (interleaved) / PLAY /
@@ -290,10 +302,67 @@ export class RtspSession {
         }
     }
 
-    /** Relay a corked burst of packets spanning BOTH tracks in original order
-     *  (used for GOP replay, where video and audio interleave). */
-    sendMixedBatch(items: readonly { control: string; packet: Buffer }[]) {
-        if (!items.length || this.socket.destroyed) return;
+    /**
+     * Relay a burst spanning both tracks in original order.
+     *
+     * Live fanout supplies one cache shared by every session in that drain.
+     * The first session serializes one immutable interleaved Buffer for its
+     * negotiated channel mapping; peers with the same mapping reuse it and
+     * issue one socket.write() each. A call without a cache (notably one-client
+     * GOP replay) retains the no-copy cork/writev path so a 16 MiB history does
+     * not need a second contiguous allocation.
+     */
+    sendMixedBatch(
+        items: readonly { control: string; packet: Buffer }[],
+        serializedByChannels?: MixedBatchSerializationCache,
+    ) {
+        if (!items.length || !this.playing || this.socket.destroyed || !this.socket.writable) return;
+        if (serializedByChannels) {
+            const videoChannel = this.channels.get('trackID=0');
+            const audioChannel = this.channels.get('trackID=1');
+            // Native mixed batches contain only these two controls. Preserve the
+            // generic/no-copy behavior if another caller ever supplies one.
+            if (items.every(item => item.control === 'trackID=0' || item.control === 'trackID=1')) {
+                const cacheKey = `${videoChannel ?? '-'}:${audioChannel ?? '-'}`;
+                let serialized = serializedByChannels.get(cacheKey);
+                if (!serialized) {
+                    let bytes = 0;
+                    let packets = 0;
+                    for (const item of items) {
+                        const channel = item.control === 'trackID=0' ? videoChannel : audioChannel;
+                        if (channel === undefined) continue;
+                        bytes += 4 + item.packet.length;
+                        packets++;
+                    }
+                    if (!packets) return;
+                    const data = Buffer.allocUnsafe(bytes);
+                    let offset = 0;
+                    for (const item of items) {
+                        const channel = item.control === 'trackID=0' ? videoChannel : audioChannel;
+                        if (channel === undefined) continue;
+                        data[offset] = RTSP_MAGIC;
+                        data[offset + 1] = channel;
+                        data.writeUInt16BE(item.packet.length, offset + 2);
+                        offset += 4;
+                        item.packet.copy(data, offset);
+                        offset += item.packet.length;
+                    }
+                    serialized = { data, packets };
+                    serializedByChannels.set(cacheKey, serialized);
+                }
+                // Include this batch in the guard: do not knowingly cross the
+                // cap and wait for a later packet to notice the stalled reader.
+                if (this.socket.writableLength + serialized.data.length > MAX_RTP_BACKLOG) {
+                    dbg('rtsp client backpressure, dropping session', this.ua, this.socket.writableLength);
+                    this.close();
+                    return;
+                }
+                this.socket.write(serialized.data);
+                this.sent += serialized.packets;
+                return;
+            }
+        }
+
         this.socket.cork();
         try {
             for (const it of items) {

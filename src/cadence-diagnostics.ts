@@ -1,4 +1,22 @@
-import { performance } from 'perf_hooks';
+import { monitorEventLoopDelay, performance } from 'perf_hooks';
+
+// One process-wide histogram is enough: every camera stream shares this Node
+// event loop. Never reset it from an individual stream, or staggered cadence
+// snapshots would erase one another's evidence.
+const PROCESS_EVENT_LOOP_DELAY_RESOLUTION_MS = 5;
+const processEventLoopDelay = monitorEventLoopDelay({
+    resolution: PROCESS_EVENT_LOOP_DELAY_RESOLUTION_MS,
+});
+processEventLoopDelay.enable();
+
+function eventLoopNsToMs(value: number) {
+    // monitorEventLoopDelay reports the complete sampling interval, which has
+    // a floor equal to its configured resolution. Expose the excess so an idle
+    // loop reads near zero and 7–15 ms stalls remain visible.
+    return Number.isFinite(value)
+        ? Math.max(0, value / 1_000_000 - PROCESS_EVENT_LOOP_DELAY_RESOLUTION_MS)
+        : 0;
+}
 
 export type IngressPauseReason = 'flv-drain' | 'egress-pressure' | 'handoff';
 
@@ -59,6 +77,10 @@ const METRIC_NAMES = [
     'pacer_release_batches',
     'pacer_release_packets',
     'pacer_release_fanout_over_5ms',
+    'pacer_drain_callbacks',
+    'pacer_drain_deadline_lateness_ms',
+    'pacer_drain_late_over_5ms',
+    'pacer_drain_late_over_10ms',
     'queue_discard_events',
     'video_rtp_packets_discarded',
     'audio_rtp_packets_discarded',
@@ -151,6 +173,12 @@ export interface CadenceSnapshot {
         max_audio_wall_gap_ms: number;
         max_abs_av_due_offset_ms: number;
         max_pacer_release_fanout_ms: number;
+        max_pacer_drain_deadline_lateness_ms: number;
+        process_event_loop_delay_resolution_ms: number;
+        process_event_loop_delay_mean_ms: number;
+        process_event_loop_delay_p95_ms: number;
+        process_event_loop_delay_p99_ms: number;
+        process_event_loop_delay_max_ms: number;
         last_keyframe_process_monotonic_ms: number | null;
         observer_timer_lag_ms: number;
         max_observer_timer_lag_ms: number;
@@ -197,6 +225,7 @@ export class CadenceDiagnostics {
     private maxAudioWallGapMs = 0;
     private maxAbsAvDueOffsetMs = 0;
     private maxPacerReleaseFanoutMs = 0;
+    private maxPacerDrainDeadlineLatenessMs = 0;
     private maxIngressPauseUnionMs = 0;
     private lastKeyframeProcessMonotonicMs: number | undefined;
     private observerTimerLagMs = 0;
@@ -458,6 +487,21 @@ export class CadenceDiagnostics {
         }
     }
 
+    recordPacerDrain(deadlineLatenessMs: number) {
+        const lateness = Number.isFinite(deadlineLatenessMs)
+            ? Math.max(0, deadlineLatenessMs)
+            : 0;
+        this.increment('pacer_drain_callbacks');
+        this.increment('pacer_drain_deadline_lateness_ms', lateness);
+        this.maxPacerDrainDeadlineLatenessMs =
+            Math.max(this.maxPacerDrainDeadlineLatenessMs, lateness);
+        if (lateness > 5) this.increment('pacer_drain_late_over_5ms');
+        if (lateness > 10) {
+            this.increment('pacer_drain_late_over_10ms');
+            this.anomaly('pacer_drain_deadline_late', `lateness_ms=${lateness.toFixed(3)}`);
+        }
+    }
+
     recordQueueDiscard(videoPackets: number, audioPackets: number, reason: string) {
         if (!videoPackets && !audioPackets) return;
         this.increment('queue_discard_events');
@@ -562,6 +606,17 @@ export class CadenceDiagnostics {
                 max_audio_wall_gap_ms: Number(this.maxAudioWallGapMs.toFixed(3)),
                 max_abs_av_due_offset_ms: Number(this.maxAbsAvDueOffsetMs.toFixed(3)),
                 max_pacer_release_fanout_ms: Number(this.maxPacerReleaseFanoutMs.toFixed(3)),
+                max_pacer_drain_deadline_lateness_ms:
+                    Number(this.maxPacerDrainDeadlineLatenessMs.toFixed(3)),
+                process_event_loop_delay_resolution_ms: PROCESS_EVENT_LOOP_DELAY_RESOLUTION_MS,
+                process_event_loop_delay_mean_ms:
+                    Number(eventLoopNsToMs(processEventLoopDelay.mean).toFixed(3)),
+                process_event_loop_delay_p95_ms:
+                    Number(eventLoopNsToMs(processEventLoopDelay.percentile(95)).toFixed(3)),
+                process_event_loop_delay_p99_ms:
+                    Number(eventLoopNsToMs(processEventLoopDelay.percentile(99)).toFixed(3)),
+                process_event_loop_delay_max_ms:
+                    Number(eventLoopNsToMs(processEventLoopDelay.max).toFixed(3)),
                 last_keyframe_process_monotonic_ms: this.lastKeyframeProcessMonotonicMs === undefined
                     ? null
                     : Number(this.lastKeyframeProcessMonotonicMs.toFixed(3)),

@@ -39,7 +39,9 @@ VIDEO_CLOCK = 90_000
 OPUS_CLOCK = 48_000
 OPUS_FRAME_TICKS = 960
 EXPECTED_TIMESTAMP_DELTAS = (2_970, 3_060)  # FLV 33/34 ms at 90 kHz.
-DEFAULT_WALL_GAP_MS = 40.0
+DEFAULT_WALL_WARNING_MS = 40.0
+DEFAULT_WALL_FAILURE_MS = 67.0
+DEFAULT_WALL_GAP_MS = DEFAULT_WALL_FAILURE_MS  # Legacy hard-threshold name.
 DEFAULT_AV_DRIFT_MS = 40.0
 DEFAULT_ANOMALY_LIMIT = 32
 DEFAULT_STARTUP_EXCLUSION_SECONDS = 10.0
@@ -58,6 +60,7 @@ ANOMALY_KINDS = (
     "timestamp_delta_unexpected",
     "timestamp_gap_gt_40ms",
     "wall_gap_gt_threshold",
+    "wall_gap_consecutive",
     "au_missing_marker",
     "au_empty",
     "au_without_vcl",
@@ -79,6 +82,8 @@ AUDIO_ANOMALY_KINDS = (
     "opus_timestamp_delta_unexpected",
     "opus_timestamp_gap_gt_40ms",
     "opus_wall_gap_gt_40ms",
+    "opus_wall_gap_gt_threshold",
+    "opus_wall_gap_consecutive",
     "opus_packet_invalid",
     "opus_packet_duration_unexpected",
     "opus_packet_stereo",
@@ -105,7 +110,11 @@ VIDEO_CADENCE_TRANSPORT_ANOMALIES = {
     "timestamp_delta_unexpected",
     "timestamp_gap_gt_40ms",
     "wall_gap_gt_threshold",
+    "wall_gap_consecutive",
 }
+
+VIDEO_WARNING_KINDS = ("wall_gap_warning",)
+AUDIO_WARNING_KINDS = ("opus_wall_gap_warning",)
 
 RTSP_URL_RE = re.compile(r"(?i)rtsps?://\S+")
 READY_RE = re.compile(r"\bDS ([0-9A-F]{12}) (video[12]) ready (rtsps?://\S+)", re.I)
@@ -249,14 +258,18 @@ class VideoCadenceAnalyzer:
         label: str,
         *,
         anomaly_limit: int = DEFAULT_ANOMALY_LIMIT,
-        wall_gap_threshold_ms: float = DEFAULT_WALL_GAP_MS,
+        wall_gap_threshold_ms: float = DEFAULT_WALL_FAILURE_MS,
+        wall_warning_threshold_ms: float = DEFAULT_WALL_WARNING_MS,
     ) -> None:
         if anomaly_limit < 1:
             raise ValueError("anomaly_limit must be positive")
+        if wall_warning_threshold_ms > wall_gap_threshold_ms:
+            raise ValueError("wall warning threshold must not exceed the failure threshold")
         self.label = label
         self.expected_payload_type = 96
         self.anomaly_limit = anomaly_limit
         self.wall_gap_threshold_ms = wall_gap_threshold_ms
+        self.wall_warning_threshold_ms = wall_warning_threshold_ms
         self._lock = threading.Lock()
         self.start_ns: Optional[int] = None
         self.end_ns: Optional[int] = None
@@ -281,6 +294,9 @@ class VideoCadenceAnalyzer:
         self.anomaly_counts = {kind: 0 for kind in ANOMALY_KINDS}
         self.anomalies: deque[dict[str, Any]] = deque(maxlen=anomaly_limit)
         self.anomalies_total = 0
+        self.warning_counts = {kind: 0 for kind in VIDEO_WARNING_KINDS}
+        self.warnings: deque[dict[str, Any]] = deque(maxlen=anomaly_limit)
+        self.warnings_total = 0
         self.timestamp_deltas = RunningMetric()
         self.wall_gaps_ms = RunningMetric()
         self.au_payload_bytes = RunningMetric()
@@ -310,6 +326,8 @@ class VideoCadenceAnalyzer:
         self.last_au_wall_ns: Optional[int] = None
         self.first_measured_wall_ns: Optional[int] = None
         self.last_measured_wall_ns: Optional[int] = None
+        self.consecutive_wall_warnings = 0
+        self.max_consecutive_wall_warnings = 0
         self._reset_current_au()
 
     def configure_window(self, start_ns: int, end_ns: int) -> None:
@@ -379,6 +397,16 @@ class VideoCadenceAnalyzer:
             relative_ms = round((at_ns - self.start_ns) / 1_000_000, 3)
         self.anomalies.append({"kind": kind, "at_ms": relative_ms, **details})
 
+    def _warning(self, kind: str, at_ns: int, **details: Union[int, float, str]) -> None:
+        if kind not in self.warning_counts:
+            raise ValueError(f"unknown warning kind {kind}")
+        self.warning_counts[kind] += 1
+        self.warnings_total += 1
+        relative_ms = None
+        if self.start_ns is not None:
+            relative_ms = round((at_ns - self.start_ns) / 1_000_000, 3)
+        self.warnings.append({"kind": kind, "at_ms": relative_ms, **details})
+
     def _timestamp_histogram_add(self, delta: Optional[int]) -> None:
         if delta is None:
             self.timestamp_histogram["duplicate_or_regression"] += 1
@@ -421,6 +449,7 @@ class VideoCadenceAnalyzer:
             self.last_sequence = None
             self.last_au_timestamp = None
             self.last_au_wall_ns = None
+            self.consecutive_wall_warnings = 0
             self.current_valid = False
         advance = True
         if self.last_sequence is not None:
@@ -575,12 +604,34 @@ class VideoCadenceAnalyzer:
             self.wall_gaps_ms.add(wall_gap_ms)
             self._wall_histogram_add(wall_gap_ms)
             if wall_gap_ms > self.wall_gap_threshold_ms:
+                self.consecutive_wall_warnings = 0
                 self._anomaly(
                     "wall_gap_gt_threshold",
                     at_ns,
                     gap_ms=round(wall_gap_ms, 3),
                 )
                 self.current_valid = False
+            elif wall_gap_ms > self.wall_warning_threshold_ms:
+                self.consecutive_wall_warnings += 1
+                self.max_consecutive_wall_warnings = max(
+                    self.max_consecutive_wall_warnings,
+                    self.consecutive_wall_warnings,
+                )
+                self._warning(
+                    "wall_gap_warning",
+                    at_ns,
+                    gap_ms=round(wall_gap_ms, 3),
+                )
+                if self.consecutive_wall_warnings == 2:
+                    self._anomaly(
+                        "wall_gap_consecutive",
+                        at_ns,
+                        consecutive=self.consecutive_wall_warnings,
+                        gap_ms=round(wall_gap_ms, 3),
+                    )
+                    self.current_valid = False
+            else:
+                self.consecutive_wall_warnings = 0
 
         self.aus_total += 1
         self.au_payload_bytes.add(self.current_payload_bytes)
@@ -713,6 +764,17 @@ class VideoCadenceAnalyzer:
                 "anomalies_retained": len(self.anomalies),
                 "anomalies_evicted": max(0, self.anomalies_total - len(self.anomalies)),
                 "anomalies": list(self.anomalies),
+                "warning_counts": dict(self.warning_counts),
+                "warnings_total": self.warnings_total,
+                "warnings_retained": len(self.warnings),
+                "warnings_evicted": max(0, self.warnings_total - len(self.warnings)),
+                "warnings": list(self.warnings),
+                "wall_arrival": {
+                    "warning_threshold_ms": self.wall_warning_threshold_ms,
+                    "failure_threshold_ms": self.wall_gap_threshold_ms,
+                    "consecutive_warning_limit": 2,
+                    "max_consecutive_warnings": self.max_consecutive_wall_warnings,
+                },
             }
 
 
@@ -759,11 +821,15 @@ class AudioCadenceAnalyzer:
         label: str,
         *,
         anomaly_limit: int = DEFAULT_ANOMALY_LIMIT,
-        wall_gap_threshold_ms: float = DEFAULT_WALL_GAP_MS,
+        wall_gap_threshold_ms: float = DEFAULT_WALL_FAILURE_MS,
+        wall_warning_threshold_ms: float = DEFAULT_WALL_WARNING_MS,
     ) -> None:
+        if wall_warning_threshold_ms > wall_gap_threshold_ms:
+            raise ValueError("wall warning threshold must not exceed the failure threshold")
         self.label = label
         self.anomaly_limit = anomaly_limit
         self.wall_gap_threshold_ms = wall_gap_threshold_ms
+        self.wall_warning_threshold_ms = wall_warning_threshold_ms
         self._lock = threading.Lock()
         self.track: Optional[AudioTrack] = None
         self.start_ns: Optional[int] = None
@@ -793,6 +859,11 @@ class AudioCadenceAnalyzer:
         self.anomaly_counts = {kind: 0 for kind in AUDIO_ANOMALY_KINDS}
         self.anomalies: deque[dict[str, Any]] = deque(maxlen=anomaly_limit)
         self.anomalies_total = 0
+        self.warning_counts = {kind: 0 for kind in AUDIO_WARNING_KINDS}
+        self.warnings: deque[dict[str, Any]] = deque(maxlen=anomaly_limit)
+        self.warnings_total = 0
+        self.consecutive_wall_warnings = 0
+        self.max_consecutive_wall_warnings = 0
 
     def configure_track(self, track: AudioTrack) -> None:
         with self._lock:
@@ -814,6 +885,16 @@ class AudioCadenceAnalyzer:
         if self.start_ns is not None:
             relative_ms = round((at_ns - self.start_ns) / 1_000_000, 3)
         self.anomalies.append({"kind": kind, "at_ms": relative_ms, **details})
+
+    def _warning(self, kind: str, at_ns: int, **details: Union[int, float, str]) -> None:
+        if kind not in self.warning_counts:
+            raise ValueError(f"unknown audio warning kind {kind}")
+        self.warning_counts[kind] += 1
+        self.warnings_total += 1
+        relative_ms = None
+        if self.start_ns is not None:
+            relative_ms = round((at_ns - self.start_ns) / 1_000_000, 3)
+        self.warnings.append({"kind": kind, "at_ms": relative_ms, **details})
 
     def consume_rtcp(self, raw: bytes, arrival_ns: int) -> list[RtcpSenderReport]:
         reports = parse_rtcp_sender_reports(raw)
@@ -846,6 +927,7 @@ class AudioCadenceAnalyzer:
             self.last_sequence = None
             self.last_timestamp = None
             self.last_wall_ns = None
+            self.consecutive_wall_warnings = 0
         if self.last_sequence is None:
             self.last_sequence = packet.sequence
             return True
@@ -925,12 +1007,34 @@ class AudioCadenceAnalyzer:
             if self.last_wall_ns is not None:
                 wall_gap_ms = (arrival_ns - self.last_wall_ns) / 1_000_000
                 self.wall_gaps_ms.add(wall_gap_ms)
-                if self.track.codec == "opus" and wall_gap_ms > DEFAULT_WALL_GAP_MS:
-                    self._anomaly(
-                        "opus_wall_gap_gt_40ms",
-                        arrival_ns,
-                        gap_ms=round(wall_gap_ms, 3),
-                    )
+                if self.track.codec == "opus":
+                    if wall_gap_ms > self.wall_gap_threshold_ms:
+                        self.consecutive_wall_warnings = 0
+                        self._anomaly(
+                            "opus_wall_gap_gt_threshold",
+                            arrival_ns,
+                            gap_ms=round(wall_gap_ms, 3),
+                        )
+                    elif wall_gap_ms > self.wall_warning_threshold_ms:
+                        self.consecutive_wall_warnings += 1
+                        self.max_consecutive_wall_warnings = max(
+                            self.max_consecutive_wall_warnings,
+                            self.consecutive_wall_warnings,
+                        )
+                        self._warning(
+                            "opus_wall_gap_warning",
+                            arrival_ns,
+                            gap_ms=round(wall_gap_ms, 3),
+                        )
+                        if self.consecutive_wall_warnings == 2:
+                            self._anomaly(
+                                "opus_wall_gap_consecutive",
+                                arrival_ns,
+                                consecutive=self.consecutive_wall_warnings,
+                                gap_ms=round(wall_gap_ms, 3),
+                            )
+                    else:
+                        self.consecutive_wall_warnings = 0
             if self.track.codec == "opus":
                 duration = opus_packet_duration_ms(packet.payload)
                 if duration is None:
@@ -1003,6 +1107,17 @@ class AudioCadenceAnalyzer:
                 "anomalies_retained": len(self.anomalies),
                 "anomalies_evicted": max(0, self.anomalies_total - len(self.anomalies)),
                 "anomalies": list(self.anomalies),
+                "warning_counts": dict(self.warning_counts),
+                "warnings_total": self.warnings_total,
+                "warnings_retained": len(self.warnings),
+                "warnings_evicted": max(0, self.warnings_total - len(self.warnings)),
+                "warnings": list(self.warnings),
+                "wall_arrival": {
+                    "warning_threshold_ms": self.wall_warning_threshold_ms,
+                    "failure_threshold_ms": self.wall_gap_threshold_ms,
+                    "consecutive_warning_limit": 2,
+                    "max_consecutive_warnings": self.max_consecutive_wall_warnings,
+                },
             }
 
 
@@ -1134,16 +1249,19 @@ class StreamCadenceAnalyzer:
         *,
         anomaly_limit: int,
         wall_gap_threshold_ms: float,
+        wall_warning_threshold_ms: float = DEFAULT_WALL_WARNING_MS,
     ) -> None:
         self.video = VideoCadenceAnalyzer(
             label,
             anomaly_limit=anomaly_limit,
             wall_gap_threshold_ms=wall_gap_threshold_ms,
+            wall_warning_threshold_ms=wall_warning_threshold_ms,
         )
         self.audio = AudioCadenceAnalyzer(
             label,
             anomaly_limit=anomaly_limit,
             wall_gap_threshold_ms=wall_gap_threshold_ms,
+            wall_warning_threshold_ms=wall_warning_threshold_ms,
         )
         self.av_sync = AvSyncAnalyzer(anomaly_limit=anomaly_limit)
 
@@ -1792,6 +1910,21 @@ def evaluate_stream(
     return failures
 
 
+def evaluate_stream_warnings(result: dict[str, Any]) -> list[str]:
+    """Return informational receiver-timing warnings without weakening hard gates."""
+    warnings: list[str] = []
+    video = result.get("video", result)
+    for kind, count in video.get("warning_counts", {}).items():
+        if count:
+            warnings.append(f"{kind}={count}")
+    audio = result.get("audio")
+    if audio is not None:
+        for kind, count in audio.get("warning_counts", {}).items():
+            if count:
+                warnings.append(f"audio {kind}={count}")
+    return warnings
+
+
 def build_report(
     analyzers: dict[str, StreamCadenceAnalyzer],
     workers: dict[str, StreamWorker],
@@ -1809,6 +1942,7 @@ def build_report(
 ) -> dict[str, Any]:
     streams = {label: analyzer.snapshot() for label, analyzer in analyzers.items()}
     failures: list[str] = []
+    warnings: list[str] = []
     if interrupted:
         failures.append("operator interruption")
     if not reached_deadline:
@@ -1823,6 +1957,8 @@ def build_report(
             maximum_fps=maximum_fps,
         ):
             failures.append(f"{label}: {reason}")
+        for reason in evaluate_stream_warnings(streams[label]):
+            warnings.append(f"{label}: {reason}")
     verdict = "pass" if not failures else "fail"
     now_ns = time.monotonic_ns()
     return {
@@ -1845,18 +1981,36 @@ def build_report(
             "video_rtp_clock_hz": VIDEO_CLOCK,
             "allowed_video_timestamp_deltas": list(EXPECTED_TIMESTAMP_DELTAS),
             "video_timestamp_gap_threshold_ticks": int(VIDEO_CLOCK * 0.040),
-            "wall_gap_threshold_ms": next(iter(analyzers.values())).video.wall_gap_threshold_ms,
+            "wall_gap_threshold_ms": (
+                next(iter(analyzers.values())).video.wall_gap_threshold_ms
+            ),
+            "wall_gap_warning_threshold_ms": (
+                next(iter(analyzers.values())).video.wall_warning_threshold_ms
+            ),
+            "wall_gap_failure_threshold_ms": (
+                next(iter(analyzers.values())).video.wall_gap_threshold_ms
+            ),
+            "consecutive_wall_gap_warning_limit": 2,
             "preferred_audio_codec": "opus",
             "opus_rtp_clock_hz": OPUS_CLOCK,
             "opus_timestamp_delta_ticks": OPUS_FRAME_TICKS,
             "opus_frame_duration_ms": 20,
-            "opus_wall_gap_threshold_ms": DEFAULT_WALL_GAP_MS,
+            "opus_wall_gap_threshold_ms": (
+                next(iter(analyzers.values())).audio.wall_gap_threshold_ms
+            ),
+            "opus_wall_gap_warning_threshold_ms": (
+                next(iter(analyzers.values())).audio.wall_warning_threshold_ms
+            ),
+            "opus_wall_gap_failure_threshold_ms": (
+                next(iter(analyzers.values())).audio.wall_gap_threshold_ms
+            ),
             "av_drift_threshold_ms": DEFAULT_AV_DRIFT_MS,
             "minimum_fps": minimum_fps,
             "maximum_fps": maximum_fps,
             "allowed_anomalies": 0,
         },
         "failure_reasons": failures,
+        "warning_reasons": warnings,
         "streams": streams,
     }
 
@@ -2009,7 +2163,7 @@ def self_test() -> None:
     broken = VideoCadenceAnalyzer("broken", anomaly_limit=2)
     broken.configure_window(0, 1_000_000_000)
     broken.consume_rtp(make_test_rtp(10, 1_000, b"\x41x"), 0)
-    broken.consume_rtp(make_test_rtp(12, 7_030, b"\x5c\x45x"), 67_000_000)
+    broken.consume_rtp(make_test_rtp(12, 7_030, b"\x5c\x45x"), 68_000_000)
     failed = broken.snapshot()
     assert failed["anomaly_counts"]["sequence_gap"] == 1
     assert failed["anomaly_counts"]["timestamp_gap_gt_40ms"] == 1
@@ -2025,6 +2179,27 @@ def self_test() -> None:
     audio.consume_rtp(make_test_rtp(0, 64, b"\xf8y", payload_type=97), 20_000_000)
     assert audio.snapshot()["packets"]["clean"] == 1
     print("self_test=ok")
+
+
+def resolve_wall_thresholds(args: argparse.Namespace) -> tuple[float, float]:
+    """Resolve the warning threshold and hard threshold with legacy CLI support."""
+    warning = getattr(args, "wall_warning_ms", None)
+    failure = getattr(args, "wall_failure_ms", None)
+    legacy_failure = getattr(args, "wall_gap_ms", None)
+    if failure is not None and legacy_failure is not None:
+        raise ValueError("--wall-failure-ms and --wall-gap-ms are mutually exclusive")
+    failure = failure if failure is not None else legacy_failure
+    if failure is None:
+        failure = DEFAULT_WALL_FAILURE_MS
+    if warning is None:
+        warning = (
+            min(DEFAULT_WALL_WARNING_MS, legacy_failure)
+            if legacy_failure is not None
+            else DEFAULT_WALL_WARNING_MS
+        )
+    if warning > failure:
+        raise ValueError("wall warning threshold must not exceed the failure threshold")
+    return warning, failure
 
 
 def parse_args() -> argparse.Namespace:
@@ -2046,7 +2221,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--source-sha256", help="optional source/patch-set SHA-256 provenance")
     parser.add_argument("--duration", type=float, default=24 * 60 * 60)
     parser.add_argument("--startup-exclusion", type=float, default=DEFAULT_STARTUP_EXCLUSION_SECONDS)
-    parser.add_argument("--wall-gap-ms", type=float, default=DEFAULT_WALL_GAP_MS)
+    parser.add_argument(
+        "--wall-warning-ms",
+        type=float,
+        help="isolated receiver wall-gap warning threshold (default: 40 ms)",
+    )
+    wall_failure = parser.add_mutually_exclusive_group()
+    wall_failure.add_argument(
+        "--wall-failure-ms",
+        type=float,
+        help="hard receiver wall-gap failure threshold (default: 67 ms)",
+    )
+    wall_failure.add_argument(
+        "--wall-gap-ms",
+        type=float,
+        help="deprecated alias for --wall-failure-ms",
+    )
     parser.add_argument("--minimum-fps", type=float, default=29.95)
     parser.add_argument("--maximum-fps", type=float, default=30.05)
     parser.add_argument("--anomaly-limit", type=int, default=DEFAULT_ANOMALY_LIMIT)
@@ -2064,7 +2254,6 @@ def parse_args() -> argparse.Namespace:
     numeric = (
         args.duration,
         args.startup_exclusion,
-        args.wall_gap_ms,
         args.minimum_fps,
         args.maximum_fps,
         args.connect_timeout,
@@ -2073,6 +2262,13 @@ def parse_args() -> argparse.Namespace:
     )
     if any(not math.isfinite(value) or value <= 0 for value in numeric):
         parser.error("durations, thresholds, and frame rates must be positive finite numbers")
+    for value in (args.wall_warning_ms, args.wall_failure_ms, args.wall_gap_ms):
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            parser.error("wall thresholds must be positive finite numbers")
+    try:
+        resolve_wall_thresholds(args)
+    except ValueError as error:
+        parser.error(str(error))
     if args.minimum_fps >= args.maximum_fps:
         parser.error("--minimum-fps must be less than --maximum-fps")
     if not 1 <= args.anomaly_limit <= 4096:
@@ -2098,6 +2294,7 @@ def run(args: argparse.Namespace) -> int:
     interrupted = False
 
     try:
+        wall_warning_ms, wall_failure_ms = resolve_wall_thresholds(args)
         urls = resolve_urls(args)
         provenance = report_provenance(args)
     except Exception as error:
@@ -2108,7 +2305,8 @@ def run(args: argparse.Namespace) -> int:
         label: StreamCadenceAnalyzer(
             label,
             anomaly_limit=args.anomaly_limit,
-            wall_gap_threshold_ms=args.wall_gap_ms,
+            wall_gap_threshold_ms=wall_failure_ms,
+            wall_warning_threshold_ms=wall_warning_ms,
         )
         for label in urls
     }
