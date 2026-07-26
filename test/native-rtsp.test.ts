@@ -8,13 +8,60 @@ import {
     FlvTagParser, parseAvcC, parseAsc, parseOpusConfig, parseOpusPacketProfile, opusPacketInfo,
     splitNals, toAnnexB, LazyRtpKeyframe, PacedQueue, RtpTrack,
     packetizeH264, packetizeAac, packetizeOpus, buildSdp, startNativeServe, videoAuSpreadMs,
-    OpusPacingClock,
+    OpusPacingClock, pacerLatenessAction, likelyEventLoopIngressStall,
+    PACER_LOCAL_REANCHOR_MS, PACER_TERMINAL_LATE_MS,
     type EgressPressureSample,
 } from '../src/native-rtsp';
 import { rng, randBytes, flvTag, flvHeader } from './helpers';
 import { RtspSession } from '../src/rtsp-session';
 
 // ---- FLV tag parsing ----
+
+test('pacer lateness uses a local 2-5 second recovery and keeps a hard terminal bound', () => {
+    assert.equal(pacerLatenessAction(PACER_LOCAL_REANCHOR_MS), 'none');
+    assert.equal(pacerLatenessAction(PACER_LOCAL_REANCHOR_MS + 1), 'local-reanchor');
+    assert.equal(pacerLatenessAction(PACER_TERMINAL_LATE_MS), 'local-reanchor');
+    assert.equal(pacerLatenessAction(PACER_TERMINAL_LATE_MS + 1), 'terminal-restart');
+    assert.equal(likelyEventLoopIngressStall(15_000, 14_000), true,
+        'an established overdue pacer was not recognized as event-loop evidence');
+    assert.equal(likelyEventLoopIngressStall(PACER_TERMINAL_LATE_MS, 15_000), false);
+    assert.equal(likelyEventLoopIngressStall(15_000, PACER_TERMINAL_LATE_MS), false);
+    assert.equal(likelyEventLoopIngressStall(15_000, 0), false,
+        'a responsive empty pacer was treated as an event-loop stall');
+});
+
+test('local re-anchor terminates if a clean IDR is not reacquired by its deadline', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({
+        flv,
+        hasAudio: false,
+        localRecoveryIngressGapMs: 5,
+        localRecoveryKeyframeTimeoutMs: 30,
+    });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 0, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(9, 0, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+    ]));
+    const serve = await servePromise;
+    try {
+        await new Promise(resolve => setTimeout(resolve, 10));
+        // Resumed P-frame input starts local recovery, but cannot reopen the
+        // decodable gate. With no following IDR the generation must not hang.
+        flv.write(flvTag(9, 33, avcTagData(2, 1,
+            lenPrefixed(Buffer.from([0x41, 2])))));
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(serve.localRecoveryActive, true);
+
+        const deadline = Date.now() + 250;
+        while (serve.alive && Date.now() < deadline)
+            await new Promise(resolve => setTimeout(resolve, 5));
+        assert.equal(serve.alive, false, 'failed keyframe reacquisition remained alive');
+        assert.equal(flv.destroyed, true, 'failed keyframe reacquisition retained the FLV pipeline');
+    } finally {
+        serve.destroy();
+    }
+});
 
 test('FlvTagParser emits tags with correct type/timestamp/data across chunking', () => {
     const r = rng(1);
@@ -337,6 +384,7 @@ test('packetizeH264: FU-A headers, sizes, markers, and RTCP accounting are exact
     assert.ok(parsed.slice(1).every((p, i) => p.seq === ((parsed[i].seq + 1) & 0xffff)));
     assert.ok(parsed.every(p => p.ts === 0x12345678 && p.pt === 96));
 
+    for (const packet of out) track.commit(packet);
     track.stamp(0x12345678);
     const sr = track.senderReport()!;
     assert.equal(sr.readUInt32BE(20), 3);
@@ -413,11 +461,13 @@ test('packetizeOpus carries exactly one raw Opus packet with no AAC headers', ()
 test('RtpTrack.senderReport maps RTP time to NTP and counts correctly', () => {
     const track = new RtpTrack(96);
     assert.equal(track.senderReport(), undefined, 'no SR before any packet');
-    track.build(90_000, true, undefined, randBytes(rng(6), 100));
-    track.build(180_000, true, undefined, randBytes(rng(7), 50));
+    const first = track.build(90_000, true, undefined, randBytes(rng(6), 100));
+    const second = track.build(180_000, true, undefined, randBytes(rng(7), 50));
     assert.equal(track.senderReport(), undefined, 'no SR until a packet is stamped as sent');
     // the egress pacer stamps the RTP↔wall mapping when a packet actually goes out
     const before = Date.now();
+    track.commit(first);
+    track.commit(second);
     track.stamp(180_000);
     const sr = track.senderReport()!;
     assert.equal(sr.length, 28);
@@ -428,6 +478,31 @@ test('RtpTrack.senderReport maps RTP time to NTP and counts correctly', () => {
     assert.equal(sr.readUInt32BE(24), 150);            // payload octets
     const ntpSec = sr.readUInt32BE(8) - 2208988800;    // 1900 → 1970 epoch
     assert.ok(Math.abs(ntpSec - before / 1000) < 5);
+});
+
+test('RtpTrack rewinds only unsent sequence allocations and keeps SR counters monotonic', () => {
+    const track = new RtpTrack(96);
+    const sent = track.build(90_000, true, undefined, Buffer.alloc(10, 1));
+    track.commit(sent);
+    track.stamp(90_000);
+    const firstSr = track.senderReport()!;
+    assert.equal(firstSr.readUInt32BE(20), 1);
+    assert.equal(firstSr.readUInt32BE(24), 10);
+
+    const discarded = track.build(93_000, true, undefined, Buffer.alloc(20, 2));
+    track.rollbackUnsent(1);
+    assert.equal(track.senderReport()!.readUInt32BE(20), 1,
+        'discarding an unsent allocation moved cumulative SR counts');
+
+    const resumed = track.build(96_000, true, undefined, Buffer.alloc(30, 3));
+    assert.equal(resumed.readUInt16BE(2), discarded.readUInt16BE(2),
+        'unsent sequence allocation was not returned');
+    assert.equal(resumed.readUInt16BE(2), (sent.readUInt16BE(2) + 1) & 0xffff);
+    track.commit(resumed);
+    track.stamp(96_000);
+    const resumedSr = track.senderReport()!;
+    assert.equal(resumedSr.readUInt32BE(20), 2);
+    assert.equal(resumedSr.readUInt32BE(24), 40);
 });
 
 // ---- end-to-end: GOP replay on join ----
@@ -454,6 +529,9 @@ async function connectMarkerClient(serve: { url: string }, capturePayloads = fal
     const markers = new Map<number, number>();
     const packetTimes = new Map<number, number[]>();
     const videoPayloads: Buffer[] = [];
+    const videoSequences: number[] = [];
+    const videoTimestamps: number[] = [];
+    const videoSenderReports: Buffer[] = [];
     let readyResolve!: () => void;
     const ready = new Promise<void>(resolve => { readyResolve = resolve; });
     client.on('data', d => {
@@ -474,20 +552,101 @@ async function connectMarkerClient(serve: { url: string }, capturePayloads = fal
             const packet = buf.subarray(4, 4 + len);
             buf = buf.subarray(4 + len);
             if (channel === 0 && packet.length >= 12) {
-                if (capturePayloads) videoPayloads.push(Buffer.from(packet.subarray(12)));
+                if (capturePayloads) {
+                    videoPayloads.push(Buffer.from(packet.subarray(12)));
+                    videoSequences.push(packet.readUInt16BE(2));
+                    videoTimestamps.push(packet.readUInt32BE(4));
+                }
                 const ts = packet.readUInt32BE(4);
                 const times = packetTimes.get(ts) ?? [];
                 times.push(performance.now());
                 packetTimes.set(ts, times);
                 if (packet[1] & 0x80) markers.set(ts, Date.now());
+            } else if (channel === 1 && packet.length >= 28 && packet[1] === 200) {
+                videoSenderReports.push(Buffer.from(packet));
             }
         }
     });
     client.write('SETUP rtsp://x/trackID=0 RTSP/1.0\r\nCSeq: 1\r\nTransport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n\r\n');
     client.write('PLAY rtsp://x/ RTSP/1.0\r\nCSeq: 2\r\n\r\n');
     await ready;
-    return { client, markers, packetTimes, videoPayloads };
+    return {
+        client,
+        markers,
+        packetTimes,
+        videoPayloads,
+        videoSequences,
+        videoTimestamps,
+        videoSenderReports,
+    };
 }
+
+test('local recovery preserves RTP sequence, timestamp, and sender-report accounting', async () => {
+    const flv = new PassThrough();
+    const servePromise = startNativeServe({
+        flv,
+        hasAudio: false,
+        localRecoveryIngressGapMs: 20,
+        localRecoveryKeyframeTimeoutMs: 500,
+    });
+    flv.write(Buffer.concat([
+        flvHeader(),
+        flvTag(9, 1_000, avcTagData(1, 0, makeAvcC(SPS, PPS))),
+        flvTag(9, 1_000, avcTagData(1, 1, lenPrefixed(Buffer.from([0x65, 1])))),
+        // These future P-frames allocate RTP state but remain in the 450 ms
+        // pacer reserve. Local recovery must rewind them before discarding.
+        flvTag(9, 1_300, avcTagData(2, 1, lenPrefixed(Buffer.from([0x41, 2])))),
+        flvTag(9, 1_333, avcTagData(2, 1, lenPrefixed(Buffer.from([0x41, 3])))),
+    ]));
+    const serve = await servePromise;
+    const first = await connectMarkerClient(serve, true);
+    let second: Awaited<ReturnType<typeof connectMarkerClient>> | undefined;
+    try {
+        const initialDeadline = Date.now() + 200;
+        while (first.videoSequences.length < 3 && Date.now() < initialDeadline)
+            await new Promise(resolve => setTimeout(resolve, 5));
+        assert.equal(first.videoSequences.length, 3, 'initial IDR did not reach the client');
+        const beforeCount = first.videoSequences.length;
+        const previousSeq = first.videoSequences.at(-1)!;
+        const previousTs = first.videoTimestamps.at(-1)!;
+
+        await new Promise(resolve => setTimeout(resolve, 25));
+        // Backtracked non-IDR input starts source recovery and is gated before
+        // packet allocation. The clean IDR also resets the camera media clock.
+        flv.write(flvTag(9, 100, avcTagData(2, 1,
+            lenPrefixed(Buffer.from([0x41, 4])))));
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(serve.localRecoveryActive, true);
+        flv.write(flvTag(9, 0, avcTagData(1, 1,
+            lenPrefixed(Buffer.from([0x65, 5])))));
+
+        const recoveredDeadline = Date.now() + 1_200;
+        while (first.videoSequences.length < beforeCount + 3 && Date.now() < recoveredDeadline)
+            await new Promise(resolve => setTimeout(resolve, 5));
+        assert.equal(first.videoSequences.length, beforeCount + 3);
+        assert.equal(first.videoSequences[beforeCount], (previousSeq + 1) & 0xffff,
+            'local discard created an artificial RTP sequence-loss gap');
+        const timestampDelta = (first.videoTimestamps[beforeCount] - previousTs) >>> 0;
+        assert.ok(timestampDelta > 0 && timestampDelta < 0x80000000,
+            `camera timestamp reset regressed the RTP clock (${timestampDelta})`);
+
+        second = await connectMarkerClient(serve, true);
+        const srDeadline = Date.now() + 300;
+        while (!second.videoSenderReports.length && Date.now() < srDeadline)
+            await new Promise(resolve => setTimeout(resolve, 5));
+        const sr = second.videoSenderReports.at(-1);
+        assert.ok(sr, 'post-recovery client did not receive a video sender report');
+        assert.equal(sr.readUInt32BE(20), first.videoSequences.length,
+            'sender report counted locally discarded RTP packets');
+        assert.equal(sr.readUInt32BE(24),
+            first.videoPayloads.reduce((sum, payload) => sum + payload.length, 0),
+            'sender report octets included locally discarded payloads');
+    } finally {
+        first.client.destroy();
+        second?.client.destroy();
+        serve.destroy();
+    }
+});
 
 test('an ordinary 85-packet video AU is spread on the actual RTSP egress path', async () => {
     const sendTimes = new Map<number, number[]>();

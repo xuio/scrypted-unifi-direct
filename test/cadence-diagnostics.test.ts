@@ -327,6 +327,65 @@ test('pacer drain deadline lateness is counted once and exposes process event-lo
         assert.ok(Number.isFinite(value) && value >= 0);
 });
 
+test('resilience snapshots expose bounded local and controller recovery state', () => {
+    let now = 100;
+    const diagnostics = new CadenceDiagnostics(
+        streamIdentity,
+        0,
+        () => now,
+        () => ({
+            reconfigure_sent: 4,
+            reconfigure_coalesced: 2,
+            reconfigure_skipped: 3,
+            reconfigure_cooldowns: 1,
+            reconfigure_ack_timeouts: 1,
+            reconfigure_explicit_failures: 0,
+            desired_revision: 7,
+            pending_changes: 1,
+            cooldown_remaining_ms: 250,
+            fallback_recoveries: 1,
+            fallback_recovery_inflight: 0,
+            last_reconfigure_reason: 'start:video2',
+            last_recovery_owner: 'plugin',
+            last_recovery_reason: 'all-published-tracks-silent',
+        }),
+    );
+    const emitted: CadenceSnapshot[] = [];
+    diagnostics.onSnapshot = value => emitted.push(value);
+    diagnostics.recordProbeConnection();
+    diagnostics.recordProbeTimeout();
+    diagnostics.recordFlvHeader();
+    diagnostics.recordStreamReady(true);
+    diagnostics.recordLocalRecovery('egress-late-2200ms', true);
+    diagnostics.recordVideoStall(30_001);
+    diagnostics.recordDetrailedPart(detrailedVideoPart(0), now);
+    now = 350;
+
+    const snapshot = diagnostics.snapshot();
+    assert.equal(snapshot.totals.flv_probe_connections, 1);
+    assert.equal(snapshot.totals.flv_probe_timeouts, 1);
+    assert.equal(snapshot.totals.flv_headers_validated, 1);
+    assert.equal(snapshot.totals.stream_ready_events, 1);
+    assert.equal(snapshot.totals.pacer_local_reanchors, 1);
+    assert.equal(snapshot.totals.video_stall_warnings, 1);
+    assert.equal(snapshot.lifetime_gauges.flv_ready, true);
+    assert.equal(snapshot.lifetime_gauges.video_no_data_ms, 250);
+    assert.equal(snapshot.lifetime_gauges.local_recovery_active, true);
+    assert.equal(snapshot.lifetime_gauges.last_local_recovery_reason, 'egress-late-2200ms');
+    assert.equal(snapshot.controller_resilience.reconfigure_sent, 4);
+    assert.equal(snapshot.controller_resilience.fallback_recoveries, 1);
+    assert.equal(snapshot.controller_resilience.last_recovery_owner, 'plugin');
+
+    diagnostics.stop('camera-stream-disconnected');
+    assert.equal(emitted.length, 1);
+    const terminal = emitted[0];
+    assert.equal(terminal.event, 'final');
+    assert.equal(terminal.lifetime_gauges.flv_ready, false);
+    assert.equal(terminal.lifetime_gauges.local_recovery_active, false);
+    assert.equal(terminal.lifetime_gauges.last_local_recovery_reason, 'egress-late-2200ms');
+    assert.equal(terminal.lifetime_gauges.last_terminal_reason, 'camera-stream-disconnected');
+});
+
 test('native serve wires parser, AVCC, AU, pacer, fanout, and final diagnostics', async () => {
     const diagnostics = new CadenceDiagnostics({
         ...streamIdentity,

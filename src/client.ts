@@ -14,6 +14,13 @@ export interface CameraStatus {
     [k: string]: any;
 }
 
+export interface CameraRebootResult {
+    /** True once an authenticated reboot request was put on the wire. */
+    issued: boolean;
+    /** True when the expected reboot connection drop prevented confirmation. */
+    ambiguous: boolean;
+}
+
 /**
  * Minimal HTTPS client for a UniFi Protect camera's local management API
  * (lighttpd, /api/1.1/*). Handles the self-signed cert, cookie session auth
@@ -258,9 +265,68 @@ export class CameraApiClient {
         return s?.controller?.addr;
     }
 
-    async reboot(): Promise<void> {
-        // reboot drops the connection; ignore the (often empty) response
-        try { await this.authed({ method: 'GET', path: '/api/1.1/reboot', timeoutMs: 6000 }); } catch { }
+    async reboot(): Promise<CameraRebootResult> {
+        const deadline = this.now() + 6000;
+        const remaining = () => {
+            const ms = Math.ceil(deadline - this.now());
+            if (ms <= 0) throw new Error('request timeout');
+            return ms;
+        };
+        const bounded = <T>(promise: Promise<T>, timeoutMs: number) =>
+            new Promise<T>((resolve, reject) => {
+                const timer = setTimeout(() => reject(new Error('request timeout')), timeoutMs);
+                promise.then(
+                    value => { clearTimeout(timer); resolve(value); },
+                    error => { clearTimeout(timer); reject(error); },
+                );
+            });
+
+        // Authentication failures are definite non-attempts: no reboot request
+        // has been accepted and callers must not consume their recovery cooldown.
+        try {
+            if (!this.cookie) {
+                const timeoutMs = remaining();
+                await bounded(this.login(timeoutMs), timeoutMs);
+            }
+        } catch {
+            return { issued: false, ambiguous: false };
+        }
+
+        const issue = async (): Promise<CameraRebootResult | 'unauthorized'> => {
+            let timeoutMs: number;
+            try { timeoutMs = remaining(); }
+            catch { return { issued: false, ambiguous: false }; }
+            try {
+                const res = await bounded(this.raw({
+                    method: 'GET',
+                    path: '/api/1.1/reboot',
+                    timeoutMs,
+                }), timeoutMs);
+                if (res.statusCode === 401) return 'unauthorized';
+                return res.statusCode >= 200 && res.statusCode < 300
+                    ? { issued: true, ambiguous: false }
+                    : { issued: false, ambiguous: false };
+            } catch {
+                // The authenticated request was issued. A healthy camera commonly
+                // resets the TLS connection before replying as it reboots, so this
+                // outcome is ambiguous and must never be retried immediately.
+                return { issued: true, ambiguous: true };
+            }
+        };
+
+        let result = await issue();
+        if (result !== 'unauthorized') return result;
+        this.cookie = undefined;
+        try {
+            const timeoutMs = remaining();
+            await bounded(this.login(timeoutMs), timeoutMs);
+        } catch {
+            return { issued: false, ambiguous: false };
+        }
+        result = await issue();
+        return result === 'unauthorized'
+            ? { issued: false, ambiguous: false }
+            : result;
     }
 
     /** Live JPEG frame. Works over the direct HTTPS session; no NVR involved. */

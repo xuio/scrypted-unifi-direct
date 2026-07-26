@@ -16,9 +16,35 @@ import { inspectAvccAccessUnit, type CadenceDiagnostics } from './cadence-diagno
 
 type Logger = { log?: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
-// Same liveness contract as the ffmpeg path: if no video RTP has been produced
-// for this long the pipeline is considered stalled and the provider rebuilds.
-const RTP_STALL_MS = 8000;
+// A silent encoder is observed here but recovered at the camera boundary. The
+// firmware watchdog gets the first 120 seconds; the plugin must not turn an
+// eight-second pause into simultaneous serializer stop/start commands.
+export const VIDEO_STALL_WARN_MS = 30_000;
+export const PACER_LOCAL_REANCHOR_MS = 2_000;
+export const PACER_TERMINAL_LATE_MS = 5_000;
+
+export type PacerLatenessAction = 'none' | 'local-reanchor' | 'terminal-restart';
+
+/** A long ingress wall gap plus an already-established pacer deadline that is
+ * equally overdue is direct evidence that Node stopped servicing both paths.
+ * A source pause leaves the responsive pacer empty instead. */
+export function likelyEventLoopIngressStall(
+    wallGapMs: number,
+    pacerOverdueMs = 0,
+): boolean {
+    return wallGapMs > PACER_TERMINAL_LATE_MS
+        && pacerOverdueMs > PACER_TERMINAL_LATE_MS;
+}
+
+/** Pure steady-state pacer decision seam used by tests and live egress. Source
+ * resumes are classified before parsing/packet allocation, so >5 s lateness
+ * reaching this function is an unbounded host-side condition. */
+export function pacerLatenessAction(latenessMs: number): PacerLatenessAction {
+    if (latenessMs <= PACER_LOCAL_REANCHOR_MS) return 'none';
+    return latenessMs <= PACER_TERMINAL_LATE_MS
+        ? 'local-reanchor'
+        : 'terminal-restart';
+}
 
 /** Max RTP payload bytes (mirrors the ffmpeg path's pkt_size=1200). */
 const MAX_PAYLOAD = 1200;
@@ -384,8 +410,6 @@ export class RtpTrack {
         this.seq = (this.seq + 1) & 0xffff;
         buf.writeUInt32BE(ts % 0x100000000, 4);
         buf.writeUInt32BE(this.ssrc, 8);
-        this.packets++;
-        this.octets = (this.octets + payloadLength) >>> 0;   // payload octets (RFC 3550)
         return buf;
     }
 
@@ -412,6 +436,22 @@ export class RtpTrack {
         buf[13] = header;
         payload.copy(buf, 14, start, end);
         return buf;
+    }
+
+    /** Roll back a contiguous unsent sequence-allocation tail. RFC 3550 counters
+     * are committed only at dequeue and therefore never need to move backward. */
+    rollbackUnsent(packetCount: number) {
+        if (!packetCount) return;
+        if (packetCount < 0) throw new Error('invalid RTP unsent rollback');
+        this.seq = (this.seq - packetCount) & 0xffff;
+    }
+
+    /** Commit cumulative RFC 3550 counters only when a paced packet leaves the
+     * unsent queue. RTCP can therefore never advertise speculative allocations
+     * or later move its cumulative counters backward after a local discard. */
+    commit(packet: Buffer) {
+        this.packets++;
+        this.octets = (this.octets + Math.max(0, packet.length - 12)) >>> 0;
     }
 
     /** Record the RTP timestamp and wall-clock of the most recently SENT packet,
@@ -745,6 +785,10 @@ export async function startNativeServe(opts: {
     sdpTimeoutMs?: number;
     /** How long past the video config to wait for the selected audio config. */
     audioGraceMs?: number;
+    /** Internal deterministic-test seams. Production always uses the exported
+     * 2 s ingress/re-anchor and 5 s keyframe threshold. */
+    localRecoveryIngressGapMs?: number;
+    localRecoveryKeyframeTimeoutMs?: number;
     /** Pause/resume the owning camera ingress when the pacer approaches its hard
      * queue bound. The callback must be cheap and must never throw into media. */
     onEgressPressure?: (paused: boolean, sample: EgressPressureSample) => void;
@@ -757,6 +801,10 @@ export async function startNativeServe(opts: {
     const { flv, hasAudio } = opts;
     const audioCodec = opts.audioCodec ?? 'aac';
     const cadence = opts.cadenceDiagnostics;
+    const localRecoveryIngressGapMs = Math.max(1,
+        opts.localRecoveryIngressGapMs ?? PACER_LOCAL_REANCHOR_MS);
+    const localRecoveryKeyframeTimeoutMs = Math.max(1,
+        opts.localRecoveryKeyframeTimeoutMs ?? PACER_TERMINAL_LATE_MS);
     if (audioCodec === 'opus' && opts.opusBitRate !== 128000 && opts.opusBitRate !== 96000)
         throw new Error('Opus requires an explicit 128000 or 96000 bps profile');
 
@@ -828,7 +876,6 @@ export async function startNativeServe(opts: {
     // a 250 ms budget leaves nothing to smooth with — the IDR is already overdue
     // when it lands. 450 ms gives real headroom; the +latency is behind the prebuffer.
     const EGRESS_DELAY_MS = 450;
-    const MAX_LATE_MS = 2000;
     const MAX_FUTURE_MS = 2000;
     const MAX_QUEUE = 8000;
     // One representative 500 KB IDR is ~420 RTP packets. Pause at roughly ten
@@ -853,6 +900,15 @@ export async function startNativeServe(opts: {
     let pressureMaxQueued = 0;
     let pressurePauseCount = 0;
     let pressureResumeCount = 0;
+    let awaitingRecoveryKeyframe = false;
+    let localRecoveryTimer: NodeJS.Timeout | undefined;
+    let lastVideoIngressAt = performance.now();
+    let lastFeedAt = performance.now();
+    let resumePacerOverdueMs: number | undefined;
+    let videoRtpOffset = 0;
+    let lastAllocatedVideoRtpTs: number | undefined;
+    let lastRetainedVideoRtpTs: number | undefined;
+    let stallWarningActive = false;
     // Reuse these tiny parallel scratch arrays across drains so diagnostics do
     // not allocate one wrapper object per access unit on the hot path. The due
     // value belongs to the marker packet and is the media deadline used by the
@@ -870,11 +926,15 @@ export async function startNativeServe(opts: {
         // Video wins a tie so a keyframe resets GOP history before same-time audio.
         return !a || (v && v.frontDue() <= a.frontDue()) ? v! : a;
     };
-    const clearEgress = (reason: string) => {
+    const clearEgress = (reason: string, rollbackUnsent = false) => {
         const videoPackets = videoEgress.length;
         const audioPackets = audioEgress.length;
         if (videoPackets || audioPackets)
             cadence?.recordQueueDiscard(videoPackets, audioPackets, reason);
+        if (rollbackUnsent) {
+            videoTrack.rollbackUnsent(videoPackets);
+            audioTrack.rollbackUnsent(audioPackets);
+        }
         videoEgress.clear();
         audioEgress.clear();
     };
@@ -920,6 +980,54 @@ export async function startNativeServe(opts: {
         // cleanup closure below is assigned. Defer one microtask so startup has
         // completed its synchronous declarations.
         queueMicrotask(() => destroy?.('pipeline-restart'));
+    };
+
+    const beginLocalRecovery = (reason: string) => {
+        if (dead || restartRequested) return;
+        // Never let repeated non-IDR input extend the terminal deadline.
+        if (awaitingRecoveryKeyframe) return;
+        clearTimeout(drainTimer);
+        drainTimer = undefined;
+        clearEgress('local-reanchor', true);
+        updatePressure();
+        epoch = 0;
+        // Restore the timestamp mapper to the last packet that actually reached
+        // egress/GOP history, not the tail just discarded from the pacer.
+        lastAllocatedVideoRtpTs = lastRetainedVideoRtpTs;
+        gop = [];
+        gopBytes = 0;
+        gopOverflow = false;
+        awaitingRecoveryKeyframe = true;
+        cadence?.recordLocalRecovery(reason, true);
+        dbg('native-rtsp local pacer re-anchor:', reason);
+        localRecoveryTimer = setTimeout(() => {
+            localRecoveryTimer = undefined;
+            if (awaitingRecoveryKeyframe)
+                requestRestart(`local recovery did not reacquire an IDR within ${localRecoveryKeyframeTimeoutMs} ms`);
+        }, localRecoveryKeyframeTimeoutMs);
+        localRecoveryTimer.unref?.();
+    };
+
+    const completeLocalRecovery = () => {
+        awaitingRecoveryKeyframe = false;
+        clearTimeout(localRecoveryTimer);
+        localRecoveryTimer = undefined;
+        cadence?.recordLocalRecovery('clean-keyframe-resumed', false);
+        dbg('native-rtsp local pacer recovery resumed at clean keyframe');
+    };
+
+    const normalizeVideoRtpTimestamp = (rawTs: number) => {
+        let candidate = (rawTs + videoRtpOffset) >>> 0;
+        if (lastAllocatedVideoRtpTs !== undefined) {
+            const delta = (candidate - lastAllocatedVideoRtpTs) >>> 0;
+            if (delta === 0 || delta >= 0x80000000) {
+                const step = Math.max(1, Math.round(videoFrameIntervalMs * (VIDEO_CLOCK / 1000)));
+                candidate = (lastAllocatedVideoRtpTs + step) >>> 0;
+                videoRtpOffset = (candidate - rawTs) >>> 0;
+            }
+        }
+        lastAllocatedVideoRtpTs = candidate;
+        return candidate;
     };
 
     const enqueue = (control: string, pkts: Buffer[], mediaMs: number, keyframe: boolean) => {
@@ -973,11 +1081,19 @@ export async function startNativeServe(opts: {
             // arrive is a frozen live view; re-anchor this generation promptly.
             dbg('native-rtsp forward timestamp discontinuity:', Math.round(drift), 'ms');
             epoch = now - front.frontDue() + EGRESS_DELAY_MS;
-        } else if (drift < -MAX_LATE_MS) {
-            // A multi-second event-loop/host stall cannot be caught up at realtime
-            // without making that delay permanent. Rebuild from a fresh keyframe.
-            requestRestart(`egress fell ${Math.round(-drift)} ms behind`);
-            return;
+        } else if (drift < -PACER_LOCAL_REANCHOR_MS) {
+            const lateness = -drift;
+            const action = pacerLatenessAction(lateness);
+            if (action === 'terminal-restart') {
+                // Keep a hard bound for a true >5 s host/event-loop stall. Source
+                // recovery is adjudicated separately above and never reaches this.
+                requestRestart(`egress fell ${Math.round(lateness)} ms behind`);
+                return;
+            }
+            if (action === 'local-reanchor') {
+                beginLocalRecovery(`egress-late-${Math.round(lateness)}ms`);
+                return;
+            }
         }
         const batch: { control: string; packet: Buffer }[] = [];
         const audioOut: Buffer[] = [];
@@ -994,6 +1110,8 @@ export async function startNativeServe(opts: {
             const keyframeStart = queue.frontIsKeyframeStart();
             const marker = queue.frontIsMarker();
             queue.shift();
+            if (control === 'trackID=0') videoTrack.commit(packet);
+            else audioTrack.commit(packet);
             if (keyframeStart) { gop = []; gopBytes = 0; gopOverflow = false; }   // GOP history resets at the keyframe boundary, at send time
             if (control !== 'trackID=1' || gop.length) gopAppend(control, packet);
             if (control === 'trackID=1') {
@@ -1005,6 +1123,7 @@ export async function startNativeServe(opts: {
                 }
             } else {
                 lastVideoTs = packet.readUInt32BE(4);
+                lastRetainedVideoRtpTs = lastVideoTs;
                 if (marker && cadence) {
                     videoMarkerTimestamps.push(lastVideoTs);
                     videoMarkerDues.push(due);
@@ -1148,18 +1267,54 @@ export async function startNativeServe(opts: {
         // H.264 IDR (NAL type 5) before replacing snapshot/GOP bootstrap state;
         // otherwise a mislabeled intra frame can make the next client black.
         const isKeyframe = nals.some(nal => (nal[0] & 0x1f) === 5);
+        const mediaMs = Math.max(0, tsMs + cts);
+        const ingressMediaDelta = previousVideoMediaMs === undefined
+            ? undefined
+            : mediaMs - previousVideoMediaMs;
+        const ingressNow = performance.now();
+        const ingressGap = Math.max(0, ingressNow - lastVideoIngressAt);
+        lastVideoIngressAt = ingressNow;
+        if (ingressGap > localRecoveryIngressGapMs) {
+            // Captured before parser.push(), so audio tags earlier in this same
+            // resumed FLV chunk cannot manufacture a stale overdue queue.
+            const pacerOverdue = resumePacerOverdueMs ?? 0;
+            resumePacerOverdueMs = undefined;
+            if (likelyEventLoopIngressStall(ingressGap, pacerOverdue)) {
+                const mediaProgress = ingressMediaDelta === undefined
+                    ? 'unknown'
+                    : `${Math.round(ingressMediaDelta)} ms`;
+                requestRestart(
+                    `video ingress paused ${Math.round(ingressGap)} ms; pacer overdue ${Math.round(pacerOverdue)} ms; media progress ${mediaProgress}`,
+                );
+                return;
+            }
+            const mediaEvidence = ingressMediaDelta === undefined
+                ? 'unknown'
+                : ingressMediaDelta <= 0 ? 'reset'
+                    : ingressMediaDelta > 250 ? 'jump'
+                        : 'ordinary';
+            beginLocalRecovery(
+                `video-ingress-resumed-${Math.round(ingressGap)}ms-media-${mediaEvidence}`,
+            );
+        }
+        // Gate before packetization: discarded media must not consume RTP
+        // sequence numbers, timestamps, octets, or sender-report packet counts.
+        if (awaitingRecoveryKeyframe) {
+            if (!isKeyframe) return;
+            completeLocalRecovery();
+        }
         // Sample freshness at IDR arrival, before packetization. The access unit
         // itself is retained below as immutable muxer-owned RTP buffers and only
         // converted to Annex-B if a snapshot consumer asks for it.
         const keyframeArrival = isKeyframe ? Date.now() : undefined;
-        const mediaMs = Math.max(0, tsMs + cts);
         if (previousVideoMediaMs !== undefined) {
             const delta = mediaMs - previousVideoMediaMs;
             if (delta >= 5 && delta <= 250)
                 videoFrameIntervalMs = videoFrameIntervalMs * 0.8 + delta * 0.2;
         }
         previousVideoMediaMs = mediaMs;
-        const ts = mediaMs * (VIDEO_CLOCK / 1000);
+        const rawTs = Math.round(mediaMs * (VIDEO_CLOCK / 1000)) >>> 0;
+        const ts = normalizeVideoRtpTimestamp(rawTs);
         const pkts: Buffer[] = [];
         packetizeH264(videoTrack, videoParams, nals, ts, isKeyframe, pkts);
         if (inspection && !inspection.valid)
@@ -1200,6 +1355,7 @@ export async function startNativeServe(opts: {
             return;
         }
         if (pktType !== 1 || audioParams?.codec !== 'aac' || !audioServed) return;
+        if (awaitingRecoveryKeyframe) return;
         // Synthesize the AAC RTP clock at exactly the AudioSpecificConfig frame
         // length (normally 1024 samples). The FLV ms
         // timestamps quantize to ±1 sample, which makes a receiver's NetEq
@@ -1261,6 +1417,7 @@ export async function startNativeServe(opts: {
             return;
         }
         if (audioParams?.codec !== 'opus' || !audioServed) return;
+        if (awaitingRecoveryKeyframe) return;
 
         // Hard CBR is part of the advertised contract. A size change means the
         // camera setting or encoder mode changed underneath this SDP; rebuild
@@ -1306,7 +1463,20 @@ export async function startNativeServe(opts: {
             }
         }
     });
-    const feed = (d: Buffer) => parser.push(d);
+    const feed = (d: Buffer) => {
+        // Snapshot established pacer lateness before parsing any resumed tags.
+        // A genuine source pause has an empty/responsive queue; a blocked Node
+        // event loop leaves already-established egress >5 s overdue.
+        const now = performance.now();
+        const feedGap = Math.max(0, now - lastFeedAt);
+        lastFeedAt = now;
+        if (feedGap > localRecoveryIngressGapMs) {
+            resumePacerOverdueMs = queued() && epoch
+                ? Math.max(0, now - (epoch + queueFront().frontDue()))
+                : 0;
+        }
+        parser.push(d);
+    };
     flv.on('data', feed);
 
     // Periodic RTCP Sender Reports so receivers can lip-sync the independent
@@ -1332,6 +1502,8 @@ export async function startNativeServe(opts: {
         clearInterval(rtcpTimer);
         clearInterval(stallTimer);
         clearTimeout(drainTimer);
+        clearTimeout(localRecoveryTimer);
+        localRecoveryTimer = undefined;
         clearEgress(reason);
         updatePressure();
         flv.removeListener('data', feed);
@@ -1343,11 +1515,17 @@ export async function startNativeServe(opts: {
         try { flv.destroy(); } catch { }
     };
     flv.once('close', () => destroy?.('flv-input-closed'));
-    // Close RTSP clients at the point of failure instead of waiting for the
-    // provider's coarse health poll. Their reconnect then creates a clean stream.
+    // Observe silence without destroying the RTSP generation or camera push.
+    // Firmware owns fast VENC recovery; UnifiCamera owns the >=120 s fallback.
     stallTimer = setInterval(() => {
-        if (!dead && performance.now() - lastVideoRtp >= RTP_STALL_MS)
-            requestRestart(`no video RTP egress for ${RTP_STALL_MS} ms`);
+        const age = performance.now() - lastVideoRtp;
+        if (!dead && age >= VIDEO_STALL_WARN_MS && !stallWarningActive) {
+            stallWarningActive = true;
+            cadence?.recordVideoStall(age);
+            dbg('native-rtsp video RTP stall warning:', Math.round(age), 'ms');
+        } else if (age < VIDEO_STALL_WARN_MS) {
+            stallWarningActive = false;
+        }
     }, 1000);
 
     // The H.264 sequence header is required to build the SDP; it arrives in the
@@ -1421,8 +1599,13 @@ export async function startNativeServe(opts: {
         const packet = queue.frontPacket();
         const keyframeStart = queue.frontIsKeyframeStart();
         queue.shift();
+        if (control === 'trackID=0') videoTrack.commit(packet);
+        else audioTrack.commit(packet);
         if (keyframeStart) { gop = []; gopBytes = 0; gopOverflow = false; }
         if (control !== 'trackID=1' || gop.length) gopAppend(control, packet);
+        if (control === 'trackID=0') {
+            lastRetainedVideoRtpTs = packet.readUInt32BE(4);
+        }
     }
     updatePressure();
     if (queued()) {
@@ -1512,7 +1695,9 @@ export async function startNativeServe(opts: {
         url,
         destroy: () => destroy?.('serve-handle-destroyed'),
         get clientCount() { return sessions.size; },
-        get alive() { return !dead && (performance.now() - lastVideoRtp) < RTP_STALL_MS; },
+        get alive() { return !dead; },
+        get videoRtpAgeMs() { return Math.max(0, performance.now() - lastVideoRtp); },
+        get localRecoveryActive() { return awaitingRecoveryKeyframe; },
         latestKeyframe: () => latestKeyframe,
         audioParams: () => useAudio,
         subscribeAudio: (fn, onEnd) => {

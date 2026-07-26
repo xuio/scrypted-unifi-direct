@@ -28,6 +28,7 @@ test('camera release is idempotent and clears owned clients, streams, waits, and
     let pendingStops = 0;
     let detectionDisposes = 0;
     let clientDestroys = 0;
+    let snapshotClientDestroys = 0;
     let waiterRuns = 0;
     let snapshotResets = 0;
     const cam: any = Object.create(UnifiCamera.prototype);
@@ -40,6 +41,8 @@ test('camera release is idempotent and clears owned clients, streams, waits, and
         detections: { dispose: () => detectionDisposes++ },
         client: { destroy: () => clientDestroys++ },
         clientConfig: { host: 'camera', username: 'user', password: 'secret' },
+        snapshotClient: { destroy: () => snapshotClientDestroys++ },
+        snapshotClientConfig: { host: 'camera', username: 'user', password: 'secret' },
         onlineWaiters: new Set([() => waiterRuns++]),
         snapshots: { reset: () => snapshotResets++ },
     });
@@ -50,10 +53,13 @@ test('camera release is idempotent and clears owned clients, streams, waits, and
     assert.equal(pendingStops, 1);
     assert.equal(detectionDisposes, 1);
     assert.equal(clientDestroys, 1);
+    assert.equal(snapshotClientDestroys, 1);
     assert.equal(waiterRuns, 1);
     assert.equal(snapshotResets, 1);
     assert.equal(cam.client, undefined);
     assert.equal(cam.clientConfig, undefined);
+    assert.equal(cam.snapshotClient, undefined);
+    assert.equal(cam.snapshotClientConfig, undefined);
     assert.equal(cam.streams.size, 0);
     assert.equal(cam.pendingStreams.size, 0);
 });
@@ -199,6 +205,306 @@ test('camera client reuse is keyed by host and credentials', () => {
     assert.equal(oldDestroys, 1, 'credential changes destroy the previous pooled agent');
     assert.deepEqual(cam.clientConfig, { host: 'camera.local', username: 'owner', password: 'new-secret' });
     replacement.destroy();
+});
+
+test('snapshot authentication and backoff are isolated from the management client', () => {
+    const values = new Map<string, string>([
+        ['host', 'camera.local'],
+        ['username', 'owner'],
+        ['password', 'secret'],
+    ]);
+    const cam: any = Object.create(UnifiCamera.prototype);
+    Object.assign(cam, {
+        released: false,
+        storage: { getItem: (key: string) => values.get(key) },
+        console: { log: () => { }, warn: () => { } },
+    });
+
+    const management = cam.getClient();
+    const snapshot = cam.getSnapshotClient();
+    assert.notEqual(snapshot, management);
+    (snapshot as any).lastLoginFail = Date.now();
+    (snapshot as any).loginFailures = 1;
+    assert.equal(snapshot.inLoginBackoff, true);
+    assert.equal(management.inLoginBackoff, false,
+        'snapshot login failure leaked into management pairing/recovery state');
+    assert.strictEqual(cam.getClient(), management);
+    assert.strictEqual(cam.getSnapshotClient(), snapshot);
+    management.destroy();
+    snapshot.destroy();
+});
+
+test('sustained all-track silence reboots only the camera once per 30-minute cooldown', async () => {
+    const values = new Map<string, string>([
+        ['mac', 'AABBCCDDEEFF'],
+        ['channel', 'high'],
+        ['substream', 'medium'],
+    ]);
+    const recoveryEvents: Array<{ inFlight: boolean; issued: boolean; reason: string }> = [];
+    let now = 10_000_000;
+    let cameraReboots = 0;
+    let managementBackoff = true;
+    let rebootResult = { issued: false, ambiguous: false };
+    const silent = {
+        connected: true,
+        ready: true,
+        videoNoDataMs: 121_000,
+        videoRtpNoDataMs: 121_000,
+        localRecoveryActive: false,
+    };
+    const emulator = {
+        isOnline: () => true,
+        recordFallbackRecovery: (
+            _mac: string,
+            _owner: string,
+            reason: string,
+            inFlight: boolean,
+            issued: boolean,
+        ) => recoveryEvents.push({ inFlight, issued, reason }),
+    };
+    const cam: any = Object.create(UnifiCamera.prototype);
+    Object.assign(cam, {
+        released: false,
+        streams: new Map([
+            ['video1', { alive: true, health: { ...silent } }],
+            ['video2', { alive: true, health: { ...silent } }],
+        ]),
+        creating: new Map(),
+        failedPublishedTracks: new Map(),
+        managementOnlineSince: now - 121_000,
+        lastFallbackRecoveryIssuedAt: 0,
+        fallbackRecoveryInFlight: false,
+        noVideoWarningActive: false,
+        resilienceNow: () => now,
+        provider: { emulator },
+        storage: {
+            getItem: (key: string) => values.get(key),
+            setItem: (key: string, value: string) => values.set(key, value),
+        },
+        getClient: () => ({
+            inLoginBackoff: managementBackoff,
+            reboot: async () => {
+                cameraReboots++;
+                return rebootResult;
+            },
+        }),
+    });
+
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 0, 'known auth backoff consumed a recovery attempt');
+    assert.equal(values.has('resilience.lastCameraRecoveryAt'), false);
+
+    managementBackoff = false;
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 1);
+    assert.equal(values.has('resilience.lastCameraRecoveryAt'), false,
+        'definite non-attempt consumed the persisted cooldown');
+    assert.equal(recoveryEvents.filter(event => event.issued).length, 0,
+        'definite non-attempt incremented successful recovery metrics');
+
+    rebootResult = { issued: true, ambiguous: true };
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 2, 'definite non-attempt incorrectly blocked an immediate retry');
+    assert.deepEqual(recoveryEvents.map(event => event.inFlight), [true, false, true, true, false]);
+    assert.equal(recoveryEvents.filter(event => event.issued).length, 1);
+    assert.match(recoveryEvents[0].reason, /all-published-tracks-degraded/);
+    assert.ok(Number(values.get('resilience.lastCameraRecoveryAt')) > 0);
+
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 2, 'camera fallback ignored its persisted cooldown');
+});
+
+test('both reaped published tracks retain failure age and reach camera fallback', async () => {
+    const values = new Map<string, string>([
+        ['mac', 'AABBCCDDEEFF'],
+        ['channel', 'high'],
+        ['substream', 'medium'],
+    ]);
+    let now = 20_000_000;
+    let cameraReboots = 0;
+    let stopped = 0;
+    const dead = {
+        alive: false,
+        health: {
+            connected: false,
+            ready: false,
+            videoNoDataMs: 0,
+            videoRtpNoDataMs: 0,
+            localRecoveryActive: false,
+        },
+        stop: () => stopped++,
+    };
+    const emulator = {
+        isOnline: () => true,
+        recordFallbackRecovery: () => { },
+    };
+    const cam: any = Object.create(UnifiCamera.prototype);
+    Object.assign(cam, {
+        released: false,
+        streams: new Map([
+            ['video1', { ...dead }],
+            ['video2', { ...dead }],
+        ]),
+        creating: new Map(),
+        failedPublishedTracks: new Map(),
+        managementOnlineSince: now - 300_000,
+        lastFallbackRecoveryIssuedAt: 0,
+        fallbackRecoveryInFlight: false,
+        noVideoWarningActive: false,
+        streamRebuilds: 0,
+        resilienceNow: () => now,
+        provider: { emulator },
+        storage: {
+            getItem: (key: string) => values.get(key),
+            setItem: (key: string, value: string) => values.set(key, value),
+        },
+        getClient: () => ({
+            inLoginBackoff: false,
+            reboot: async () => {
+                cameraReboots++;
+                return { issued: true, ambiguous: true };
+            },
+        }),
+    });
+
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cam.streams.size, 0);
+    assert.equal(cam.failedPublishedTracks.size, 2);
+    assert.equal(stopped, 2);
+    assert.equal(cameraReboots, 0);
+
+    now += 119_999;
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 0);
+
+    now += 1;
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 1,
+        'removing both DirectStream objects disabled the camera fallback');
+});
+
+test('management reconnect must remain continuously online before fallback', async () => {
+    const values = new Map<string, string>([
+        ['mac', 'AABBCCDDEEFF'],
+        ['channel', 'high'],
+        ['substream', 'medium'],
+    ]);
+    let now = 30_000_000;
+    let cameraReboots = 0;
+    const emulator = {
+        isOnline: () => true,
+        recordFallbackRecovery: () => { },
+    };
+    const cam: any = Object.create(UnifiCamera.prototype);
+    Object.assign(cam, {
+        released: false,
+        online: true,
+        streams: new Map(),
+        creating: new Map(),
+        failedPublishedTracks: new Map([
+            ['video1', now - 300_000],
+            ['video2', now - 300_000],
+        ]),
+        managementOnlineSince: now - 300_000,
+        lastFallbackRecoveryIssuedAt: 0,
+        fallbackRecoveryInFlight: false,
+        noVideoWarningActive: false,
+        resilienceNow: () => now,
+        provider: { emulator },
+        storage: {
+            getItem: (key: string) => values.get(key),
+            setItem: (key: string, value: string) => values.set(key, value),
+        },
+        invalidateAudioProfile: () => { },
+        snapshots: { warm: () => { } },
+        preferredAudioProfile: async () => ({ codec: 'aac' }),
+        onDeviceEvent: async () => { },
+        getClient: () => ({
+            inLoginBackoff: false,
+            reboot: async () => {
+                cameraReboots++;
+                return { issued: true, ambiguous: false };
+            },
+        }),
+    });
+
+    cam.onManagementConnectionChanged(false);
+    cam.onManagementConnectionChanged(true);
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 0, 'management reconnect caused an immediate reboot');
+
+    now += 119_999;
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 0);
+
+    now += 1;
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 1);
+});
+
+test('fire-and-forget camera recovery contains metrics and persistence failures', async () => {
+    let now = 40_000_000;
+    let cameraReboots = 0;
+    const cam: any = Object.create(UnifiCamera.prototype);
+    Object.assign(cam, {
+        released: false,
+        streams: new Map([['video1', {
+            alive: true,
+            health: {
+                connected: true,
+                ready: true,
+                videoNoDataMs: 121_000,
+                videoRtpNoDataMs: 121_000,
+                localRecoveryActive: false,
+            },
+        }]]),
+        creating: new Map(),
+        failedPublishedTracks: new Map(),
+        managementOnlineSince: now - 121_000,
+        fallbackRecoveryInFlight: false,
+        lastFallbackRecoveryIssuedAt: 0,
+        noVideoWarningActive: false,
+        resilienceNow: () => now,
+        provider: {
+            emulator: {
+                isOnline: () => true,
+                recordFallbackRecovery: () => { throw new Error('metrics unavailable'); },
+            },
+        },
+        storage: {
+            getItem: (key: string) => {
+                if (key === 'resilience.lastCameraRecoveryAt') throw new Error('storage read failed');
+                if (key === 'mac') return 'AABBCCDDEEFF';
+                if (key === 'channel') return 'high';
+                return undefined;
+            },
+            setItem: () => { throw new Error('storage write failed'); },
+        },
+        getClient: () => ({
+            inLoginBackoff: false,
+            reboot: async () => {
+                cameraReboots++;
+                return { issued: true, ambiguous: true };
+            },
+        }),
+    });
+
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 1);
+    assert.equal(cam.fallbackRecoveryInFlight, false);
+    assert.equal(cam.lastFallbackRecoveryIssuedAt, now,
+        'failed persistence lost the in-memory exactly-once cooldown');
 });
 
 test('verified audio profile is cached for client startup and refreshed on reconnect', async () => {
@@ -357,6 +663,8 @@ test('reset stops an in-flight DirectStream before start resolves', async () => 
         creating: new Map(),
         pendingStreams: new Map(),
         streamGen: 0,
+        failedPublishedTracks: new Map([['video1', Date.now() - 60_000]]),
+        noVideoWarningActive: true,
         storage: { getItem: (key: string) => values.get(key) },
         provider: {},
         createDirectStream: () => pending,
@@ -371,6 +679,8 @@ test('reset stops an in-flight DirectStream before start resolves', async () => 
     cam.resetStreams();
     assert.equal(stops, 1, 'reset stops the local instance immediately');
     assert.equal(cam.pendingStreams.size, 0);
+    assert.equal(cam.failedPublishedTracks.size, 0);
+    assert.equal(cam.noVideoWarningActive, false);
 
     resolveStart();
     const error = await result;
@@ -378,6 +688,108 @@ test('reset stops an in-flight DirectStream before start resolves', async () => 
     await new Promise<void>(resolve => setImmediate(resolve));
     assert.equal(cam.creating.size, 0);
     assert.equal(cam.streams.size, 0);
+});
+
+test('both requested primary streams failing before first FLV reach camera fallback', async () => {
+    const values = new Map<string, string>([
+        ['mac', 'AABBCCDDEEFF'],
+        ['host', 'camera.local'],
+        ['channel', 'high'],
+        ['substream', 'medium'],
+    ]);
+    let now = 50_000_000;
+    let cameraReboots = 0;
+    let starts = 0;
+    const emulator = {
+        isOnline: () => true,
+        recordFallbackRecovery: () => { },
+    };
+    const cam: any = Object.create(UnifiCamera.prototype);
+    Object.assign(cam, {
+        released: false,
+        streams: new Map(),
+        creating: new Map(),
+        pendingStreams: new Map(),
+        streamGen: 0,
+        failedPublishedTracks: new Map(),
+        managementOnlineSince: now - 300_000,
+        lastFallbackRecoveryIssuedAt: 0,
+        fallbackRecoveryInFlight: false,
+        noVideoWarningActive: false,
+        streamRebuilds: 0,
+        resilienceNow: () => now,
+        provider: { emulator },
+        storage: {
+            getItem: (key: string) => values.get(key),
+            setItem: (key: string, value: string) => values.set(key, value),
+        },
+        createDirectStream: () => ({
+            start: async () => {
+                starts++;
+                throw new Error('no valid FLV');
+            },
+            stop: () => { },
+            matchesAudioProfile: () => true,
+        }),
+        getClient: () => ({
+            inLoginBackoff: false,
+            reboot: async () => {
+                cameraReboots++;
+                return { issued: true, ambiguous: true };
+            },
+        }),
+    });
+
+    const failed = await Promise.allSettled([
+        cam.getOrCreateStream('video1', emulator),
+        cam.getOrCreateStream('video2', emulator),
+    ]);
+    assert.deepEqual(failed.map(result => result.status), ['rejected', 'rejected']);
+    assert.equal(starts, 2);
+    assert.deepEqual([...cam.failedPublishedTracks.keys()].sort(), ['video1', 'video2']);
+    assert.equal(cam.pendingStreams.size, 0);
+
+    now += 119_999;
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 0);
+
+    now += 1;
+    cam.reapDeadStreams();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(cameraReboots, 1,
+        'pre-FLV primary failures were not retained for the 120 second fallback');
+});
+
+test('successful stream recreation clears its remembered terminal failure', async () => {
+    const values = new Map<string, string>([
+        ['host', 'camera.local'],
+        ['channel', 'high'],
+        ['substream', 'none'],
+    ]);
+    const rebuilt = {
+        alive: true,
+        start: async () => { },
+        stop: () => { },
+        matchesAudioProfile: () => true,
+    };
+    const cam: any = Object.create(UnifiCamera.prototype);
+    Object.assign(cam, {
+        released: false,
+        streams: new Map(),
+        creating: new Map(),
+        pendingStreams: new Map(),
+        streamGen: 0,
+        failedPublishedTracks: new Map([['video1', Date.now() - 60_000]]),
+        storage: { getItem: (key: string) => values.get(key) },
+        provider: {},
+        createDirectStream: () => rebuilt,
+    });
+
+    const stream = await cam.getOrCreateStream('video1', {});
+    assert.strictEqual(stream, rebuilt);
+    assert.strictEqual(cam.streams.get('video1'), rebuilt);
+    assert.equal(cam.failedPublishedTracks.has('video1'), false);
 });
 
 test('provider shutdown is idempotent and drains every owned resource', async () => {

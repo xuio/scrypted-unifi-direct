@@ -53,12 +53,13 @@ export interface RtspServeHandle {
     url: string;
     destroy(): void;
     readonly clientCount: number;
-    /**
-     * False once the video pipeline is no longer usable (destroyed, or no RTP has
-     * been produced for a while — a stalled feed). The provider treats a non-alive
-     * serve as dead and rebuilds it from scratch.
-     */
+    /** False only after terminal media teardown. Temporary encoder silence stays
+     * alive so firmware/plugin recovery does not churn camera serializers. */
     readonly alive: boolean;
+    /** Monotonic age of the last video RTP egress, for camera-level recovery. */
+    readonly videoRtpAgeMs?: number;
+    /** True while stale paced media is being discarded until a clean IDR. */
+    readonly localRecoveryActive?: boolean;
     /**
      * The most recent decoded-ready keyframe, retained in muxer-owned form for
      * instant snapshots without opening another stream. Its Annex-B access unit

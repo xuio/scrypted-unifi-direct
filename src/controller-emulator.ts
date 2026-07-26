@@ -5,6 +5,7 @@ import { EventEmitter } from 'events';
 import { ByteQueue } from './byte-queue';
 import type { EmulatorTls } from './emulator-tls';
 import { dbg } from './debug';
+import type { ControllerResilienceSnapshot } from './cadence-diagnostics';
 
 type Logger = { log: (...a: any[]) => void; warn?: (...a: any[]) => void };
 
@@ -146,7 +147,73 @@ interface CameraSession {
     socket: net.Socket;
     send: (fn: string, payload: any, responseExpected?: boolean, inResponseTo?: number) => number;
     authenticated: boolean;
-    handshakeTimer?: NodeJS.Timeout;
+    handshakePhase: 'connected' | 'hello-received' | 'challenge-sent' | 'authenticated' | 'closed';
+    paramAgreementRequestId?: number;
+    paramAgreementTimer?: NodeJS.Timeout;
+    handshakeDeadlineTimer?: NodeJS.Timeout;
+}
+
+type VideoTrack = 'video1' | 'video2' | 'video3';
+const VIDEO_TRACKS: readonly VideoTrack[] = ['video1', 'video2', 'video3'];
+const VIDEO_RECONCILE_DEBOUNCE_MS = 20;
+const VIDEO_COMMAND_GAP_MS = 250;
+const VIDEO_COMMAND_ACK_MS = 5000;
+const VIDEO_COMMAND_COOLDOWN_BASE_MS = 1000;
+const VIDEO_COMMAND_COOLDOWN_MAX_MS = 30_000;
+const MANAGEMENT_HANDSHAKE_TIMEOUT_MS = 10_000;
+const MANAGEMENT_PARAM_AGREEMENT_DELAY_MS = 500;
+const MAX_PENDING_MANAGEMENT_SESSIONS = 64;
+
+interface DesiredVideoState {
+    active: boolean;
+    audioCodec: SerializerAudioCodec;
+    videoCodec?: string;
+    destination?: string;
+    streamName?: string;
+}
+
+interface VideoReconcileState {
+    desired: Map<VideoTrack, DesiredVideoState>;
+    applied: Map<VideoTrack, DesiredVideoState>;
+    desiredRevision: Map<VideoTrack, number>;
+    timeoutReassertedRevision: Map<VideoTrack, number>;
+    timer?: NodeJS.Timeout;
+    running: boolean;
+    blockedUntil: number;
+    failures: number;
+}
+
+interface VideoAck {
+    received: boolean;
+    payload?: any;
+}
+
+interface MutableControllerResilience {
+    reconfigure_sent: number;
+    reconfigure_coalesced: number;
+    reconfigure_skipped: number;
+    reconfigure_cooldowns: number;
+    reconfigure_ack_timeouts: number;
+    reconfigure_explicit_failures: number;
+    desired_revision: number;
+    fallback_recoveries: number;
+    fallback_recovery_inflight: number;
+    last_reconfigure_reason: string;
+    last_recovery_owner: string;
+    last_recovery_reason: string;
+}
+
+function sameDesiredVideo(a: DesiredVideoState | undefined, b: DesiredVideoState | undefined) {
+    return !!a && !!b
+        && a.active === b.active
+        && a.audioCodec === b.audioCodec
+        && a.videoCodec === b.videoCodec
+        && a.destination === b.destination
+        && a.streamName === b.streamName;
+}
+
+function boundedReason(reason: string) {
+    return reason.slice(0, 96);
 }
 
 /**
@@ -167,8 +234,20 @@ export class ControllerEmulator extends EventEmitter {
     private starting: Promise<void> | undefined;
     private stopping: Promise<void> | undefined;
     private sessions = new Map<string, CameraSession>();
+    private pendingSessions = new Map<string, CameraSession>();
     private msgId = 1;
     private pending = new Map<number, (payload: any) => void>();   // messageId -> reply resolver
+    private videoAcks = new Map<number, {
+        session: CameraSession;
+        resolve: (ack: VideoAck) => void;
+    }>();
+    private videoReconcile = new Map<string, VideoReconcileState>();
+    private resilience = new Map<string, MutableControllerResilience>();
+    /** Test seams retain production bounds while keeping timeout tests fast. */
+    private videoCommandAckMs = VIDEO_COMMAND_ACK_MS;
+    private videoCommandCooldownBaseMs = VIDEO_COMMAND_COOLDOWN_BASE_MS;
+    private handshakeTimeoutMs = MANAGEMENT_HANDSHAKE_TIMEOUT_MS;
+    private paramAgreementDelayMs = MANAGEMENT_PARAM_AGREEMENT_DELAY_MS;
     public readonly controllerUuid = 'e6f3f5f0-0000-4000-8000-' + crypto.randomBytes(6).toString('hex');
 
     constructor(private port: number, private logger: Logger, private tlsIdentity: EmulatorTls) {
@@ -188,6 +267,77 @@ export class ControllerEmulator extends EventEmitter {
     /** MACs of all cameras that have completed the handshake (for diagnostics). */
     onlineMacs(): string[] {
         return [...this.sessions.values()].filter(s => s.authenticated).map(s => s.mac);
+    }
+
+    private resilienceState(mac: string): MutableControllerResilience {
+        let state = this.resilience.get(mac);
+        if (!state) {
+            state = {
+                reconfigure_sent: 0,
+                reconfigure_coalesced: 0,
+                reconfigure_skipped: 0,
+                reconfigure_cooldowns: 0,
+                reconfigure_ack_timeouts: 0,
+                reconfigure_explicit_failures: 0,
+                desired_revision: 0,
+                fallback_recoveries: 0,
+                fallback_recovery_inflight: 0,
+                last_reconfigure_reason: '',
+                last_recovery_owner: '',
+                last_recovery_reason: '',
+            };
+            this.resilience.set(mac, state);
+        }
+        return state;
+    }
+
+    /** Safe, bounded camera-level metrics for the cadence JSONL collector. */
+    resilienceSnapshot(mac: string): ControllerResilienceSnapshot {
+        const metrics = this.resilienceState(mac);
+        const reconcile = this.videoReconcile.get(mac);
+        let pendingChanges = 0;
+        if (reconcile)
+            for (const track of VIDEO_TRACKS) {
+                const desired = reconcile.desired.get(track);
+                if (desired && !sameDesiredVideo(desired, reconcile.applied.get(track)))
+                    pendingChanges++;
+            }
+        return {
+            ...metrics,
+            pending_changes: pendingChanges,
+            cooldown_remaining_ms: Math.max(0, Math.round((reconcile?.blockedUntil ?? 0) - Date.now())),
+        };
+    }
+
+    recordFallbackRecovery(
+        mac: string,
+        owner: 'plugin',
+        reason: string,
+        inFlight: boolean,
+        issued: boolean,
+    ) {
+        const metrics = this.resilienceState(mac);
+        if (issued) metrics.fallback_recoveries++;
+        metrics.fallback_recovery_inflight = inFlight ? 1 : 0;
+        metrics.last_recovery_owner = owner;
+        metrics.last_recovery_reason = boundedReason(reason);
+    }
+
+    private reconcileState(mac: string): VideoReconcileState {
+        let state = this.videoReconcile.get(mac);
+        if (!state) {
+            state = {
+                desired: new Map(),
+                applied: new Map(),
+                desiredRevision: new Map(),
+                timeoutReassertedRevision: new Map(),
+                running: false,
+                blockedUntil: 0,
+                failures: 0,
+            };
+            this.videoReconcile.set(mac, state);
+        }
+        return state;
     }
 
     start(): Promise<void> {
@@ -236,12 +386,25 @@ export class ControllerEmulator extends EventEmitter {
 
     private async stopServer() {
         for (const s of this.sessions.values()) {
-            this.clearHandshakeTimer(s);
+            this.clearSessionTimers(s);
+            s.handshakePhase = 'closed';
+            s.paramAgreementRequestId = undefined;
             try { s.socket.destroy(); } catch { }
         }
         this.sessions.clear();
+        for (const s of this.pendingSessions.values()) {
+            this.clearSessionTimers(s);
+            s.handshakePhase = 'closed';
+            s.paramAgreementRequestId = undefined;
+            try { s.socket.destroy(); } catch { }
+        }
+        this.pendingSessions.clear();
         for (const resolve of this.pending.values()) resolve(undefined);
         this.pending.clear();
+        for (const pending of this.videoAcks.values()) pending.resolve({ received: false });
+        this.videoAcks.clear();
+        for (const state of this.videoReconcile.values()) clearTimeout(state.timer);
+        this.videoReconcile.clear();
         this.activeStreams.clear();
         const server = this.server;
         const starting = this.starting;
@@ -297,9 +460,11 @@ export class ControllerEmulator extends EventEmitter {
             // Upgrade parsing and socket implementations are outside our trust
             // boundary. Never let their exceptions escape EventEmitter.
             if (mac) {
-                const session = this.sessions.get(mac);
-                if (session?.socket === socket) {
-                    this.clearHandshakeTimer(session);
+                const pending = this.pendingSessions.get(mac);
+                if (pending?.socket === socket) this.discardPendingSession(pending);
+                const active = this.sessions.get(mac);
+                if (active?.socket === socket) {
+                    this.clearSessionTimers(active);
                     this.sessions.delete(mac);
                 }
             }
@@ -323,10 +488,29 @@ export class ControllerEmulator extends EventEmitter {
         try { socket.destroy(); } catch { }
     }
 
-    private clearHandshakeTimer(session: CameraSession) {
-        if (!session.handshakeTimer) return;
-        clearTimeout(session.handshakeTimer);
-        session.handshakeTimer = undefined;
+    private clearSessionTimers(session: CameraSession) {
+        if (session.paramAgreementTimer) {
+            clearTimeout(session.paramAgreementTimer);
+            session.paramAgreementTimer = undefined;
+        }
+        if (session.handshakeDeadlineTimer) {
+            clearTimeout(session.handshakeDeadlineTimer);
+            session.handshakeDeadlineTimer = undefined;
+        }
+    }
+
+    private discardPendingSession(session: CameraSession) {
+        if (this.pendingSessions.get(session.mac) === session)
+            this.pendingSessions.delete(session.mac);
+        this.clearSessionTimers(session);
+    }
+
+    private cancelVideoAcks(session: CameraSession) {
+        for (const [id, pending] of [...this.videoAcks])
+            if (pending.session === session) {
+                this.videoAcks.delete(id);
+                pending.resolve({ received: false });
+            }
     }
 
     private handleSession(mac: string, socket: net.Socket) {
@@ -341,15 +525,39 @@ export class ControllerEmulator extends EventEmitter {
             if (!socket.writableEnded && !socket.destroyed) socket.write(encodeFrame(Buffer.from(JSON.stringify(env))));
             return messageId;
         };
-        // If this MAC already has a session (reconnect before the old close fired),
-        // tear down the stale socket so its parser can't double-fire the handshake.
-        const prev = this.sessions.get(mac);
-        if (prev && prev.socket !== socket) {
-            this.clearHandshakeTimer(prev);
-            try { prev.socket.destroy(); } catch { }
+        // Keep an unauthenticated candidate separate from the active session.
+        // A peer that knows only a syntactically valid MAC must not tear down a
+        // healthy camera or allocate persistent reconcile/metrics state.
+        const existingCandidate = this.pendingSessions.get(mac);
+        if (existingCandidate && existingCandidate.socket !== socket) {
+            this.log('rejected overlapping unauthenticated camera session', mac);
+            try { socket.destroy(); } catch { }
+            return;
         }
-        const session: CameraSession = { mac, socket, send, authenticated: false };
-        this.sessions.set(mac, session);
+        if (!existingCandidate
+            && this.pendingSessions.size >= MAX_PENDING_MANAGEMENT_SESSIONS) {
+            this.log('rejected camera session: pending handshake limit reached');
+            try { socket.destroy(); } catch { }
+            return;
+        }
+        const session: CameraSession = {
+            mac,
+            socket,
+            send,
+            authenticated: false,
+            handshakePhase: 'connected',
+        };
+        this.pendingSessions.set(mac, session);
+        session.handshakeDeadlineTimer = setTimeout(() => {
+            session.handshakeDeadlineTimer = undefined;
+            if (this.pendingSessions.get(mac) !== session) return;
+            this.discardPendingSession(session);
+            session.handshakePhase = 'closed';
+            session.paramAgreementRequestId = undefined;
+            this.log('camera handshake timed out', mac);
+            try { socket.destroy(); } catch { }
+        }, this.handshakeTimeoutMs);
+        session.handshakeDeadlineTimer.unref?.();
 
         const parser = makeFrameParser(payload => {
             let m: any;
@@ -372,18 +580,77 @@ export class ControllerEmulator extends EventEmitter {
 
         socket.on('data', parser);
         socket.on('close', () => {
-            this.clearHandshakeTimer(session);
+            this.discardPendingSession(session);
+            this.cancelVideoAcks(session);
+            session.handshakePhase = 'closed';
+            session.paramAgreementRequestId = undefined;
             if (this.sessions.get(mac) === session) {
                 this.sessions.delete(mac);
                 this.log('camera disconnected', mac);
-                this.emit('offline', mac);
+                try { this.emit('offline', mac); }
+                catch (e) { this.log('offline handler failed', mac, (e as Error)?.message); }
             }
         });
         socket.on('error', e => this.log('camera socket error', mac, (e as Error)?.message));
     }
 
+    private authenticateSession(session: CameraSession, inResponseTo: unknown) {
+        if (this.pendingSessions.get(session.mac) !== session
+            || session.socket.destroyed
+            || session.socket.writableEnded
+            || session.handshakePhase !== 'challenge-sent'
+            || session.paramAgreementRequestId === undefined
+            || inResponseTo !== session.paramAgreementRequestId) return;
+        this.discardPendingSession(session);
+
+        // An overlapping, fully authenticated reconnect is authoritative. Emit
+        // a real offline/online edge while no active session is visible so
+        // camera-level continuous-online recovery age restarts at zero.
+        const previous = this.sessions.get(session.mac);
+        if (previous && previous !== session) {
+            this.sessions.delete(session.mac);
+            this.cancelVideoAcks(previous);
+            this.log('camera session replaced', session.mac);
+            try { this.emit('offline', session.mac); }
+            catch (e) { this.log('offline handler failed', session.mac, (e as Error)?.message); }
+            try { previous.socket.destroy(); } catch { }
+        }
+
+        // The camera may have rebooted or retained only part of serializer
+        // state. Reconnect is also the bounded reset point for a revision whose
+        // one lost-ACK reassertion was already consumed.
+        const reconcile = this.videoReconcile.get(session.mac);
+        if (reconcile) {
+            reconcile.applied.clear();
+            reconcile.timeoutReassertedRevision.clear();
+            reconcile.failures = 0;
+            reconcile.blockedUntil = 0;
+            if (reconcile.timer) {
+                clearTimeout(reconcile.timer);
+                reconcile.timer = undefined;
+            }
+        }
+
+        session.authenticated = true;
+        session.handshakePhase = 'authenticated';
+        this.sessions.set(session.mac, session);
+        this.log('camera authenticated', session.mac);
+        this.quiesceSubstreams(session);
+        this.enableDetections(session);
+        try { this.emit('online', session.mac); }
+        catch (e) { this.log('online handler failed', session.mac, (e as Error)?.message); }
+    }
+
     private onMessage(session: CameraSession, m: any) {
+        const live = session.authenticated
+            ? this.sessions.get(session.mac) === session
+            : this.pendingSessions.get(session.mac) === session;
+        if (!live) return;
         const fn = m.functionName;
+        if (!session.authenticated
+            && fn !== 'ubnt_avclient_hello'
+            && fn !== 'ubnt_avclient_paramAgreement'
+            && fn !== 'ubnt_avclient_timeSync') return;
         if (fn !== 'ubnt_avclient_timeSync') dbg('emu recv', session.mac, fn);
         // Surface the camera's reply to our Change*Settings commands without
         // reflecting configuration payloads into the diagnostic log. Only
@@ -400,8 +667,15 @@ export class ControllerEmulator extends EventEmitter {
                     : success !== undefined ? `success=${success}`
                         : 'status=received');
         }
+        if (session.authenticated && m.inResponseTo && this.videoAcks.has(m.inResponseTo)) {
+            const pending = this.videoAcks.get(m.inResponseTo)!;
+            if (pending.session === session) {
+                this.videoAcks.delete(m.inResponseTo);
+                pending.resolve({ received: true, payload: m.payload });
+            }
+        }
         // Resolve a pending readSetting() awaiting this reply.
-        if (m.inResponseTo && this.pending.has(m.inResponseTo)) {
+        if (session.authenticated && m.inResponseTo && this.pending.has(m.inResponseTo)) {
             const resolve = this.pending.get(m.inResponseTo)!;
             this.pending.delete(m.inResponseTo);
             resolve(m.payload);
@@ -415,27 +689,37 @@ export class ControllerEmulator extends EventEmitter {
                     controllerVersion: '1.20.0',
                     overrideUuid: true,
                 }, false, m.messageId);
-                this.clearHandshakeTimer(session);
-                session.handshakeTimer = setTimeout(() => {
-                    session.handshakeTimer = undefined;
-                    if (this.sessions.get(session.mac) !== session
+                session.handshakePhase = 'hello-received';
+                session.paramAgreementRequestId = undefined;
+                if (session.paramAgreementTimer)
+                    clearTimeout(session.paramAgreementTimer);
+                session.paramAgreementTimer = setTimeout(() => {
+                    session.paramAgreementTimer = undefined;
+                    if (this.pendingSessions.get(session.mac) !== session
+                        || session.handshakePhase !== 'hello-received'
                         || session.socket.destroyed
                         || session.socket.writableEnded) return;
-                    session.send('ubnt_avclient_paramAgreement', {
-                        enableStatusCodes: true, useHeartbeats: false, heartbeatsTimeoutMs: 60000,
-                    }, true);
-                }, 500);
+                    try {
+                        session.paramAgreementRequestId = session.send('ubnt_avclient_paramAgreement', {
+                            enableStatusCodes: true, useHeartbeats: false, heartbeatsTimeoutMs: 60000,
+                        }, true);
+                        session.handshakePhase = 'challenge-sent';
+                    } catch (e) {
+                        this.log('camera handshake challenge failed', session.mac,
+                            (e as Error)?.message);
+                        this.discardPendingSession(session);
+                        session.handshakePhase = 'closed';
+                        session.paramAgreementRequestId = undefined;
+                        try { session.socket.destroy(); } catch { }
+                    }
+                }, this.paramAgreementDelayMs);
+                session.paramAgreementTimer.unref?.();
                 break;
             case 'ubnt_avclient_paramAgreement':
-                // camera's reply to our paramAgreement completes the handshake
-                if (!session.authenticated) {
-                    this.clearHandshakeTimer(session);
-                    session.authenticated = true;
-                    this.log('camera authenticated', session.mac);
-                    this.quiesceSubstreams(session);
-                    this.enableDetections(session);
-                    this.emit('online', session.mac);
-                }
+                // Only the exact reply to this session's issued challenge can
+                // complete adoption; a MAC header and function name are not proof.
+                if (!session.authenticated)
+                    this.authenticateSession(session, m.inResponseTo);
                 break;
             case 'ubnt_avclient_timeSync':
                 session.send('ubnt_avclient_timeSync', { t1: Date.now(), t2: Date.now() }, false, m.messageId);
@@ -489,6 +773,160 @@ export class ControllerEmulator extends EventEmitter {
         return this.audioCodecs.get(mac) ?? 'aac';
     }
 
+    private quiescedState(mac: string): DesiredVideoState {
+        return { active: false, audioCodec: this.audioCodec(mac) };
+    }
+
+    private setDesired(mac: string, track: VideoTrack, desired: DesiredVideoState, reason: string) {
+        const state = this.reconcileState(mac);
+        const metrics = this.resilienceState(mac);
+        if (sameDesiredVideo(state.desired.get(track), desired)) {
+            metrics.reconfigure_skipped++;
+            return;
+        }
+        state.desired.set(track, desired);
+        metrics.desired_revision++;
+        state.desiredRevision.set(track, metrics.desired_revision);
+        metrics.last_reconfigure_reason = boundedReason(reason);
+        this.scheduleVideoReconcile(mac);
+    }
+
+    private scheduleVideoReconcile(mac: string, delayMs = VIDEO_RECONCILE_DEBOUNCE_MS) {
+        const state = this.reconcileState(mac);
+        if (state.running || state.timer) {
+            this.resilienceState(mac).reconfigure_coalesced++;
+            return;
+        }
+        const delay = Math.max(delayMs, state.blockedUntil - Date.now(), 0);
+        state.timer = setTimeout(() => {
+            state.timer = undefined;
+            void this.runVideoReconcile(mac);
+        }, delay);
+        state.timer.unref?.();
+    }
+
+    private nextVideoChange(state: VideoReconcileState):
+        { track: VideoTrack; desired: DesiredVideoState; revision: number } | undefined {
+        // One track per command is deliberate: high and medium must never be
+        // stopped/restarted in the same camera transaction.
+        for (const track of VIDEO_TRACKS) {
+            const desired = state.desired.get(track);
+            if (desired && !sameDesiredVideo(desired, state.applied.get(track)))
+                return {
+                    track,
+                    desired,
+                    revision: state.desiredRevision.get(track) ?? 0,
+                };
+        }
+    }
+
+    private videoPayload(track: VideoTrack, desired: DesiredVideoState) {
+        return {
+            video: {
+                [track]: desired.active ? {
+                    avSerializer: {
+                        type: 'extendedFlv',
+                        parameters: audioSerializerParameters(desired.audioCodec, desired.streamName),
+                        destinations: [desired.destination],
+                    },
+                    type: desired.videoCodec,
+                } : {
+                    avSerializer: {
+                        type: 'extendedFlv',
+                        parameters: audioSerializerParameters(desired.audioCodec),
+                        destinations: ['file:///dev/null'],
+                    },
+                },
+            },
+        };
+    }
+
+    private waitForVideoAck(session: CameraSession, id: number): Promise<VideoAck> {
+        return new Promise(resolve => {
+            let settled = false;
+            const finish = (ack: VideoAck) => {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                this.videoAcks.delete(id);
+                resolve(ack);
+            };
+            const timer = setTimeout(() => finish({ received: false }), this.videoCommandAckMs);
+            timer.unref?.();
+            this.videoAcks.set(id, { session, resolve: finish });
+        });
+    }
+
+    private async runVideoReconcile(mac: string) {
+        const state = this.reconcileState(mac);
+        if (state.running) return;
+        const session = this.sessions.get(mac);
+        if (!session?.authenticated) return;
+        const change = this.nextVideoChange(state);
+        if (!change) return;
+
+        state.running = true;
+        const metrics = this.resilienceState(mac);
+        const { track, desired, revision } = change;
+        try {
+            const id = session.send('ChangeVideoSettings', this.videoPayload(track, desired), true);
+            // Optimistic application prevents an ambiguous lost acknowledgement
+            // from becoming a command storm. A reconnect clears this cache and
+            // safely reconciles the complete latest desired state.
+            state.applied.set(track, { ...desired });
+            metrics.reconfigure_sent++;
+            dbg('emulator reconcile video', mac, track, desired.active ? 'active' : 'quiesced');
+            const ack = await this.waitForVideoAck(session, id);
+            // A reconnect cancels the old wait. Its result must not mutate the
+            // freshly-cleared applied/retry state for the replacement session.
+            if (this.sessions.get(mac) !== session) return;
+            const explicitFailure = ack.received
+                && (ack.payload?.success === false
+                    || (typeof ack.payload?.statusCode === 'number' && ack.payload.statusCode >= 400));
+            if (!ack.received) {
+                metrics.reconfigure_ack_timeouts++;
+                state.failures++;
+                // One lost ACK may mean the command never reached the camera.
+                // Reassert this exact desired revision once after cooldown; a
+                // second lost ACK remains optimistically applied to stop storms.
+                if (state.desiredRevision.get(track) === revision
+                    && state.timeoutReassertedRevision.get(track) !== revision) {
+                    state.timeoutReassertedRevision.set(track, revision);
+                    state.applied.delete(track);
+                }
+            } else if (explicitFailure) {
+                metrics.reconfigure_explicit_failures++;
+                state.failures++;
+                state.applied.delete(track);
+            } else {
+                state.failures = 0;
+            }
+            if (!ack.received || explicitFailure) {
+                const cooldown = Math.min(this.videoCommandCooldownBaseMs
+                    * 2 ** Math.max(0, state.failures - 1),
+                    VIDEO_COMMAND_COOLDOWN_MAX_MS);
+                state.blockedUntil = Date.now() + cooldown;
+                metrics.reconfigure_cooldowns++;
+            } else {
+                state.blockedUntil = Date.now() + VIDEO_COMMAND_GAP_MS;
+            }
+        } catch (e) {
+            state.applied.delete(track);
+            state.failures++;
+            state.blockedUntil = Date.now() + Math.min(
+                this.videoCommandCooldownBaseMs * 2 ** Math.max(0, state.failures - 1),
+                VIDEO_COMMAND_COOLDOWN_MAX_MS,
+            );
+            metrics.reconfigure_explicit_failures++;
+            metrics.reconfigure_cooldowns++;
+            dbg('emulator reconcile video failed', mac, track, (e as Error)?.message);
+        } finally {
+            state.running = false;
+            if (this.sessions.get(mac)?.authenticated && this.nextVideoChange(state))
+                this.scheduleVideoReconcile(mac, VIDEO_COMMAND_GAP_MS);
+        }
+    }
+
     /**
      * On adoption, stop any serializer a previous controller/plugin generation
      * may have left pushing to
@@ -501,24 +939,15 @@ export class ControllerEmulator extends EventEmitter {
     private quiesceSubstreams(s: CameraSession) {
         try {
             const active = this.activeTracks(s.mac);
-            const video: Record<string, any> = {};
-            // Include video1. After a plugin process restart activeStreams is
-            // intentionally empty, but the camera retains the old destination and
-            // otherwise reconnect-storms the shared port before routes exist. On a
-            // normal management reconnect in the same process, genuinely active
-            // tracks remain in this map and are left untouched.
-            for (const t of ['video1', 'video2', 'video3'])
-                if (!active.has(t))
-                    video[t] = {
-                        avSerializer: {
-                            type: 'extendedFlv',
-                            parameters: audioSerializerParameters(this.audioCodec(s.mac)),
-                            destinations: ['file:///dev/null'],
-                        },
-                    };
-            if (!Object.keys(video).length) return;
-            s.send('ChangeVideoSettings', { video }, true);
-            dbg('emulator quiesceSubstreams', s.mac, Object.keys(video).join(','));
+            for (const track of VIDEO_TRACKS)
+                if (!active.has(track))
+                    this.setDesired(s.mac, track, this.quiescedState(s.mac),
+                        `management-online-quiesce:${track}`);
+            // Desired active tracks survive a management reconnect. Applied state
+            // was cleared on authenticated promotion, so the serialized reconciler
+            // reasserts them without racing the quiesce commands.
+            this.scheduleVideoReconcile(s.mac);
+            dbg('emulator quiesceSubstreams queued', s.mac);
         } catch (e) { dbg('quiesceSubstreams failed', s.mac, (e as Error)?.message); }
     }
 
@@ -582,50 +1011,51 @@ export class ControllerEmulator extends EventEmitter {
         const s = this.sessions.get(mac);
         if (!s) throw new Error(`camera ${mac} is not connected to the emulator`);
         const active = this.activeTracks(mac);
+        const previousCodec = this.audioCodec(mac);
         this.audioCodecs.set(mac, audioCodec);
-        const streamName = crypto.randomBytes(8).toString('hex');
-        const video: Record<string, any> = {
-            [channel]: {
-                avSerializer: {
-                    type: 'extendedFlv',
-                    parameters: audioSerializerParameters(audioCodec, streamName),
-                    destinations: [`tcp://${destHost}:${destPort}?retryInterval=1&connectTimeout=5`],
-                },
-                type: videoCodec,
-            },
-        };
-        for (const other of ['video1', 'video2', 'video3']) {
-            if (other === channel || active.has(other)) continue;
-            video[other] = {
-                avSerializer: {
-                    type: 'extendedFlv',
-                    parameters: audioSerializerParameters(audioCodec),
-                    destinations: ['file:///dev/null'],
-                },
-            };
+        const state = this.reconcileState(mac);
+        // The audio encoder is camera-wide. If the selected codec changes, update
+        // every desired serializer before reconciling any one track.
+        if (previousCodec !== audioCodec) {
+            for (const track of VIDEO_TRACKS) {
+                const desired = state.desired.get(track);
+                if (!desired) continue;
+                this.setDesired(mac, track, {
+                    ...desired,
+                    audioCodec,
+                    ...(desired.active ? { streamName: crypto.randomBytes(8).toString('hex') } : {}),
+                }, `audio-codec:${track}`);
+            }
         }
-        active.set(channel, `tcp://${destHost}:${destPort}`);
-        s.send('ChangeVideoSettings', { video }, true);
-        dbg('emulator startStream', mac, channel, `-> ${destHost}:${destPort}`, videoCodec, audioCodec, 'streamName', streamName,
+        const track = channel as VideoTrack;
+        if (!VIDEO_TRACKS.includes(track)) throw new Error(`unsupported camera track ${channel}`);
+        const destination = `tcp://${destHost}:${destPort}?retryInterval=1&connectTimeout=5`;
+        const existing = state.desired.get(track);
+        const sameActive = existing?.active
+            && existing.destination === destination
+            && existing.videoCodec === videoCodec
+            && existing.audioCodec === audioCodec;
+        this.setDesired(mac, track, sameActive ? existing : {
+            active: true,
+            audioCodec,
+            videoCodec,
+            destination,
+            streamName: crypto.randomBytes(8).toString('hex'),
+        }, `start:${track}`);
+        for (const other of VIDEO_TRACKS)
+            if (other !== track && !active.has(other) && !state.desired.has(other))
+                this.setDesired(mac, other, this.quiescedState(mac), `initial-quiesce:${other}`);
+        active.set(track, destination);
+        dbg('emulator startStream queued', mac, track, videoCodec, audioCodec,
             'active', [...active.keys()].join(','));
-        this.log(`commanded ${mac} ${channel} -> ${destHost}:${destPort} (${videoCodec})`);
+        this.log(`queued ${mac} ${track} stream (${videoCodec})`);
     }
 
     /** Tell a camera to stop pushing the given channel. */
     stopStream(mac: string, channel: string) {
-        this.activeStreams.get(mac)?.delete(channel);
-        const s = this.sessions.get(mac);
-        if (!s) return;
-        s.send('ChangeVideoSettings', {
-            video: {
-                [channel]: {
-                    avSerializer: {
-                        type: 'extendedFlv',
-                        parameters: audioSerializerParameters(this.audioCodec(mac)),
-                        destinations: ['file:///dev/null'],
-                    },
-                },
-            },
-        }, true);
+        const track = channel as VideoTrack;
+        if (!VIDEO_TRACKS.includes(track)) return;
+        this.activeStreams.get(mac)?.delete(track);
+        this.setDesired(mac, track, this.quiescedState(mac), `stop:${track}`);
     }
 }

@@ -152,6 +152,8 @@ export class DirectStream {
     private cadenceDiagnostics: CadenceDiagnostics | undefined;
     private nativeTerminalReason: NativeTerminalReason | undefined;
     private lastCandidateDataAt = 0;
+    private createdAt = Date.now();
+    private lastVideoDataAt = 0;
     private settleTimer: any;
     private serve: RtspServeHandle | undefined;
     private serveStarted = false;
@@ -223,6 +225,18 @@ export class DirectStream {
             && !!this.cameraSocket && !this.cameraSocket.destroyed;
     }
 
+    /** Bounded health state consumed by the camera-level recovery owner. */
+    get health() {
+        const now = Date.now();
+        return {
+            connected: !!this.cameraSocket && !this.cameraSocket.destroyed,
+            ready: !!this.serve && this.serve.alive && !this.stopped,
+            videoNoDataMs: Math.max(0, now - (this.lastVideoDataAt || this.createdAt)),
+            videoRtpNoDataMs: this.serve?.videoRtpAgeMs ?? Math.max(0, now - this.createdAt),
+            localRecoveryActive: this.serve?.localRecoveryActive ?? false,
+        };
+    }
+
     /** RTSP url Scrypted connects to. Available after start() resolves. */
     get url() { return this.serve?.url; }
 
@@ -261,7 +275,7 @@ export class DirectStream {
             mac: this.mac,
             channel: this.channel,
             generation: randomBytes(6).toString('hex'),
-        });
+        }, undefined, undefined, () => this.emulator.resilienceSnapshot?.(this.mac));
         cadence.onSnapshot = writeCadenceSnapshot;
         return cadence;
     }
@@ -281,6 +295,7 @@ export class DirectStream {
                 throw new Error('stopped');
             }
             this.registered = true;
+            this.cadenceDiagnostics ??= this.createCadenceDiagnostics();
 
             // Arm completion observers before commanding the camera. The push
             // listener and source-scoped route are already live because
@@ -337,6 +352,7 @@ export class DirectStream {
         try { sock.setKeepAlive(true, 10_000); } catch { }
         if (this.stopped) { sock.destroy(); return; }   // race: connection after stop
         this.cameraSockets.add(sock);
+        this.cadenceDiagnostics?.recordProbeConnection();
 
         // TCP may split the three-byte FLV signature at either byte boundary.
         // Keep a tiny per-socket prefix until it is a definite match/mismatch;
@@ -346,6 +362,7 @@ export class DirectStream {
         const probeTimer = setTimeout(() => {
             if (!classified && !sock.destroyed) {
                 dbg('DS', this.mac, 'stream probe timed out from', sock.remoteAddress || '?');
+                this.cadenceDiagnostics?.recordProbeTimeout();
                 sock.destroy();
             }
         }, PROBE_TIMEOUT_MS);
@@ -365,6 +382,7 @@ export class DirectStream {
                 if (probe.length < FLV_MAGIC.length) return;
                 classified = true;
                 clearTimeout(probeTimer);
+                this.cadenceDiagnostics?.recordFlvHeader();
                 d = probe;
                 probe = Buffer.alloc(0);
 
@@ -395,6 +413,7 @@ export class DirectStream {
                 let writable = true;
                 for (const part of clean) {
                     if (flv.destroyed) break;
+                    if ((part[0] & 0x1f) === 9) this.lastVideoDataAt = Date.now();
                     this.cadenceDiagnostics?.recordDetrailedPart(part);
                     if (!flv.write(part)) writable = false;
                 }
@@ -482,8 +501,6 @@ export class DirectStream {
         this.detrailer = undefined;
         this.lastCandidateDataAt = 0;
         clearTimeout(this.settleTimer);
-        this.cadenceDiagnostics?.stop(`candidate-discarded:${reason}`);
-        this.cadenceDiagnostics = undefined;
         dbg('DS', this.mac, reason);
         try { oldFlv?.destroy(); } catch { }
         try { oldSocket?.destroy(); } catch { }
@@ -492,8 +509,7 @@ export class DirectStream {
     /** Lock onto a candidate FLV connection with a fresh pipeline and settle timer. */
     private adopt(sock: net.Socket) {
         this.clearIngressPauses();
-        this.cadenceDiagnostics?.stop('candidate-replaced');
-        this.cadenceDiagnostics = this.createCadenceDiagnostics();
+        this.cadenceDiagnostics ??= this.createCadenceDiagnostics();
         this.nativeTerminalReason = undefined;
         this.cameraSocket = sock;
         this.flv = new PassThrough({ highWaterMark: SETTLE_BUFFER_HWM });
@@ -620,6 +636,7 @@ export class DirectStream {
                 throw new Error('native media pipeline closed during startup');
             }
             this.serve = serve;
+            cadence.recordStreamReady(true);
             this.onServeReady?.();
         } catch (e) {
             settleFlv.unpipe(steadyFlv);
@@ -653,8 +670,7 @@ export class DirectStream {
         try { this.flv?.destroy(); } catch { }
         this.flv = undefined;
         this.detrailer = undefined;
-        this.cadenceDiagnostics?.stop('candidate-connection-closed');
-        this.cadenceDiagnostics = undefined;
+        this.cadenceDiagnostics?.recordStreamReady(false);
     }
 
     stop(reason = 'direct-stream-stop') {
@@ -663,6 +679,7 @@ export class DirectStream {
         clearTimeout(this.settleTimer);
         clearInterval(this.resolveTimer);
         this.clearIngressPauses();
+        this.cadenceDiagnostics?.recordStreamReady(false);
         try { this.emulator.stopStream(this.mac, this.channel); } catch { }
         this.streaming = false;
         for (const s of this.cameraSockets) { try { s.destroy(); } catch { } }   // incl. non-adopted strays

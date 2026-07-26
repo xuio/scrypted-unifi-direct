@@ -62,10 +62,16 @@ export const CHANNELS: Record<string, { track: string; label: string; w: number;
  *  so nothing needs to be allocated or persisted. Verified on-hardware that a
  *  camera sustains concurrent per-track pushes. */
 const TRACK_PORTS: Record<string, number> = { video1: 17550, video2: 17551, video3: 17552 };
+export const NO_VIDEO_WARN_MS = 30_000;
+export const CAMERA_FALLBACK_RECOVERY_MS = 120_000;
+export const CAMERA_FALLBACK_COOLDOWN_MS = 30 * 60_000;
+const SNAPSHOT_TRANSACTION_MS = 3000;
 
 export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCamera, Settings, MotionSensor, ObjectDetector, Online {
     private client: CameraApiClient | undefined;
     private clientConfig: { host: string; username: string; password: string } | undefined;
+    private snapshotClient: CameraApiClient | undefined;
+    private snapshotClientConfig: { host: string; username: string; password: string } | undefined;
     private streams = new Map<string, DirectStream>();
     private creating = new Map<string, Promise<DirectStream>>();
     private pendingStreams = new Map<string, DirectStream>();
@@ -78,6 +84,11 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     private onlineWaiters = new Set<() => void>();
     private zoneManager = new CameraZoneManager(this.storage);
     private snapshotRequestSequence = 0;
+    private noVideoWarningActive = false;
+    private fallbackRecoveryInFlight = false;
+    private failedPublishedTracks = new Map<string, number>();
+    private managementOnlineSince: number | undefined;
+    private lastFallbackRecoveryIssuedAt = 0;
 
     // Detection runs on the full sensor FoV regardless of the streamed channel.
     private detections = new DetectionEngine(CHANNELS.high, {
@@ -107,7 +118,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             const mo = await proxy.getVideoStream({ id: this.channelKey });
             return mediaManager.convertMediaObjectToBuffer(mo, 'image/jpeg');
         },
-        mjpgSnapshot: () => this.getClient().getSnapshot(),
+        mjpgSnapshot: () => this.getSnapshotClient().getSnapshot(SNAPSHOT_TRANSACTION_MS),
     }, {
         inspectJpeg: inspectSnapshotVisual,
     });
@@ -158,6 +169,28 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             this.clientConfig = { host, username, password };
         }
         return this.client;
+    }
+
+    /** Snapshots own a separate cookie, login backoff, keep-alive pool, and hard
+     * transaction budget. A slow JPEG/login can never consume the management
+     * client's auth state or delay pairing/media recovery. */
+    private getSnapshotClient(): CameraApiClient {
+        if (this.released)
+            throw new Error('camera has been released');
+        const host = this.storage.getItem('host');
+        const username = this.storage.getItem('username');
+        const password = this.storage.getItem('password');
+        if (!host || !username || !password)
+            throw new Error('camera missing host/username/password');
+        const sameConfig = this.snapshotClientConfig?.host === host
+            && this.snapshotClientConfig.username === username
+            && this.snapshotClientConfig.password === password;
+        if (!this.snapshotClient || !sameConfig) {
+            this.snapshotClient?.destroy();
+            this.snapshotClient = new CameraApiClient(host, username, password, this.console);
+            this.snapshotClientConfig = { host, username, password };
+        }
+        return this.snapshotClient;
     }
 
     private cachedFeatures?: Record<string, any>;
@@ -807,7 +840,11 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             // Audio is one camera-wide encoder. Replacing only this track can
             // overlap incompatible serializer profiles with another live track.
             if (!existing.matchesAudioProfile(audioProfile)) this.resetStreams();
-            else { existing.stop(); this.streams.delete(track); }
+            else {
+                if (!existing.alive) this.markPublishedTrackFailed(track);
+                existing.stop();
+                this.streams.delete(track);
+            }
         }
 
         let creating = this.creating.get(track);
@@ -829,7 +866,16 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                         throw new Error('stream creation superseded');
                     }
                     this.streams.set(track, s);
+                    this.failedTrackState().delete(track);
                     return s;
+                } catch (e) {
+                    // A primary track that was requested but never reached its
+                    // first valid FLV is still a real published-path failure.
+                    // Retain its first failure time for the camera fallback, but
+                    // never resurrect failures cleared by an intentional reset.
+                    if (!this.released && gen === this.streamGen)
+                        this.markPublishedTrackFailed(track);
+                    throw e;
                 } finally {
                     if (this.pendingStreams.get(track) === s) this.pendingStreams.delete(track);
                 }
@@ -862,6 +908,8 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         // be reused by a request for the new profile. Their conditional finally
         // cleanup cannot delete a newer creation inserted under the same track.
         this.creating.clear();
+        this.failedTrackState().clear();
+        this.noVideoWarningActive = false;
     }
 
     /**
@@ -875,18 +923,156 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
     private streamRebuilds = 0;
     private lastRebuild?: number;
 
+    /** Test seam for deterministic recovery windows; production uses wall time. */
+    private resilienceNow() { return Date.now(); }
+
+    private failedTrackState() {
+        return this.failedPublishedTracks ??= new Map<string, number>();
+    }
+
+    private markPublishedTrackFailed(track: string, now = this.resilienceNow()) {
+        const advertised = this.advertisedChannels().some(key => CHANNELS[key].track === track);
+        if (advertised && !this.failedTrackState().has(track))
+            this.failedTrackState().set(track, now);
+    }
+
+    /** Minimum continuous degradation across every track that has actually been
+     * published and is still advertised. A surviving healthy track contributes
+     * zero; a reaped track continues aging from its first terminal observation. */
+    private cameraDegradation(now = this.resilienceNow()):
+        { durationMs: number; trackCount: number } | undefined {
+        const emulator = this.provider.emulator;
+        let online = false;
+        try { online = !!emulator?.isOnline(this.mac); } catch { }
+        const onlineSince = this.managementOnlineSince;
+        if (!online || onlineSince === undefined) return;
+
+        const advertised = new Set(this.advertisedChannels().map(key => CHANNELS[key].track));
+        const failed = this.failedTrackState();
+        for (const track of [...failed.keys()])
+            if (!advertised.has(track)) failed.delete(track);
+
+        const durations: number[] = [];
+        for (const track of advertised) {
+            const stream = this.streams.get(track);
+            if (stream) {
+                const health = stream.health;
+                if (!stream.alive || !health.connected || !health.ready) {
+                    this.markPublishedTrackFailed(track, now);
+                    durations.push(Math.max(0, now - (failed.get(track) ?? now)));
+                } else {
+                    durations.push(Math.max(0,
+                        Math.min(health.videoNoDataMs, health.videoRtpNoDataMs)));
+                }
+                continue;
+            }
+            const failedAt = failed.get(track);
+            if (failedAt !== undefined)
+                durations.push(Math.max(0, now - failedAt));
+        }
+        if (!durations.length) return;
+        return {
+            durationMs: Math.min(
+                Math.max(0, now - onlineSince),
+                ...durations,
+            ),
+            trackCount: durations.length,
+        };
+    }
+
+    private lastFallbackRecoveryAt(): number {
+        let persisted = 0;
+        try {
+            const value = Number(this.storage.getItem('resilience.lastCameraRecoveryAt') || 0);
+            if (Number.isFinite(value) && value > 0) persisted = value;
+        } catch { }
+        return Math.max(this.lastFallbackRecoveryIssuedAt || 0, persisted);
+    }
+
+    private recordFallbackRecovery(reason: string, inFlight: boolean, issued: boolean) {
+        try {
+            this.provider.emulator?.recordFallbackRecovery(
+                this.mac,
+                'plugin',
+                reason,
+                inFlight,
+                issued,
+            );
+        } catch (e) {
+            dbg('camera resilience metric failed', this.mac, (e as Error)?.message);
+        }
+    }
+
+    private async recoverCameraAfterSustainedSilence(reason: string) {
+        if (this.released || this.fallbackRecoveryInFlight) return;
+        let metricStarted = false;
+        try {
+            const now = this.resilienceNow();
+            if (now - this.lastFallbackRecoveryAt() < CAMERA_FALLBACK_COOLDOWN_MS) return;
+            const degradation = this.cameraDegradation(now);
+            if (!degradation || degradation.durationMs < CAMERA_FALLBACK_RECOVERY_MS) return;
+
+            const client = this.getClient();
+            // A known authentication cooldown is a definite non-attempt.
+            if (client.inLoginBackoff) return;
+
+            this.fallbackRecoveryInFlight = true;
+            metricStarted = true;
+            this.recordFallbackRecovery(reason, true, false);
+            dbg('camera resilience fallback reboot', this.mac, reason);
+            const result = await client.reboot();
+            if (!result.issued) {
+                dbg('camera resilience reboot was not issued', this.mac);
+                return;
+            }
+
+            // Accepted and post-issue ambiguous outcomes are exactly-once. A
+            // successful camera reboot normally drops HTTPS before its response.
+            this.lastFallbackRecoveryIssuedAt = now;
+            try {
+                this.storage.setItem('resilience.lastCameraRecoveryAt', String(now));
+            } catch (e) {
+                dbg('camera resilience cooldown persistence failed', this.mac, (e as Error)?.message);
+            }
+            this.recordFallbackRecovery(reason, true, true);
+        } catch (e) {
+            dbg('camera resilience fallback failed', this.mac, (e as Error)?.message);
+        } finally {
+            this.fallbackRecoveryInFlight = false;
+            if (metricStarted) this.recordFallbackRecovery(reason, false, false);
+        }
+    }
+
     reapDeadStreams() {
         if (this.released) return;
+        const now = this.resilienceNow();
         for (const [track, s] of [...this.streams]) {
             if (this.creating.has(track)) continue;
             if (!s.alive) {
                 dbg('reaping dead stream', this.mac, track);
+                this.markPublishedTrackFailed(track, now);
                 try { s.stop(); } catch { }
                 this.streams.delete(track);
                 this.streamRebuilds++;
-                this.lastRebuild = Date.now();
+                this.lastRebuild = now;
             }
         }
+
+        const degradation = this.cameraDegradation(now);
+        if (!degradation || degradation.durationMs < NO_VIDEO_WARN_MS) {
+            this.noVideoWarningActive = false;
+            return;
+        }
+        if (!this.noVideoWarningActive) {
+            this.noVideoWarningActive = true;
+            dbg('camera resilience no-video warning', this.mac,
+                `tracks=${degradation.trackCount}`,
+                `degraded_ms=${Math.round(degradation.durationMs)}`);
+        }
+        if (degradation.durationMs >= CAMERA_FALLBACK_RECOVERY_MS)
+            void this.recoverCameraAfterSustainedSilence(
+                `all-published-tracks-degraded-${Math.round(degradation.durationMs)}ms`)
+                .catch(e => dbg('camera resilience recovery task failed', this.mac, (e as Error)?.message));
     }
 
     // ---- audio-only endpoint (BirdNET-Go etc.) ----
@@ -940,6 +1126,7 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         if (this.released) return;
         this.online = isOnline;
         if (isOnline) {
+            this.managementOnlineSince ??= this.resilienceNow();
             this.invalidateAudioProfile(true);
             this.snapshots.warm();
             // Refresh in the background so a reconnect can adopt firmware or
@@ -947,6 +1134,9 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             // on the next HomeKit/client startup path.
             this.preferredAudioProfile(true)
                 .catch(e => dbg('audio profile reconnect refresh failed', this.mac, (e as Error)?.message));
+        } else {
+            this.managementOnlineSince = undefined;
+            this.noVideoWarningActive = false;
         }
         this.onDeviceEvent(ScryptedInterface.Settings, undefined)
             .catch(e => dbg('connection status event failed', this.mac, (e as Error)?.message));
@@ -986,6 +1176,9 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
         this.client?.destroy();
         this.client = undefined;
         this.clientConfig = undefined;
+        this.snapshotClient?.destroy();
+        this.snapshotClient = undefined;
+        this.snapshotClientConfig = undefined;
         // Zone import uses only release-raced I/O and cancellable delays, so this
         // is a bounded drain (it does not wait for an unabortable camera request).
         await importing?.catch(() => { });
@@ -1201,6 +1394,8 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
                     try { s.stop(); } catch { }
                     this.streams.delete(track);
                 }
+                for (const track of [...this.failedTrackState().keys()])
+                    if (!tracks.has(track)) this.failedTrackState().delete(track);
                 // the advertised stream set changed — tell consumers that cache
                 // getVideoStreamOptions (prebuffer) to refresh promptly.
                 await this.onDeviceEvent(ScryptedInterface.VideoCamera, undefined);
@@ -1278,6 +1473,9 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             this.client?.destroy();
             this.client = undefined;
             this.clientConfig = undefined;
+            this.snapshotClient?.destroy();
+            this.snapshotClient = undefined;
+            this.snapshotClientConfig = undefined;
             // Point at a different camera → drop everything cached from the old one
             // (a stale last-good frame or feature flags would otherwise leak across).
             this.snapshots.reset();
@@ -1288,7 +1486,10 @@ export class UnifiCamera extends ScryptedDeviceBase implements Camera, VideoCame
             // A host change may identify a completely different camera. Force
             // the next pairing pass to read its real MAC instead of accepting an
             // old emulator session as proof that this device is already online.
-            if (key === 'host') this.storage.removeItem('mac');
+            if (key === 'host') {
+                this.storage.removeItem('mac');
+                this.managementOnlineSince = undefined;
+            }
         }
         if (key === 'channel' || key === 'codec') {
             this.resetStreams();

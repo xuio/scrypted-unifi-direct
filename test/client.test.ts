@@ -113,3 +113,45 @@ test('snapshot caller does not inherit an older long-running login deadline', as
     assert.ok(Date.now() - started < 100, 'snapshot waited for the existing login promise');
     (client as any).loginPromise = undefined;
 });
+
+test('camera reboot distinguishes definite non-attempts from post-issue ambiguity', async t => {
+    const loginRejected = new CameraApiClient('camera.invalid', 'user', 'password');
+    t.after(() => loginRejected.destroy());
+    (loginRejected as any).raw = async () => ({
+        statusCode: 401,
+        headers: {},
+        body: Buffer.alloc(0),
+    });
+    assert.deepEqual(await loginRejected.reboot(), { issued: false, ambiguous: false });
+
+    const staleUnauthorized = new CameraApiClient('camera.invalid', 'user', 'password');
+    t.after(() => staleUnauthorized.destroy());
+    (staleUnauthorized as any).cookie = 'authId=stale';
+    (staleUnauthorized as any).raw = async (options: any) => options.path === '/api/1.1/reboot'
+        ? { statusCode: 401, headers: {}, body: Buffer.alloc(0) }
+        : { statusCode: 403, headers: {}, body: Buffer.alloc(0) };
+    assert.deepEqual(await staleUnauthorized.reboot(), { issued: false, ambiguous: false });
+
+    const httpRejected = new CameraApiClient('camera.invalid', 'user', 'password');
+    t.after(() => httpRejected.destroy());
+    (httpRejected as any).raw = async (options: any) => options.path === '/api/1.1/login'
+        ? { statusCode: 200, headers: { 'set-cookie': ['authId=test; Secure'] }, body: Buffer.alloc(0) }
+        : { statusCode: 500, headers: {}, body: Buffer.alloc(0) };
+    assert.deepEqual(await httpRejected.reboot(), { issued: false, ambiguous: false });
+
+    const droppedAfterIssue = new CameraApiClient('camera.invalid', 'user', 'password');
+    t.after(() => droppedAfterIssue.destroy());
+    (droppedAfterIssue as any).raw = async (options: any) => {
+        if (options.path === '/api/1.1/login')
+            return { statusCode: 200, headers: { 'set-cookie': ['authId=test; Secure'] }, body: Buffer.alloc(0) };
+        throw new Error('connection reset by reboot');
+    };
+    assert.deepEqual(await droppedAfterIssue.reboot(), { issued: true, ambiguous: true });
+
+    const accepted = new CameraApiClient('camera.invalid', 'user', 'password');
+    t.after(() => accepted.destroy());
+    (accepted as any).raw = async (options: any) => options.path === '/api/1.1/login'
+        ? { statusCode: 200, headers: { 'set-cookie': ['authId=test; Secure'] }, body: Buffer.alloc(0) }
+        : { statusCode: 200, headers: {}, body: Buffer.alloc(0) };
+    assert.deepEqual(await accepted.reboot(), { issued: true, ambiguous: false });
+});

@@ -90,6 +90,12 @@ const METRIC_NAMES = [
     'ingress_egress_pressure_pauses',
     'ingress_handoff_pauses',
     'ingress_pause_union_ms',
+    'flv_probe_connections',
+    'flv_probe_timeouts',
+    'flv_headers_validated',
+    'stream_ready_events',
+    'pacer_local_reanchors',
+    'video_stall_warnings',
     'pipeline_restarts',
 ] as const;
 
@@ -182,9 +188,52 @@ export interface CadenceSnapshot {
         last_keyframe_process_monotonic_ms: number | null;
         observer_timer_lag_ms: number;
         max_observer_timer_lag_ms: number;
+        flv_ready: boolean;
+        video_no_data_ms: number;
+        local_recovery_active: boolean;
+        last_local_recovery_reason: string;
+        last_terminal_reason: string;
     };
+    controller_resilience: ControllerResilienceSnapshot;
     recent_anomalies: CadenceAnomaly[];
 }
+
+/** Camera-level controller/recovery state copied into each bounded stream
+ * snapshot. It deliberately contains no destinations, URLs, credentials, or
+ * payloads, so the existing JSONL file remains safe for a metrics collector. */
+export interface ControllerResilienceSnapshot {
+    reconfigure_sent: number;
+    reconfigure_coalesced: number;
+    reconfigure_skipped: number;
+    reconfigure_cooldowns: number;
+    reconfigure_ack_timeouts: number;
+    reconfigure_explicit_failures: number;
+    desired_revision: number;
+    pending_changes: number;
+    cooldown_remaining_ms: number;
+    fallback_recoveries: number;
+    fallback_recovery_inflight: number;
+    last_reconfigure_reason: string;
+    last_recovery_owner: string;
+    last_recovery_reason: string;
+}
+
+const EMPTY_CONTROLLER_RESILIENCE: ControllerResilienceSnapshot = Object.freeze({
+    reconfigure_sent: 0,
+    reconfigure_coalesced: 0,
+    reconfigure_skipped: 0,
+    reconfigure_cooldowns: 0,
+    reconfigure_ack_timeouts: 0,
+    reconfigure_explicit_failures: 0,
+    desired_revision: 0,
+    pending_changes: 0,
+    cooldown_remaining_ms: 0,
+    fallback_recoveries: 0,
+    fallback_recovery_inflight: 0,
+    last_reconfigure_reason: '',
+    last_recovery_owner: '',
+    last_recovery_reason: '',
+});
 
 function forwardDelta32(current: number, previous: number): number | undefined {
     const delta = ((current >>> 0) - (previous >>> 0)) >>> 0;
@@ -232,11 +281,16 @@ export class CadenceDiagnostics {
     private maxObserverTimerLagMs = 0;
     private timer: NodeJS.Timeout | undefined;
     private stopped = false;
+    private flvReady = false;
+    private localRecoveryActive = false;
+    private lastLocalRecoveryReason = '';
+    private lastTerminalReason = '';
 
     constructor(
         private stream: { mac: string; channel: string; generation: string },
         private intervalMs = 60_000,
         private now: () => number = () => performance.now(),
+        private controllerSnapshot: () => ControllerResilienceSnapshot | undefined = () => undefined,
     ) {
         this.startedAt = this.windowStartedAt = this.now();
         if (intervalMs > 0) {
@@ -502,6 +556,42 @@ export class CadenceDiagnostics {
         }
     }
 
+    recordProbeConnection() {
+        this.increment('flv_probe_connections');
+    }
+
+    recordProbeTimeout() {
+        this.increment('flv_probe_timeouts');
+        this.anomaly('flv_probe_timeout', 'no FLV header before probe deadline');
+    }
+
+    recordFlvHeader() {
+        this.increment('flv_headers_validated');
+    }
+
+    recordStreamReady(ready: boolean) {
+        this.flvReady = ready;
+        if (ready) this.increment('stream_ready_events');
+    }
+
+    recordLocalRecovery(reason: string, active: boolean) {
+        this.localRecoveryActive = active;
+        this.lastLocalRecoveryReason = reason.slice(0, 96);
+        if (active) {
+            this.increment('pacer_local_reanchors');
+            this.anomaly('pacer_local_reanchor', this.lastLocalRecoveryReason);
+        }
+    }
+
+    recordVideoStall(ageMs: number) {
+        this.increment('video_stall_warnings');
+        this.anomaly('video_stall_warning', `no_video_rtp_ms=${Math.round(ageMs)}`);
+    }
+
+    recordTerminal(reason: string) {
+        this.lastTerminalReason = reason.slice(0, 96);
+    }
+
     recordQueueDiscard(videoPackets: number, audioPackets: number, reason: string) {
         if (!videoPackets && !audioPackets) return;
         this.increment('queue_discard_events');
@@ -571,6 +661,7 @@ export class CadenceDiagnostics {
             : Math.max(0, now - this.physicalPauseStartedAt);
         const totals = { ...this.totals };
         const window = { ...this.window };
+        const controller = this.controllerSnapshot() ?? EMPTY_CONTROLLER_RESILIENCE;
         if (includeUnaccountedPause && this.physicalPauseAccountedAt !== undefined) {
             const elapsed = Math.max(0, now - this.physicalPauseAccountedAt);
             totals.ingress_pause_union_ms += elapsed;
@@ -622,7 +713,14 @@ export class CadenceDiagnostics {
                     : Number(this.lastKeyframeProcessMonotonicMs.toFixed(3)),
                 observer_timer_lag_ms: Number(this.observerTimerLagMs.toFixed(3)),
                 max_observer_timer_lag_ms: Number(this.maxObserverTimerLagMs.toFixed(3)),
+                flv_ready: this.flvReady,
+                video_no_data_ms: Number(Math.max(0,
+                    now - (this.previousIngressVideoWallMs ?? this.startedAt)).toFixed(3)),
+                local_recovery_active: this.localRecoveryActive,
+                last_local_recovery_reason: this.lastLocalRecoveryReason,
+                last_terminal_reason: this.lastTerminalReason,
             },
+            controller_resilience: { ...controller },
             recent_anomalies: this.recentAnomalies.map(anomaly => ({ ...anomaly })),
         };
     }
@@ -644,6 +742,12 @@ export class CadenceDiagnostics {
     stop(reason = 'stream-destroyed') {
         if (this.stopped) return;
         this.stopped = true;
+        this.recordTerminal(reason);
+        this.flvReady = false;
+        // A final snapshot cannot truthfully report an in-progress recovery
+        // after its diagnostics owner has stopped. Preserve the last reason for
+        // postmortem attribution while closing only the active gauge.
+        this.localRecoveryActive = false;
         if (this.timer) clearTimeout(this.timer);
         this.timer = undefined;
         for (const pauseReason of [...this.activeIngressPauses.keys()])
